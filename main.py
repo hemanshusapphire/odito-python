@@ -128,16 +128,58 @@ def handle_ai_visibility(job: AIVisibilityJob):
 @app.post("/jobs/ai-visibility-scoring")
 def handle_ai_visibility_scoring(job: AIVisibilityScoringV2Job):
     """Handle AI_VISIBILITY_SCORING job dispatched dealt Node.js"""
-    # Import worker function
-    from scraper.workers.ai.ai_scoring_v2.ai_scoring_v2_worker import execute_ai_visibility_scoring_logic
-    
-    # Execute scoring logic
-    result = execute_ai_visibility_scoring_logic(job.dict())
-    
-    if result["status"] == "failed":
-        raise HTTPException(status_code=500, detail=result.get("error", "Scoring failed"))
-    
-    return result
+    try:
+        # Detailed logging of incoming request
+        print(f"[AI_VISIBILITY_SCORING] Received job request")
+        print(f"[AI_VISIBILITY_SCORING] Job ID: {job.jobId}")
+        print(f"[AI_VISIBILITY_SCORING] Project ID: {job.projectId}")
+        print(f"[AI_VISIBILITY_SCORING] User ID: {job.userId}")
+        print(f"[AI_VISIBILITY_SCORING] Source Job ID: {job.sourceJobId}")
+        print(f"[AI_VISIBILITY_SCORING] AI Project ID: {job.aiProjectId}")
+        
+        # Validation: Check if aiProjectId is provided
+        if not job.aiProjectId:
+            error_msg = "aiProjectId is required for AI_VISIBILITY_SCORING jobs"
+            print(f"[AI_VISIBILITY_SCORING] Validation failed: {error_msg}")
+            return {
+                "status": "failed",
+                "error": error_msg,
+                "jobId": job.jobId
+            }
+        
+        # Import worker function
+        from scraper.workers.ai.ai_scoring_v2.ai_scoring_v2_worker import execute_ai_visibility_scoring_logic
+        
+        print(f"[AI_VISIBILITY_SCORING] Starting scoring logic execution")
+        
+        # Execute scoring logic
+        result = execute_ai_visibility_scoring_logic(job.dict())
+        
+        print(f"[AI_VISIBILITY_SCORING] Scoring logic completed with status: {result.get('status', 'unknown')}")
+        
+        if result.get("status") == "failed":
+            error_detail = result.get("error", "Scoring failed")
+            print(f"[AI_VISIBILITY_SCORING] Job failed: {error_detail}")
+            raise HTTPException(status_code=500, detail=error_detail)
+        
+        return result
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions (already have proper status codes)
+        raise
+    except Exception as e:
+        # Catch any other exceptions and return meaningful error instead of 500 crash
+        error_msg = f"Unexpected error in AI_VISIBILITY_SCORING handler: {str(e)}"
+        print(f"[AI_VISIBILITY_SCORING] ERROR: {error_msg}")
+        import traceback
+        print(f"[AI_VISIBILITY_SCORING] Stack trace: {traceback.format_exc()}")
+        
+        # Return proper error response instead of crashing
+        return {
+            "status": "failed",
+            "error": error_msg,
+            "jobId": getattr(job, 'jobId', 'unknown')
+        }
 
 @app.post("/workers/claim")
 def claim_job(request: JobClaimRequest):

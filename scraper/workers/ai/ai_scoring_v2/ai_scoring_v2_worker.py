@@ -193,8 +193,35 @@ def execute_ai_visibility_scoring_v2(job_data: Dict[str, Any]) -> Dict[str, Any]
         Job completion results
     """
     try:
+        # Log incoming request payload for debugging
+        print(f"[WORKER] AI_VISIBILITY_SCORING_V2 received job_data: {job_data}")
+        
+        # Validate required fields
+        required_fields = ["jobId", "projectId", "userId", "sourceJobId"]
+        missing_fields = [field for field in required_fields if not job_data.get(field)]
+        if missing_fields:
+            error_msg = f"Missing required fields: {missing_fields}"
+            print(f"[WORKER] Validation failed: {error_msg}")
+            return {
+                "status": "failed",
+                "error": error_msg,
+                "jobId": job_data.get("jobId", "unknown")
+            }
+        
+        # Validate aiProjectId - it's required for this job type
+        aiProjectId = job_data.get("aiProjectId")
+        if not aiProjectId:
+            error_msg = "aiProjectId is required for AI_VISIBILITY_SCORING jobs"
+            print(f"[WORKER] Validation failed: {error_msg}")
+            return {
+                "status": "failed", 
+                "error": error_msg,
+                "jobId": job_data.get("jobId", "unknown")
+            }
+        
         # Initialize job
         job = AIVisibilityScoringJob(job_data)
+        print(f"[WORKER] AI_VISIBILITY_SCORING_V2 started | jobId={job.jobId} | projectId={job.projectId} | aiProjectId={job.aiProjectId}")
         logger.info(f"[WORKER] AI_VISIBILITY_SCORING_V2 started | jobId={job.jobId} | projectId={job.projectId}")
         
         # Send initial progress
@@ -564,7 +591,25 @@ def store_website_score(website_result: Dict[str, Any], project_id: str):
 # Main execution function
 def execute_ai_visibility_scoring_logic(job_data: Dict[str, Any]) -> Dict[str, Any]:
     """Main entry point for AI visibility scoring v2"""
-    return execute_ai_visibility_scoring_v2(job_data)
+    try:
+        print(f"[WORKER] execute_ai_visibility_scoring_logic called with: {job_data}")
+        result = execute_ai_visibility_scoring_v2(job_data)
+        print(f"[WORKER] execute_ai_visibility_scoring_logic returning: {result}")
+        return result
+    except Exception as e:
+        # Ultimate safety net - never let exceptions crash the worker
+        error_msg = f"Critical error in execute_ai_visibility_scoring_logic: {str(e)}"
+        print(f"[WORKER] CRITICAL ERROR: {error_msg}")
+        import traceback
+        print(f"[WORKER] Critical stack trace: {traceback.format_exc()}")
+        
+        # Always return valid JSON response
+        return {
+            "status": "failed",
+            "error": error_msg,
+            "jobId": job_data.get("jobId", "unknown"),
+            "critical_failure": True
+        }
 
 if __name__ == "__main__":
     # Test execution
