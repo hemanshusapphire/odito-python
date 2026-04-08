@@ -72,7 +72,6 @@ class AIVisibilityScoringJob:
         self.jobId = job_data.get("jobId")
         self.projectId = job_data.get("projectId")
         self.userId = job_data.get("userId")
-        self.aiProjectId = job_data.get("aiProjectId") or self.projectId
         self.sourceJobId = job_data.get("sourceJobId")
 
 def is_job_cancelled(job_id: str) -> bool:
@@ -208,20 +207,9 @@ def execute_ai_visibility_scoring_v2(job_data: Dict[str, Any]) -> Dict[str, Any]
                 "jobId": job_data.get("jobId", "unknown")
             }
         
-        # Validate aiProjectId - it's required for this job type
-        aiProjectId = job_data.get("aiProjectId")
-        if not aiProjectId:
-            error_msg = "aiProjectId is required for AI_VISIBILITY_SCORING jobs"
-            print(f"[WORKER] Validation failed: {error_msg}")
-            return {
-                "status": "failed", 
-                "error": error_msg,
-                "jobId": job_data.get("jobId", "unknown")
-            }
-        
         # Initialize job
         job = AIVisibilityScoringJob(job_data)
-        print(f"[WORKER] AI_VISIBILITY_SCORING_V2 started | jobId={job.jobId} | projectId={job.projectId} | aiProjectId={job.aiProjectId}")
+        print(f"[WORKER] AI_VISIBILITY_SCORING_V2 started | jobId={job.jobId} | projectId={job.projectId}")
         logger.info(f"[WORKER] AI_VISIBILITY_SCORING_V2 started | jobId={job.jobId} | projectId={job.projectId}")
         
         # Send initial progress

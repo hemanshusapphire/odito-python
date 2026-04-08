@@ -3621,9 +3621,9 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
         if is_job_cancelled(job.jobId):
             return None
         
-        # === CRITICAL FIX: Use aiProjectId from job if not provided ===
+        # Use projectId instead of aiProjectId
         if not aiProjectId:
-            aiProjectId = job.aiProjectId or job.projectId
+            aiProjectId = job.projectId
         
         print(f"[AI_VISIBILITY] Analyzing URL from database: {url}")
         
@@ -4034,9 +4034,9 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob, 
         if is_job_cancelled(job.jobId):
             return None
         
-        # === CRITICAL FIX: Use aiProjectId from job if not provided ===
+        # Use projectId instead of aiProjectId
         if not aiProjectId:
-            aiProjectId = job.aiProjectId or job.projectId
+            aiProjectId = job.projectId
         
         print(f"[AI_VISIBILITY] Analyzing URL with provided HTML: {url}")
         

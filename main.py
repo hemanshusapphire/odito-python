@@ -121,9 +121,8 @@ def generate_worker_id():
 @app.post("/jobs/ai-visibility")
 def handle_ai_visibility(job: AIVisibilityJob):
     """Handle AI_VISIBILITY job dispatched dealt Node.js"""
-    # === CRITICAL FIX: Extract aiProjectId from job ===
-    aiProjectId = job.aiProjectId or job.projectId
-    return execute_ai_visibility(job, aiProjectId)
+    # Use projectId instead of aiProjectId
+    return execute_ai_visibility(job, job.projectId)
 
 @app.post("/jobs/ai-visibility-scoring")
 def handle_ai_visibility_scoring(job: AIVisibilityScoringV2Job):
@@ -135,17 +134,6 @@ def handle_ai_visibility_scoring(job: AIVisibilityScoringV2Job):
         print(f"[AI_VISIBILITY_SCORING] Project ID: {job.projectId}")
         print(f"[AI_VISIBILITY_SCORING] User ID: {job.userId}")
         print(f"[AI_VISIBILITY_SCORING] Source Job ID: {job.sourceJobId}")
-        print(f"[AI_VISIBILITY_SCORING] AI Project ID: {job.aiProjectId}")
-        
-        # Validation: Check if aiProjectId is provided
-        if not job.aiProjectId:
-            error_msg = "aiProjectId is required for AI_VISIBILITY_SCORING jobs"
-            print(f"[AI_VISIBILITY_SCORING] Validation failed: {error_msg}")
-            return {
-                "status": "failed",
-                "error": error_msg,
-                "jobId": job.jobId
-            }
         
         # Import worker function
         from scraper.workers.ai.ai_scoring_v2.ai_scoring_v2_worker import execute_ai_visibility_scoring_logic

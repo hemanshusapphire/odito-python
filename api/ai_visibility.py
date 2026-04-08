@@ -43,8 +43,6 @@ async def handle_ai_visibility(request: Request):
         print(f"  jobId: {job.jobId}")
         print(f"  projectId: {job.projectId}")
         print(f"  userId: {job.userId}")
-        print(f"  aiProjectId: {job.aiProjectId}")
-        print(f"  TYPE aiProjectId: {type(job.aiProjectId)}")
         
         # Import here to avoid circular imports
         from main import completed_jobs, completed_jobs_lock
@@ -63,7 +61,7 @@ async def handle_ai_visibility(request: Request):
         print(f"[WORKER] AI_VISIBILITY started | jobId={job.jobId}")
         
         # Execute AI visibility immediately (no polling loop)
-        result = execute_ai_visibility(job=job, aiProjectId=job.aiProjectId)
+        result = execute_ai_visibility(job=job, aiProjectId=job.projectId)
         
         # Mark as completed
         with completed_jobs_lock:
