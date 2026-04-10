@@ -448,15 +448,36 @@ def check_ranking(req: CheckRankingRequest):
                 "payload_matches_kw": payload[0]["keyword"] == kw
             })
 
-            resp = requests.post(SERP_API_URL, json=payload, headers=headers, timeout=30)
+            try:
+                resp = requests.post(SERP_API_URL, json=payload, headers=headers, timeout=30)
 
-            if resp.status_code in (401, 402):
-                print(f"[ONBOARDING] SERP API auth/credit error for \"{kw}\"")
+                if resp.status_code in (401, 402):
+                    print(f"[ONBOARDING] SERP API auth/credit error for \"{kw}\"")
+                    results.append(KeywordRank(keyword=kw, rank=None))
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+
+            except requests.exceptions.Timeout:
+                print(f"[ONBOARDING] SERP API timeout for \"{kw}\"")
                 results.append(KeywordRank(keyword=kw, rank=None))
                 continue
-
-            resp.raise_for_status()
-            data = resp.json()
+                
+            except requests.exceptions.ConnectionError as e:
+                print(f"[ONBOARDING] SERP API connection error for \"{kw}\": {str(e)}")
+                results.append(KeywordRank(keyword=kw, rank=None))
+                continue
+                
+            except requests.exceptions.RequestException as e:
+                print(f"[ONBOARDING] SERP API request error for \"{kw}\": {str(e)}")
+                results.append(KeywordRank(keyword=kw, rank=None))
+                continue
+                
+            except Exception as e:
+                print(f"[ONBOARDING] Unexpected error for \"{kw}\": {str(e)}")
+                results.append(KeywordRank(keyword=kw, rank=None))
+                continue
 
             if data.get("status_code") != 20000:
                 print(f"[ONBOARDING] SERP API error for \"{kw}\": {data.get('status_message')}")

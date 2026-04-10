@@ -14,17 +14,29 @@ from datetime import datetime, timezone
 class DataForSEOClient:
     """Client for the DataForSEO APIs (Related Keywords and SERP)."""
 
-    RELATED_KEYWORDS_API_URL = "https://api.dataforseo.com/v3/dataforseo_labs/google/related_keywords/live"
-    SERP_API_URL = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced"
+    DEFAULT_RELATED_KEYWORDS_API_URL = "https://api.dataforseo.com/v3/dataforseo_labs/google/related_keywords/live"
+    DEFAULT_SERP_API_URL = "https://api.dataforseo.com/v3/serp/google/organic/live/advanced"
     MAX_RETRIES = 3
     RETRY_BACKOFF_BASE = 2  # seconds
 
     def __init__(self):
         self.login = os.getenv("DATAFORSEO_LOGIN", "")
         self.password = os.getenv("DATAFORSEO_PASSWORD", "")
+        
+        # Environment-based API URLs with fallbacks
+        self.RELATED_KEYWORDS_API_URL = os.getenv(
+            "DATAFORSEO_RELATED_KEYWORDS_API_URL", 
+            self.DEFAULT_RELATED_KEYWORDS_API_URL
+        )
+        self.SERP_API_URL = os.getenv(
+            "DATAFORSEO_SERP_API_URL", 
+            self.DEFAULT_SERP_API_URL
+        )
 
         if not self.login or not self.password:
             print("[DATAFORSEO] WARNING: DATAFORSEO_LOGIN or DATAFORSEO_PASSWORD not set in environment")
+        
+        print(f"[DATAFORSEO] Initialized with URLs: RELATED={self.RELATED_KEYWORDS_API_URL}, SERP={self.SERP_API_URL}")
 
     def _get_auth_header(self):
         """Generate HTTP Basic Auth header."""
@@ -69,7 +81,7 @@ class DataForSEOClient:
                 print(f"[DATAFORSEO] API request attempt {attempt}/{self.MAX_RETRIES} | keyword=\"{keyword}\" | depth={depth} | location_code={location_code} | language_code={language_code} | timestamp={datetime.now(timezone.utc).isoformat()}")
 
                 response = requests.post(
-                    self.API_URL,
+                    self.RELATED_KEYWORDS_API_URL,
                     json=payload,
                     headers=headers,
                     timeout=60
