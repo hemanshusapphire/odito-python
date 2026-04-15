@@ -61,7 +61,7 @@ async def handle_ai_visibility(request: Request):
         print(f"[WORKER] AI_VISIBILITY started | jobId={job.jobId}")
         
         # Execute AI visibility immediately (no polling loop)
-        result = execute_ai_visibility(job=job, aiProjectId=job.projectId)
+        result = execute_ai_visibility(job=job)
         
         # Mark as completed
         with completed_jobs_lock:

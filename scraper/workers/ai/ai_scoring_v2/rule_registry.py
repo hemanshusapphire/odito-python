@@ -5,7 +5,7 @@ Manages registration and retrieval of all scoring rules.
 """
 
 from typing import Dict, List, Type, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class RuleRegistry:
     """Registry for managing scoring rules"""

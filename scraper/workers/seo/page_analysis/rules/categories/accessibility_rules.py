@@ -1,521 +1,358 @@
 """
-Accessibility SEO Rules (Rules 213–228, 230, 233, 236)
-
-axe-core violation handling, DOM metrics, keyboard navigation,
-ARIA landmarks, form labels, and focus indicators.
+Accessibility SEO Rules
+Rules for WCAG compliance, screen reader accessibility, and inclusive design.
 """
 
 from ..base_seo_rule import BaseSEORuleV2
-from ..seo_rule_utils import _get_axe, _get_dom_metrics, _get_keyboard
-
-# Helpers (_get_axe, _get_dom_metrics, _get_keyboard) imported from seo_rule_utils
-
-def _get_headless(normalized):
-    return normalized.get("headless", {})
+from bson.objectid import ObjectId
+from datetime import datetime
 
 
-# ═══════════════════════════════════════════════════════════════
-# AXE-CORE VIOLATIONS (Rules 213–216) - FIXED: Deduplicated
-# ═══════════════════════════════════════════════════════════════
-
-class AxeNoViolationsRule(BaseSEORuleV2):
-    rule_id = "AXE_NO_VIOLATIONS"
-    rule_no = 213
+class FormInputsLabelsRule(BaseSEORuleV2):
+    rule_id = "form_inputs_labels"
+    rule_no = 111  # Updated rule number since we removed the previous rule
     category = "Accessibility"
     severity = "high"
-    description = "No axe-core violations found"
+    description = "Unlabelled form inputs break screen reader accessibility and fail WCAG 1.3.1"
+
+
+class TextContrastRule(BaseSEORuleV2):
+    rule_id = "text_contrast"
+    rule_no = 112
+    category = "Accessibility"
+    severity = "high"
+    description = "Low contrast fails WCAG 2.2 Level AA — Google and users with visual impairments penalise this"
 
     def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        # GUARD: Skip if headless data is not available
-        if not headless or not isinstance(headless, dict):
-            return []
+        issues = []
         
-        violations = _get_axe(normalized)
-        if violations:
-            # FIXED: Create summary issue instead of individual violation issues
-            unique_violation_types = set()
-            impacts = {"critical": 0, "serious": 0, "moderate": 0, "minor": 0}
+        # This requires CSS analysis which may not be available in normalized data
+        # Simplified implementation would check for obvious contrast issues
+        
+        # For now, we'll skip this rule as it requires detailed CSS parsing
+        # In a full implementation, you'd extract colors from CSS and calculate contrast ratios
+        
+        return issues
+
+
+class FormInputsLabelsRule(BaseSEORuleV2):
+    rule_id = "form_inputs_labels"
+    rule_no = 113
+    category = "Accessibility"
+    severity = "high"
+    description = "Unlabelled form inputs break screen reader accessibility and fail WCAG 1.3.1"
+
+    def evaluate(self, normalized, job_id, project_id, url):
+        issues = []
+        
+        # ✅ Use headless data instead of missing forms array
+        headless = normalized.get("headless", {})
+        dom_metrics = headless.get("domMetrics", {})
+        
+        forms_count = dom_metrics.get("forms", 0)
+        inputs_count = dom_metrics.get("inputs", 0)
+        
+        # If we have forms but no detailed input analysis, create a general issue
+        if forms_count > 0 and inputs_count > 0:
+            # Check if axe violations contain form-related issues
+            axe_violations = headless.get("axeViolations", [])
+            form_violations = [v for v in axe_violations if any(tag in v.get("tags", []) for tag in ["wcag2aa", "forms", "labels"])]
             
-            for v in violations:
-                if isinstance(v, dict):
-                    violation_id = v.get("id", "unknown")
-                    impact = v.get("impact", "minor")
-                    unique_violation_types.add(violation_id)
-                    if impact in impacts:
-                        impacts[impact] += 1
-            
-            impact_summary = ", ".join([f"{count} {impact}" for impact, count in impacts.items() if count > 0])
-            
-            return [self.create_issue(
+            if form_violations:
+                for violation in form_violations:
+                    if "label" in violation.get("description", "").lower() or "form" in violation.get("description", "").lower():
+                        issues.append(self.create_issue(
+                            job_id, project_id, url,
+                            f"Form accessibility issue: {violation.get('description', 'Unknown form issue')}",
+                            f"WCAG violation detected by axe-core: {violation.get('id', 'unknown')}",
+                            "All form inputs must have proper labels and accessibility attributes",
+                            data_key="headless",
+                            data_path="axeViolations"
+                        ))
+            else:
+                # If no specific violations found but forms exist, flag for manual review
+                issues.append(self.create_issue(
+                    job_id, project_id, url,
+                    f"Forms detected ({forms_count} forms, {inputs_count} inputs) - manual accessibility review recommended",
+                    f"Forms present but detailed input analysis not available",
+                    "All form inputs should be manually checked for proper labels and accessibility",
+                    data_key="headless",
+                    data_path="domMetrics"
+                ))
+        
+        return issues
+
+
+class KeyboardAccessibilityRule(BaseSEORuleV2):
+    rule_id = "keyboard_accessibility"
+    rule_no = 113  # Updated from 114
+    category = "Accessibility"
+    severity = "high"
+    description = "Keyboard-only users must reach every interactive element without a mouse"
+
+    def evaluate(self, normalized, job_id, project_id, url):
+        issues = []
+        
+        # ✅ Use real keyboard navigation data from headless worker
+        headless = normalized.get("headless", {})
+        keyboard = headless.get("keyboard_analysis", {})
+        
+        if not keyboard.get("keyboard_navigation_checked", False):
+            # If keyboard navigation wasn't checked, skip this rule
+            return issues
+        
+        # Check for focus traps
+        if keyboard.get("focus_trap_detected", False):
+            issues.append(self.create_issue(
                 job_id, project_id, url,
-                f"{len(violations)} accessibility violations found: {len(unique_violation_types)} unique types ({impact_summary})",
-                len(violations), "0 axe-core violations",
-                data_key="headless"
-            )]
-        return []
+                "Focus trap detected - keyboard users cannot navigate away from certain elements",
+                "Keyboard navigation test detected focus trap",
+                "All interactive elements must allow keyboard users to navigate away",
+                data_key="headless",
+                data_path="keyboard_analysis.focus_trap_detected"
+            ))
+        
+        # Check for unreachable elements
+        unreachable_count = keyboard.get("unreachable_elements", 0)
+        if unreachable_count > 0:
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                f"Unreachable interactive elements detected: {unreachable_count} elements not reachable by keyboard",
+                f"Keyboard navigation test found {unreachable_count} unreachable elements",
+                "All interactive elements must be reachable via Tab navigation",
+                data_key="headless",
+                data_path="keyboard_analysis.unreachable_elements"
+            ))
+        
+        # Check for missing focus outlines
+        missing_outline_count = keyboard.get("missing_focus_outline", 0)
+        if missing_outline_count > 0:
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                f"Missing focus indicators: {missing_outline_count} elements lack visible focus outlines",
+                f"Keyboard navigation test found {missing_outline_count} elements without focus indicators",
+                "All interactive elements must have visible focus indicators when focused",
+                data_key="headless",
+                data_path="keyboard_analysis.missing_focus_outline"
+            ))
+        
+        return issues
 
 
-class AxeNoCriticalRule(BaseSEORuleV2):
-    rule_id = "AXE_NO_CRITICAL"
-    rule_no = 214
+class FocusIndicatorsRule(BaseSEORuleV2):
+    rule_id = "focus_indicators"
+    rule_no = 114  # Updated from 115
     category = "Accessibility"
     severity = "high"
-    description = "No critical axe-core violations"
+    description = "Removing CSS focus outlines fails WCAG 2.4.11 — WCAG 2.2 criterion"
 
     def evaluate(self, normalized, job_id, project_id, url):
-        # FIXED: Skip individual critical violations - handled by summary rule
-        return []  # Prevents duplicate counting
+        issues = []
+        
+        # Check for CSS that removes focus indicators
+        content = normalized.get("content", "")
+        
+        # Look for common focus outline removal patterns
+        focus_removal_patterns = [
+            "outline:0",
+            "outline:none",
+            "outline: 0",
+            "outline: none",
+            "outline-width:0",
+            "outline-width: 0"
+        ]
+        
+        for pattern in focus_removal_patterns:
+            if pattern in content.lower():
+                issues.append(self.create_issue(
+                    job_id, project_id, url,
+                    f"CSS removes focus indicators: {pattern}",
+                    f"Found: {pattern}",
+                    "Visible focus ring on keyboard focus for all interactive elements",
+                    data_key="content",
+                    data_path="content.focus_indicators"
+                ))
+                break
+        
+        return issues
 
 
-class AxeNoSeriousRule(BaseSEORuleV2):
-    rule_id = "AXE_NO_SERIOUS"
-    rule_no = 215
+class PageLanguageRule(BaseSEORuleV2):
+    rule_id = "page_language"
+    rule_no = 115  # Updated from 116
     category = "Accessibility"
     severity = "high"
-    description = "No serious axe-core violations"
+    description = "Missing lang attribute prevents screen readers using correct pronunciation"
 
     def evaluate(self, normalized, job_id, project_id, url):
-        # FIXED: Skip individual serious violations - handled by summary rule
-        return []  # Prevents duplicate counting
+        issues = []
+        
+        # Check for html lang attribute
+        html_lang = normalized.get("html_lang", "")
+        
+        if not html_lang:
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                "HTML missing lang attribute",
+                "No lang attribute on html tag",
+                "lang attribute present and correct on every page",
+                data_key="html_lang",
+                data_path="html_lang"
+            ))
+        elif len(html_lang) < 2:  # Basic validation for ISO 639-1 codes
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                f"Invalid lang attribute: '{html_lang}'",
+                f"Lang attribute: '{html_lang}' (too short)",
+                "Valid ISO 639-1 language code (e.g., 'en', 'es')",
+                data_key="html_lang",
+                data_path="html_lang"
+            ))
+        
+        return issues
 
 
-class AxeMaxModerateRule(BaseSEORuleV2):
-    rule_id = "AXE_MAX_MODERATE"
-    rule_no = 216
+class VideoCaptionsRule(BaseSEORuleV2):
+    rule_id = "video_captions"
+    rule_no = 116  # Updated from 117
     category = "Accessibility"
     severity = "medium"
-    description = "Moderate violations ≤5"
+    description = "Videos without captions fail WCAG 1.2.2 and exclude deaf/hard-of-hearing users"
 
     def evaluate(self, normalized, job_id, project_id, url):
-        # FIXED: Skip individual moderate violations - handled by summary rule
-        return []  # Prevents duplicate counting
-
-
-# ═══════════════════════════════════════════════════════════════
-# IMAGES ALT TEXT (Rule 217)
-# ═══════════════════════════════════════════════════════════════
-
-class ImagesAllHaveAltRule(BaseSEORuleV2):
-    rule_id = "IMAGES_ALL_HAVE_ALT"
-    rule_no = 217
-    category = "Accessibility"
-    severity = "high"
-    description = "All images must have alt text"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        images = normalized.get("images", [])
-        if not images:
-            return []
+        issues = []
         
-        # Get image analysis data if available
-        image_analysis = normalized.get("image_analysis", {})
+        # ❌ videos array not available in normalized data
+        # ✅ Check axe violations for video-related accessibility issues instead
+        headless = normalized.get("headless", {})
+        axe_violations = headless.get("axeViolations", [])
         
-        # Calculate actual missing alt text (excluding decorative images)
-        missing_count = 0
-        for img in images:
-            if not isinstance(img, dict):
-                continue
-            
-            alt = img.get("alt", "")
-            # Check if image is decorative (role="presentation" or explicitly marked)
-            is_decorative = (
-                img.get("role") == "presentation" or 
-                img.get("is_decorative") is True or
-                alt == ""  # Empty alt indicates decorative
-            )
-            
-            # Count as missing only if no alt and not decorative
-            if not alt and not is_decorative:
-                missing_count += 1
+        # Look for video-related violations in axe results
+        video_violations = [v for v in axe_violations if any(
+            keyword in v.get("description", "").lower() or 
+            keyword in v.get("id", "").lower()
+            for keyword in ["video", "caption", "media", "track"]
+        )]
         
-        # If we have analysis data, use that for more accurate counting
-        if image_analysis and isinstance(image_analysis, dict):
-            images_without_alt = image_analysis.get("images_without_alt", 0)
-            decorative_images = image_analysis.get("decorative_images", 0)
-            # Use analysis data but ensure we don't get negative values
-            actual_missing = max(0, images_without_alt - decorative_images)
-            missing_count = max(missing_count, actual_missing)
-        
-        if missing_count > 0:
-            return [self.create_issue(
+        for violation in video_violations:
+            issues.append(self.create_issue(
                 job_id, project_id, url,
-                f"{missing_count} image(s) missing alt text",
-                missing_count, "All non-decorative images need alt text",
-                data_key="images"
-            )]
+                f"Video accessibility issue: {violation.get('description', 'Video accessibility problem detected')}",
+                f"axe-core detected: {violation.get('id', 'video-violation')}",
+                "All videos should have captions, tracks, and proper accessibility attributes",
+                data_key="headless",
+                data_path="axeViolations"
+            ))
         
-        return []
+        # If no axe violations found but we want to ensure video analysis happened
+        # Note: Since we don't have video data in normalized, we can't do detailed analysis
+        # This rule now relies entirely on axe-core for video accessibility detection
+        
+        return issues
 
 
-# ═══════════════════════════════════════════════════════════════
-# DOM STRUCTURE (Rules 218–222)
-# ═══════════════════════════════════════════════════════════════
-
-class DomElementCountRule(BaseSEORuleV2):
-    rule_id = "DOM_ELEMENT_COUNT"
-    rule_no = 218
+class TapTargetSizeRule(BaseSEORuleV2):
+    rule_id = "tap_target_size"
+    rule_no = 117  # Updated from 118
     category = "Accessibility"
     severity = "medium"
-    description = "Total DOM elements should be ≤1500"
+    description = "WCAG 2.2 criterion 2.5.8 requires minimum 24×24px tap targets — new in 2024"
 
     def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        dm = _get_dom_metrics(normalized)
-        total = dm.get("totalElements", 0)
-        if total > 1500:
-            return [self.create_issue(
+        issues = []
+        
+        # ✅ Use real tap target data from headless worker keyboard analysis
+        headless = normalized.get("headless", {})
+        keyboard = headless.get("keyboard_analysis", {})
+        
+        if not keyboard.get("keyboard_navigation_checked", False):
+            # If keyboard navigation wasn't checked, skip this rule
+            return issues
+        
+        # Check for small click targets detected during keyboard navigation
+        small_targets_count = keyboard.get("small_click_targets", 0)
+        
+        if small_targets_count > 0:
+            issues.append(self.create_issue(
                 job_id, project_id, url,
-                f"DOM has {total} elements (recommend ≤1500)",
-                total, "≤1500 elements",
-                data_key="headless"
-            )]
-        return []
+                f"Small tap targets detected: {small_targets_count} interactive elements smaller than 24×24px",
+                f"Keyboard navigation analysis found {small_targets_count} small click targets",
+                "All interactive elements should be at least 24×24 CSS pixels for touch accessibility",
+                data_key="headless",
+                data_path="keyboard_analysis.small_click_targets"
+            ))
+        
+        # Also check DOM metrics for button count to provide context
+        dom_metrics = headless.get("domMetrics", {})
+        buttons_count = dom_metrics.get("buttons", 0)
+        
+        if buttons_count > 0 and small_targets_count == 0:
+            # If we have buttons but no small targets detected, still note the analysis
+            # This helps users know the rule was checked
+            pass  # No issue - this is good!
+        
+        return issues
 
 
-class FormLabelsRule(BaseSEORuleV2):
-    rule_id = "FORM_LABELS"
-    rule_no = 219
+class AxeViolationsRule(BaseSEORuleV2):
+    rule_id = "axe_violations"
+    rule_no = 118  # New rule number
     category = "Accessibility"
     severity = "high"
-    description = "Form inputs should have labels"
+    description = "Professional accessibility violations detected by axe-core testing"
 
     def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        dm = _get_dom_metrics(normalized)
-        inputs = dm.get("inputs", 0)
-        forms = dm.get("forms", 0)
-        if inputs > 0 and forms > 0:
-            # Check axe for form-related violations
-            violations = _get_axe(normalized)
-            label_issues = [
-                v for v in violations
-                if isinstance(v, dict) and v.get("id") in ("label", "input-image-alt", "select-name")
-            ]
-            if label_issues:
-                return [self.create_issue(
-                    job_id, project_id, url,
-                    f"Form input(s) missing labels ({len(label_issues)} issue(s))",
-                    len(label_issues), "All form inputs need associated labels",
-                    data_key="headless"
-                )]
-        return []
+        issues = []
+        
+        # 🚀 GAME CHANGER: Use real axe-core violations
+        headless = normalized.get("headless", {})
+        axe_violations = headless.get("axeViolations", [])
+        
+        for violation in axe_violations:
+            # Map axe impact to our severity levels
+            impact = violation.get("impact", "moderate")
+            severity_mapping = {
+                "critical": "high",
+                "serious": "high", 
+                "moderate": "medium",
+                "minor": "low"
+            }
+            rule_severity = severity_mapping.get(impact, "medium")
+            
+            # Create issue for each axe violation
+            issues.append({
+                "projectId": ObjectId(project_id),
+                "seo_jobId": ObjectId(job_id),
+                "page_url": url,
+                "rule_no": self.rule_no,
+                "category": self.category,
+                "severity": rule_severity,
+                "issue_code": f"axe_{violation.get('id', 'unknown')}",
+                "rule_id": self.rule_id,
+                "issue_message": f"axe-core: {violation.get('description', 'Accessibility issue detected')}",
+                "detected_value": f"Impact: {impact}, Nodes affected: {violation.get('nodes', 0)}",
+                "expected_value": "No WCAG violations",
+                "data_key": "headless",
+                "data_path": "axeViolations",
+                "created_at": datetime.utcnow(),
+                "axe_data": {  # Include original axe data for reference
+                    "axe_id": violation.get("id"),
+                    "help_url": violation.get("helpUrl"),
+                    "impact": impact,
+                    "tags": violation.get("tags", [])
+                }
+            })
+        
+        return issues
 
-
-class AriaLandmarksRule(BaseSEORuleV2):
-    rule_id = "ARIA_LANDMARKS"
-    rule_no = 221
-    category = "Accessibility"
-    severity = "high"
-    description = "ARIA landmarks should be present"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        dm = _get_dom_metrics(normalized)
-        landmarks = dm.get("ariaLandmarks", 0)
-        if landmarks is None:
-            return []  # Data unavailable, do not fire issue
-        if landmarks == 0:
-            return [self.create_issue(
-                job_id, project_id, url,
-                "No ARIA landmarks found",
-                0, "Add role=navigation, main, banner, etc.",
-                data_key="headless"
-            )]
-        return []
-
-
-class ButtonsHaveLabelsRule(BaseSEORuleV2):
-    rule_id = "BUTTONS_HAVE_LABELS"
-    rule_no = 222
-    category = "Accessibility"
-    severity = "high"
-    description = "All buttons should have accessible labels"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        violations = _get_axe(normalized)
-        button_issues = [
-            v for v in violations
-            if isinstance(v, dict) and v.get("id") in ("button-name",)
-        ]
-        if button_issues:
-            node_count = sum(
-                len(v.get("nodes", [])) if isinstance(v.get("nodes"), list) else 0
-                for v in button_issues
-            )
-            return [self.create_issue(
-                job_id, project_id, url,
-                "Buttons without accessible labels found",
-                node_count,
-                "All buttons need accessible names",
-                data_key="headless"
-            )]
-        return []
-
-
-# ═══════════════════════════════════════════════════════════════
-# HEADING HIERARCHY (Rule 223)
-# ═══════════════════════════════════════════════════════════════
-
-class HeadingOrderLogicalRule(BaseSEORuleV2):
-    rule_id = "HEADING_ORDER_LOGICAL_A11Y"
-    rule_no = 223
-    category = "Accessibility"
-    severity = "high"
-    description = "Heading order should be logical for accessibility"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        """Only check axe-core accessibility heading violations.
-        Structural heading hierarchy is handled by Rule 229 (HeadingHierarchyLogicalRule).
-        """
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        violations = _get_axe(normalized)
-        heading_issues = [
-            v for v in violations
-            if isinstance(v, dict) and v.get("id") in ("heading-order", "page-has-heading-one")
-        ]
-        if heading_issues:
-            ids = [v.get("id", "?") for v in heading_issues]
-            return [self.create_issue(
-                job_id, project_id, url,
-                f"Accessibility heading violation(s): {', '.join(ids)}",
-                ", ".join(ids), "Fix axe-core heading-order / page-has-heading-one",
-                data_key="headless"
-            )]
-        return []
-
-
-# ═══════════════════════════════════════════════════════════════
-# KEYBOARD ACCESSIBILITY (Rules 224–228, 230)
-# ═══════════════════════════════════════════════════════════════
-
-class KeyboardNavigationCheckedRule(BaseSEORuleV2):
-    rule_id = "KEYBOARD_NAV_CHECKED"
-    rule_no = 224
-    category = "Accessibility"
-    severity = "high"
-    description = "Keyboard navigation should be functional"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        kb = _get_keyboard(normalized)
-        if kb and not kb.get("keyboard_navigation_checked"):
-            return [self.create_issue(
-                job_id, project_id, url,
-                "Keyboard navigation could not be checked",
-                "Not checked", "Ensure keyboard accessibility",
-                data_key="headless"
-            )]
-        return []
-
-
-class NoFocusTrapRule(BaseSEORuleV2):
-    rule_id = "NO_FOCUS_TRAP"
-    rule_no = 225
-    category = "Accessibility"
-    severity = "high"
-    description = "No focus traps detected"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        kb = _get_keyboard(normalized)
-        if kb and kb.get("focus_trap_detected"):
-            return [self.create_issue(
-                job_id, project_id, url,
-                "Focus trap detected during keyboard navigation",
-                "Trap detected", "Fix focus trapping elements",
-                data_key="headless"
-            )]
-        return []
-
-
-class SmallClickTargetsRule(BaseSEORuleV2):
-    rule_id = "SMALL_CLICK_TARGETS"
-    rule_no = 226
-    category = "Accessibility"
-    severity = "high"
-    description = "No small click targets (<24px)"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        kb = _get_keyboard(normalized)
-        if kb:
-            small = kb.get("small_click_targets", 0)
-            if small > 0:
-                return [self.create_issue(
-                    job_id, project_id, url,
-                    f"{small} small click target(s) detected (<24px)",
-                    small, "All interactive elements ≥24×24px",
-                    data_key="headless"
-                )]
-        return []
-
-
-class FocusIndicatorRule(BaseSEORuleV2):
-    rule_id = "FOCUS_INDICATOR"
-    rule_no = 227
-    category = "Accessibility"
-    severity = "high"
-    description = "Focus indicators should be visible"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        kb = _get_keyboard(normalized)
-        if kb:
-            missing = kb.get("missing_focus_outline", 0)
-            if missing > 0:
-                return [self.create_issue(
-                    job_id, project_id, url,
-                    f"{missing} element(s) with missing focus outline",
-                    missing, "All focusable elements need visible outline",
-                    data_key="headless"
-                )]
-        return []
-
-
-class UnreachableElementsRule(BaseSEORuleV2):
-    rule_id = "UNREACHABLE_ELEMENTS"
-    rule_no = 228
-    category = "Accessibility"
-    severity = "high"
-    description = "All interactive elements should be keyboard-reachable"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        kb = _get_keyboard(normalized)
-        if kb:
-            unreachable = kb.get("unreachable_elements", 0)
-            total_tabs = kb.get("total_tab_presses", 20)
-            if unreachable > total_tabs * 0.5:
-                return [self.create_issue(
-                    job_id, project_id, url,
-                    f"{unreachable} of {total_tabs} tab presses reached no element",
-                    unreachable, "All elements should be keyboard-reachable",
-                    data_key="headless"
-                )]
-        return []
-
-
-class SkipNavigationRule(BaseSEORuleV2):
-    rule_id = "SKIP_NAVIGATION"
-    rule_no = 230
-    category = "Accessibility"
-    severity = "high"
-    description = "Skip navigation link should be present"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        violations = _get_axe(normalized)
-        skip_issues = [
-            v for v in violations
-            if isinstance(v, dict) and v.get("id") in ("bypass", "skip-link")
-        ]
-        if skip_issues:
-            return [self.create_issue(
-                job_id, project_id, url,
-                "Skip navigation link missing or broken",
-                "Missing", "Add skip-to-content link",
-                data_key="headless"
-            )]
-        return []
-
-
-class HtmlLangA11yRule(BaseSEORuleV2):
-    rule_id = "HTML_LANG_A11Y"
-    rule_no = 233
-    category = "Accessibility"
-    severity = "high"
-    description = "HTML lang attribute must be present for screen readers"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        if not normalized.get("html_lang"):
-            return [self.create_issue(
-                job_id, project_id, url,
-                "HTML lang attribute is missing",
-                "None", 'Add lang="en" to <html>',
-                data_key="html_lang"
-            )]
-        return []
-
-
-class LinksHaveDescriptiveTextRule(BaseSEORuleV2):
-    rule_id = "LINKS_DESCRIPTIVE_TEXT"
-    rule_no = 236
-    category = "Accessibility"
-    severity = "high"
-    description = "Links should have descriptive text"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        headless = normalized.get("headless")
-        if not headless or not isinstance(headless, dict):
-            return []
-        violations = _get_axe(normalized)
-        link_issues = [
-            v for v in violations
-            if isinstance(v, dict) and v.get("id") in ("link-name",)
-        ]
-        if link_issues:
-            node_count = sum(
-                len(v.get("nodes", [])) if isinstance(v.get("nodes"), list) else 0
-                for v in link_issues
-            )
-            return [self.create_issue(
-                job_id, project_id, url,
-                "Links without descriptive text found",
-                node_count,
-                "All links need descriptive text (not 'click here')",
-                data_key="headless"
-            )]
-        return []
-
-
-# ── Registration ──────────────────────────────────────────────
 
 def register_accessibility_rules(registry):
-    """Register all Accessibility rules"""
-    # Axe (213–216)
-    registry.register(AxeNoViolationsRule())
-    registry.register(AxeNoCriticalRule())
-    registry.register(AxeNoSeriousRule())
-    registry.register(AxeMaxModerateRule())
-    # Images (217)
-    registry.register(ImagesAllHaveAltRule())
-    # DOM (218–223)
-    registry.register(DomElementCountRule())
-    registry.register(FormLabelsRule())
-    registry.register(AriaLandmarksRule())
-    registry.register(ButtonsHaveLabelsRule())
-    registry.register(HeadingOrderLogicalRule())
-    # Keyboard (224–228, 230)
-    registry.register(KeyboardNavigationCheckedRule())
-    registry.register(NoFocusTrapRule())
-    registry.register(SmallClickTargetsRule())
-    registry.register(FocusIndicatorRule())
-    registry.register(UnreachableElementsRule())
-    registry.register(SkipNavigationRule())
-    # Misc A11y (233, 236)
-    registry.register(HtmlLangA11yRule())
-    registry.register(LinksHaveDescriptiveTextRule())
+    """Register all accessibility rules with the registry."""
+    registry.register(TextContrastRule())
+    registry.register(FormInputsLabelsRule())
+    registry.register(KeyboardAccessibilityRule())
+    registry.register(FocusIndicatorsRule())
+    registry.register(PageLanguageRule())
+    registry.register(VideoCaptionsRule())
+    registry.register(TapTargetSizeRule())
+    registry.register(AxeViolationsRule())  # 🚀 NEW: Process real axe violations

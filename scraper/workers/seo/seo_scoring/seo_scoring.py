@@ -209,18 +209,6 @@ def calculate_page_score(high_issues: int, medium_issues: int, low_issues: int, 
     # Step 5: SAFE CLAMP
     final_score = max(25, min(100, score))
     
-    # Step 6: DEBUG LOGGING (MANDATORY)
-    debug_info = {
-        "high": high_issues,
-        "medium": medium_issues,
-        "low": low_issues,
-        "damage": damage,
-        "normalized_damage": normalized_damage,
-        "penalty": penalty,
-        "final_score": final_score
-    }
-    print(f"[SEO_SCORING_DEBUG] {debug_info}")
-    
     return round(final_score, 2)
 
 def page_grade(score: float) -> str:
@@ -254,7 +242,6 @@ def execute_seo_scoring_logic(job):
             raise ValueError(f"Invalid projectId: {job.projectId}")
         
         project_object_id = ObjectId(job.projectId)
-        print(f"[DEBUG] ProjectId converted to ObjectId: {project_object_id}")
         
         db = get_db_connection()
         
@@ -277,9 +264,8 @@ def execute_seo_scoring_logic(job):
         # PHASE 3: DATA COLLECTION
         project_field = field_mapping["project"]
         
-        # DEBUG: Check total pages for project first
+        # Check total pages for project first
         total_pages_count = db.seo_page_data.count_documents({project_field: project_object_id})
-        print(f"[DEBUG] total pages for project: {total_pages_count}")
         
         # Use ONLY fields that definitely exist - minimal filtering for now
         page_query = {
@@ -287,14 +273,13 @@ def execute_seo_scoring_logic(job):
             "scrape_status": "SUCCESS"   # ✅ correct field - minimal filtering
         }
         
-        # DEBUG: Check filtered pages count
+        # Check filtered pages count
         filtered_pages_count = db.seo_page_data.count_documents(page_query)
-        print(f"[DEBUG] filtered pages: {filtered_pages_count}")
         
         pages = list(db.seo_page_data.find(page_query))
         issues = list(db.seo_page_issues.find({project_field: project_object_id}))
         
-        print(f"[DEBUG] pages_found={len(pages)} | issues_found={len(issues)} | jobId={job.jobId}")
+        print(f"[INFO] Found {len(pages)} pages and {len(issues)} issues | jobId={job.jobId}")
         
         if len(pages) == 0:
             error_msg = f"No pages found for project {job.projectId} in seo_page_data after filtering"
@@ -313,7 +298,7 @@ def execute_seo_scoring_logic(job):
                     issues_by_url[page_url] = []
                 issues_by_url[page_url].append(issue)
         
-        print(f"[DEBUG] pages_with_issues={len(issues_by_url)} | jobId={job.jobId}")
+        print(f"[INFO] Grouped issues for {len(issues_by_url)} pages | jobId={job.jobId}")
         
         # PHASE 5: SCORING
         page_scores = []
@@ -329,7 +314,6 @@ def execute_seo_scoring_logic(job):
             
             page_url = page.get(url_data_field)
             if not page_url:
-                print(f"[DEBUG] Skipping page without URL | jobId={job.jobId}")
                 continue
             
             page_issues = issues_by_url.get(page_url, [])
@@ -369,7 +353,7 @@ def execute_seo_scoring_logic(job):
         # Calculate website score
         website_score = total_score / pages_scored if pages_scored > 0 else 0
         
-        print(f"[DEBUG] pages_scored={pages_scored} | website_score={website_score:.2f} | jobId={job.jobId}")
+        print(f"[INFO] Scored {pages_scored} pages, website score: {website_score:.2f} | jobId={job.jobId}")
         
         # PHASE 6: STORAGE
         if page_scores:
@@ -426,10 +410,11 @@ def execute_seo_scoring_logic(job):
                 
                 print(f"[WEBSITE] Website score calculated | score={website_score} | grade={website_grade_letter} | jobId={job.jobId}")
                 
-                # DEBUG: Verify project exists before update
+                # Verify project exists before update
                 project_check = db.seoprojects.find_one({"_id": project_object_id})
                 if project_check:
-                    print(f"[DEBUG] Project found | projectId={job.projectId} | project_object_id={project_object_id} | current_fields={list(project_check.keys())}")
+                    # Project exists, proceed with update
+                    pass
                 else:
                     print(f"[ERROR] Project NOT found | projectId={job.projectId} | project_object_id={project_object_id}")
                     print(f"[DEBUG] Available projects (first 3):")

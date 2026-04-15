@@ -224,6 +224,444 @@ def detect_media_elements(html: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# SEO ENRICHMENT LAYER - P0 FUNCTIONS
+# ---------------------------------------------------------------------------
+
+def check_link_status_batch(links: list, base_url: str, timeout: int = 7, max_links: int = 30) -> dict:
+    """
+    Check HTTP status for internal/external links with parallel processing.
+    
+    Args:
+        links: List of URLs to check
+        base_url: Base URL for domain comparison
+        timeout: Request timeout in seconds
+        max_links: Maximum links to process
+        
+    Returns:
+        dict with internal_links_status, external_links_status, broken_links_count
+    """
+    if not links:
+        return {
+            "internal_links_status": {},
+            "external_links_status": {},
+            "broken_links_count": 0
+        }
+    
+    try:
+        base_domain = get_registrable_domain(base_url)
+        link_status = {"internal": {}, "external": {}}
+        broken_count = 0
+        
+        def check_single_link(url):
+            try:
+                response = requests.head(
+                    url, 
+                    timeout=timeout, 
+                    allow_redirects=True,
+                    headers={'User-Agent': random.choice(USER_AGENTS)}
+                )
+                return {
+                    'status_code': response.status_code,
+                    'final_url': response.url,
+                    'redirect_count': len(response.history) if hasattr(response, 'history') else 0,
+                    'error': None
+                }
+            except Exception as e:
+                return {
+                    'status_code': None,
+                    'final_url': url,
+                    'redirect_count': 0,
+                    'error': str(e)[:100]
+                }
+        
+        # Process links in parallel with limits
+        limited_links = links[:max_links]
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(check_single_link, url): url for url in limited_links}
+            
+            for future in as_completed(futures):
+                url = futures[future]
+                result = future.result()
+                
+                # Categorize as internal/external
+                link_domain = get_registrable_domain(url)
+                is_internal = link_domain == base_domain
+                
+                category = "internal" if is_internal else "external"
+                link_status[category][url] = result
+                
+                # Count broken links (only real 4XX/5XX errors, not timeouts)
+                if result['status_code'] is None:
+                    # timeout / network issue - DO NOT COUNT as broken
+                    continue
+                elif result['status_code'] >= 400:
+                    broken_count += 1
+        
+        return {
+            "internal_links_status": link_status["internal"],
+            "external_links_status": link_status["external"],
+            "broken_links_count": broken_count
+        }
+        
+    except Exception as e:
+        return {
+            "internal_links_status": {},
+            "external_links_status": {},
+            "broken_links_count": 0,
+            "error": str(e)
+        }
+
+
+def calculate_html_metrics(html: str) -> dict:
+    """
+    Calculate code-to-HTML ratio and size metrics.
+    
+    Args:
+        html: Raw HTML string
+        
+    Returns:
+        dict with html_size_bytes, visible_text_bytes, code_to_html_ratio
+    """
+    try:
+        if not html:
+            return {
+                "html_size_bytes": 0,
+                "visible_text_bytes": 0,
+                "code_to_html_ratio": 0,
+                "error": "no_html_provided"
+            }
+        
+        # Total HTML size
+        html_size = len(html.encode('utf-8'))
+        
+        # Create copy for visible text extraction
+        text_soup = BeautifulSoup(html, "lxml")
+        
+        # Remove non-visible elements
+        for element in text_soup(["script", "style", "noscript", "meta", "link"]):
+            element.decompose()
+        
+        # Get visible text
+        visible_text = text_soup.get_text(strip=True, separator=' ')
+        visible_text_size = len(visible_text.encode('utf-8'))
+        
+        # Calculate ratio
+        code_to_html_ratio = (visible_text_size / html_size * 100) if html_size > 0 else 0
+        
+        return {
+            "html_size_bytes": html_size,
+            "visible_text_bytes": visible_text_size,
+            "code_to_html_ratio": round(code_to_html_ratio, 2),
+            "code_size_bytes": html_size - visible_text_size
+        }
+        
+    except Exception as e:
+        return {
+            "html_size_bytes": 0,
+            "visible_text_bytes": 0,
+            "code_to_html_ratio": 0,
+            "error": str(e)
+        }
+
+
+def analyze_url_structure(current_url: str, internal_links: list) -> dict:
+    """
+    Analyze URL structure for SEO issues.
+    
+    Args:
+        current_url: Current page URL
+        internal_links: List of internal links
+        
+    Returns:
+        dict with URL structure analysis
+    """
+    try:
+        from urllib.parse import urlparse, parse_qs
+        
+        parsed = urlparse(current_url)
+        
+        # Check for parameters
+        has_params = bool(parsed.query)
+        param_count = len(parse_qs(parsed.query)) if has_params else 0
+        
+        # Check for double slashes in path
+        path_clean = parsed.path.replace('https://', '').replace('http://', '')
+        has_double_slash = '//' in path_clean
+        
+        # URL length analysis
+        url_length = len(current_url)
+        
+        # Analyze internal links for length issues
+        long_urls = []
+        for link in internal_links[:100]:  # Limit for performance
+            if len(link) > 115:
+                long_urls.append({
+                    "url": link,
+                    "length": len(link),
+                    "excess_length": len(link) - 115
+                })
+        
+        return {
+            "url_length": url_length,
+            "has_parameters": has_params,
+            "parameter_count": param_count,
+            "has_double_slash": has_double_slash,
+            "long_urls_count": len(long_urls),
+            "long_urls": long_urls[:10]  # Limit output
+        }
+        
+    except Exception as e:
+        return {
+            "url_length": 0,
+            "has_parameters": False,
+            "parameter_count": 0,
+            "has_double_slash": False,
+            "long_urls_count": 0,
+            "error": str(e)
+        }
+
+
+def detect_mixed_content(soup: BeautifulSoup, base_url: str) -> dict:
+    """
+    Detect HTTP resources on HTTPS pages.
+    
+    Args:
+        soup: BeautifulSoup object
+        base_url: Base URL of the page
+        
+    Returns:
+        dict with mixed content analysis
+    """
+    try:
+        if not base_url.startswith('https://'):
+            return {
+                "mixed_content_detected": False,
+                "mixed_content_count": 0,
+                "mixed_resources": [],
+                "reason": "page_not_https"
+            }
+        
+        mixed_resources = []
+        
+        # Check all resource types
+        resource_tags = {
+            'img': 'src',
+            'script': 'src', 
+            'link': 'href',
+            'iframe': 'src',
+            'video': 'src',
+            'audio': 'src'
+        }
+        
+        for tag_name, attr in resource_tags.items():
+            for tag in soup.find_all(tag_name):
+                resource_url = tag.get(attr)
+                if resource_url and resource_url.startswith('http://'):
+                    mixed_resources.append({
+                        "tag": tag_name,
+                        "url": resource_url,
+                        "attribute": attr
+                    })
+        
+        return {
+            "mixed_content_detected": len(mixed_resources) > 0,
+            "mixed_content_count": len(mixed_resources),
+            "mixed_resources": mixed_resources[:20]  # Limit output
+        }
+        
+    except Exception as e:
+        return {
+            "mixed_content_detected": False,
+            "mixed_content_count": 0,
+            "mixed_resources": [],
+            "error": str(e)
+        }
+
+
+def calculate_keyword_density(text: str, title: str, meta_description: str) -> dict:
+    """
+    Calculate keyword density and identify primary keyword.
+    
+    Args:
+        text: Page text content
+        title: Page title
+        meta_description: Meta description
+        
+    Returns:
+        dict with keyword analysis
+    """
+    try:
+        if not text or len(text.strip()) < 50:
+            return {
+                "keyword_density": 0,
+                "primary_keyword": None,
+                "keyword_count": 0,
+                "total_words": 0,
+                "error": "insufficient_text"
+            }
+        
+        # Clean and normalize text
+        words = re.findall(r'\b[a-z]+\b', text.lower())
+        total_words = len(words)
+        
+        if total_words < 10:
+            return {
+                "keyword_density": 0,
+                "primary_keyword": None,
+                "keyword_count": 0,
+                "total_words": total_words
+            }
+        
+        # Get word frequencies
+        from collections import Counter
+        word_freq = Counter(words)
+        
+        # Remove common stop words
+        stop_words = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+            'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did',
+            'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these',
+            'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what', 'which', 'who',
+            'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more',
+            'most', 'other', 'some', 'such', 'only', 'own', 'same', 'so', 'than', 'too',
+            'very', 'just', 'now', 'also', 'back', 'even', 'further', 'still', 'yet'
+        }
+        
+        # Filter out stop words and short words
+        meaningful_words = {word: count for word, count in word_freq.items() 
+                          if word not in stop_words and len(word) > 2}
+        
+        # Find primary keyword (most frequent meaningful word)
+        if meaningful_words:
+            primary_keyword = max(meaningful_words, key=meaningful_words.get)
+            keyword_count = meaningful_words[primary_keyword]
+            keyword_density = (keyword_count / total_words * 100)
+            
+            # Check if keyword appears in title/meta
+            in_title = primary_keyword in title.lower() if title else False
+            in_meta = primary_keyword in meta_description.lower() if meta_description else False
+            
+            return {
+                "keyword_density": round(keyword_density, 2),
+                "primary_keyword": primary_keyword,
+                "keyword_count": keyword_count,
+                "total_words": total_words,
+                "in_title": in_title,
+                "in_meta_description": in_meta
+            }
+        
+        return {
+            "keyword_density": 0,
+            "primary_keyword": None,
+            "keyword_count": 0,
+            "total_words": total_words
+        }
+        
+    except Exception as e:
+        return {
+            "keyword_density": 0,
+            "primary_keyword": None,
+            "keyword_count": 0,
+            "total_words": 0,
+            "error": str(e)
+        }
+
+
+def detect_iframe_wrapping(soup: BeautifulSoup) -> dict:
+    """
+    Detect full-site iframe wrapping.
+    
+    Args:
+        soup: BeautifulSoup object
+        
+    Returns:
+        dict with iframe analysis
+    """
+    try:
+        iframes = soup.find_all('iframe')
+        
+        for iframe in iframes:
+            # Check for full-site iframe indicators
+            width = iframe.get('width', '').lower()
+            height = iframe.get('height', '').lower()
+            src = iframe.get('src', '')
+            
+            # Full-site iframe characteristics
+            is_full_width = width in ['100%', '100vw', '1000px', '1200px', '1920px']
+            is_full_height = height in ['100%', '100vh', '800px', '900px', '1080px']
+            
+            if is_full_width and is_full_height:
+                return {
+                    "full_site_iframe_detected": True,
+                    "iframe_src": src,
+                    "iframe_dimensions": {"width": width, "height": height},
+                    "is_external": bool(src and src.startswith('http') and not src.startswith('https://www.sapphiredigitalagency.com'))
+                }
+        
+        return {"full_site_iframe_detected": False}
+        
+    except Exception as e:
+        return {"full_site_iframe_detected": False, "error": str(e)}
+
+
+def analyze_404_page(soup: BeautifulSoup, status_code: int) -> dict:
+    """
+    Analyze 404 page content for helpful navigation.
+    
+    Args:
+        soup: BeautifulSoup object
+        status_code: HTTP status code
+        
+    Returns:
+        dict with 404 page analysis
+    """
+    try:
+        if status_code != 404:
+            return {
+                "is_404_page": False,
+                "custom_404_detected": False,
+                "has_navigation": False,
+                "has_home_link": False,
+                "has_search": False,
+                "has_helpful_text": False
+            }
+        
+        # Check for helpful elements (improved detection)
+        has_navigation = bool(soup.find('nav') or soup.find('header') or soup.find('div', class_=re.compile(r'nav|menu', re.IGNORECASE)))
+        has_home_link = bool(soup.find('a', href=re.compile(r'^(\/|#|https?:\/\/.*\/?$)', re.IGNORECASE)) or 
+                           soup.find('a', string=re.compile(r'home|homepage', re.IGNORECASE)))
+        has_search = bool(soup.find('input', type='search') or soup.find('form'))
+        
+        # Check for helpful text
+        page_text = soup.get_text().lower()
+        helpful_indicators = ['not found', 'page not found', 'error 404', 'broken link', 'moved', 'home', 'search']
+        has_helpful_text = any(indicator in page_text for indicator in helpful_indicators)
+        
+        # Determine if it's a custom 404
+        is_custom_404 = has_navigation or has_home_link or has_search or has_helpful_text
+        
+        return {
+            "is_404_page": True,
+            "custom_404_detected": is_custom_404,
+            "has_navigation": has_navigation,
+            "has_home_link": has_home_link,
+            "has_search": has_search,
+            "has_helpful_text": has_helpful_text
+        }
+        
+    except Exception as e:
+        return {
+            "is_404_page": False,
+            "custom_404_detected": False,
+            "has_navigation": False,
+            "has_home_link": False,
+            "has_search": False,
+            "has_helpful_text": False,
+            "error": str(e)
+        }
+
+
+# ---------------------------------------------------------------------------
 # Internal Link Extraction for CRAWL_GRAPH
 # ---------------------------------------------------------------------------
 _EXCLUDED_SCHEMES = frozenset(["mailto:", "tel:", "javascript:"])
@@ -441,6 +879,146 @@ def execute_page_scraping_logic(job: PageScrapingJob):
                             page_data["media_analysis"] = detect_media_elements(html_for_media)
                     except Exception as media_err:
                         print(f"[WARNING] Media detection failed for {url}: {media_err}")
+
+                    # --- SEO ENRICHMENT LAYER - P0 FUNCTIONS ---
+                    try:
+                        print(f"\n🔍 [SEO DEBUG] Starting enrichment for URL: {url}")
+                        
+                        # Get necessary data for SEO analysis
+                        raw_html = page_data.get("raw_html", "")
+                        internal_links = page_data.get("internal_links", [])
+                        http_status = page_data.get("http_status_code", 200)
+                        
+                        # Create BeautifulSoup object for DOM analysis
+                        seo_soup = BeautifulSoup(raw_html, "lxml") if raw_html else None
+                        
+                        print(f"[SEO DEBUG] raw_html exists: {bool(raw_html)}, length: {len(raw_html) if raw_html else 0}")
+                        print(f"[SEO DEBUG] internal_links count: {len(internal_links)}")
+                        print(f"[SEO DEBUG] http_status: {http_status}")
+                        print(f"[SEO DEBUG] seo_soup exists: {bool(seo_soup)}")
+                        
+                        # A. Link Status Analysis
+                        print(f"[SEO DEBUG] Checking link status analysis...")
+                        if internal_links:
+                            print(f"[SEO DEBUG] Running link analysis with {len(internal_links)} links")
+                            link_analysis = check_link_status_batch(internal_links, url)
+                            print(f"[SEO DEBUG] Link analysis result keys: {list(link_analysis.keys())}")
+                            page_data.update(link_analysis)
+                        else:
+                            print(f"[SEO DEBUG] Skipping link analysis - no internal links")
+                        
+                        # B. HTML Metrics
+                        print(f"[SEO DEBUG] Checking HTML metrics...")
+                        if raw_html:
+                            print(f"[SEO DEBUG] Running HTML metrics calculation")
+                            html_metrics = calculate_html_metrics(raw_html)
+                            print(f"[SEO DEBUG] HTML metrics keys: {list(html_metrics.keys())}")
+                            page_data.update(html_metrics)
+                        else:
+                            print(f"[SEO DEBUG] Skipping HTML metrics - no raw HTML")
+                        
+                        # C. URL Structure Analysis
+                        print(f"[SEO DEBUG] Running URL structure analysis...")
+                        url_structure = analyze_url_structure(url, internal_links)
+                        print(f"[SEO DEBUG] URL structure keys: {list(url_structure.keys())}")
+                        page_data.update(url_structure)
+                        
+                        # D. Mixed Content Detection
+                        print(f"[SEO DEBUG] Checking mixed content detection...")
+                        if seo_soup:
+                            print(f"[SEO DEBUG] Running mixed content detection")
+                            mixed_content = detect_mixed_content(seo_soup, url)
+                            print(f"[SEO DEBUG] Mixed content keys: {list(mixed_content.keys())}")
+                            page_data.update(mixed_content)
+                        else:
+                            print(f"[SEO DEBUG] Skipping mixed content - no soup")
+                        
+                        # E. Keyword Density
+                        print(f"[SEO DEBUG] Checking keyword density...")
+                        content_text = page_data.get("content", {}).get("text", "")
+                        page_title = page_data.get("title", "")
+                        meta_desc_list = page_data.get("meta_tags", {}).get("description", [])
+                        meta_description = meta_desc_list[0] if meta_desc_list else ""
+                        
+                        print(f"[SEO DEBUG] content_text length: {len(content_text)}")
+                        print(f"[SEO DEBUG] page_title: {page_title}")
+                        print(f"[SEO DEBUG] meta_description exists: {bool(meta_description)}")
+                        
+                        if content_text:
+                            print(f"[SEO DEBUG] Running keyword density calculation")
+                            keyword_analysis = calculate_keyword_density(content_text, page_title, meta_description)
+                            print(f"[SEO DEBUG] Keyword analysis keys: {list(keyword_analysis.keys())}")
+                            page_data.update(keyword_analysis)
+                        else:
+                            print(f"[SEO DEBUG] Skipping keyword density - no content text")
+                        
+                        # F. iFrame Detection
+                        print(f"[SEO DEBUG] Checking iframe detection...")
+                        if seo_soup:
+                            print(f"[SEO DEBUG] Running iframe detection")
+                            iframe_analysis = detect_iframe_wrapping(seo_soup)
+                            print(f"[SEO DEBUG] iFrame analysis keys: {list(iframe_analysis.keys())}")
+                            page_data.update(iframe_analysis)
+                        else:
+                            print(f"[SEO DEBUG] Skipping iframe detection - no soup")
+                        
+                        # G. 404 Page Analysis
+                        print(f"[SEO DEBUG] Running 404 page analysis...")
+                        error_page_analysis = analyze_404_page(seo_soup, http_status)
+                        print(f"[SEO DEBUG] 404 analysis keys: {list(error_page_analysis.keys())}")
+                        page_data.update(error_page_analysis)
+                        
+                        # FINAL VALIDATION
+                        print(f"\n🔍 [SEO DEBUG] ENRICHMENT COMPLETE - VALIDATING REQUIRED FIELDS:")
+                        required_fields = [
+                            'broken_links_count', 'internal_links_status', 'external_links_status',
+                            'code_to_html_ratio', 'keyword_density', 'primary_keyword',
+                            'mixed_content_detected', 'url_length', 'has_parameters',
+                            'has_double_slash', 'long_urls_count', 'full_site_iframe_detected',
+                            'custom_404_detected'
+                        ]
+                        
+                        missing_fields = []
+                        present_fields = []
+                        for field in required_fields:
+                            if field in page_data:
+                                present_fields.append(f"{field}: {page_data[field]}")
+                            else:
+                                missing_fields.append(field)
+                        
+                        print(f"[SEO DEBUG] ✅ PRESENT FIELDS ({len(present_fields)}):")
+                        for field in present_fields:
+                            print(f"  - {field}")
+                        
+                        if missing_fields:
+                            print(f"[SEO DEBUG] ❌ MISSING FIELDS ({len(missing_fields)}):")
+                            for field in missing_fields:
+                                print(f"  - {field}")
+                        else:
+                            print(f"[SEO DEBUG] 🎉 ALL REQUIRED FIELDS PRESENT!")
+                        
+                    except Exception as seo_err:
+                        print(f"[SEO ERROR] ❌ SEO enrichment failed for {url}: {seo_err}")
+                        import traceback
+                        traceback.print_exc()
+                        # Add error status but don't crash
+                        page_data.update({
+                            "seo_enrichment_status": "partial",
+                            "seo_enrichment_error": str(seo_err)[:200]
+                        })
+
+                    # FINAL OUTPUT LOGGING
+                    print(f"\n🔍 [SEO DEBUG] FINAL PAGE DATA OUTPUT:")
+                    import json
+                    try:
+                        output_sample = json.dumps(page_data, indent=2, default=str)[:3000]
+                        print(output_sample)
+                        if len(json.dumps(page_data, indent=2, default=str)) > 3000:
+                            print("\n... (truncated for display)")
+                    except Exception as json_err:
+                        print(f"[SEO DEBUG] Could not serialize page_data: {json_err}")
+                        print(f"[SEO DEBUG] page_data keys: {list(page_data.keys()) if isinstance(page_data, dict) else 'not_dict'}")
+                        print(f"[SEO DEBUG] page_data type: {type(page_data)}")
 
                     return page_data
 

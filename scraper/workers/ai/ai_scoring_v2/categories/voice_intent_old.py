@@ -6,8 +6,8 @@ Focuses on conversational language, intent matching, and voice search readiness.
 """
 
 from typing import Dict, Any
-from rule_base import BaseRule
-from scoring_engine import safe_len
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.scoring_engine import safe_len
 
 class IntentClarityRule(BaseRule):
     """Evaluates clarity and strength of user intent"""

@@ -7,3 +7,4 @@ selenium
 pymongo
 pydantic
 webdriver-manager
+playwright

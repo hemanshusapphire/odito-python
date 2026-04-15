@@ -9,6 +9,37 @@ from .seo_rule_registry import SEORuleRegistry
 from bson.objectid import ObjectId
 from typing import Dict, List, Any
 from .categories import register_all_seo_categories
+import os
+
+
+def detect_page_type_safely(normalized: dict, url: str) -> str:
+    """
+    Safe page type detection using existing normalized data.
+    Returns 'general' if detection fails (fallback to current behavior).
+    """
+    try:
+        url_lower = url.lower()
+        content_lower = normalized.get("content_text", "").lower()
+        
+        # URL-based detection (highest confidence)
+        if any(pattern in url_lower for pattern in ['/contact', '/contact-us', '/support', '/help']):
+            return 'contact'
+        elif any(pattern in url_lower for pattern in ['/blog', '/article', '/post']):
+            return 'blog'
+        elif any(pattern in url_lower for pattern in ['/service', '/solution']):
+            return 'service'
+        elif any(pattern in url_lower for pattern in ['/about', '/team']):
+            return 'about'
+        
+        # Content-based detection (fallback)
+        if any(word in content_lower for word in ['contact form', 'email us', 'get in touch', 'contact us']):
+            return 'contact'
+        elif any(word in content_lower for word in ['blog post', 'article', 'published']):
+            return 'blog'
+        
+        return 'general'  # SAFE FALLBACK
+    except Exception:
+        return 'general'  # SAFE FALLBACK
 
 
 class SEORuleEngine:
@@ -65,9 +96,8 @@ class SEORuleEngine:
         try:
             validated_job_id = self._validate_object_id(job_id, 'job_id')
             validated_project_id = self._validate_object_id(project_id, 'project_id')
-            print(f"[VALIDATION] ✅ ObjectId validation passed for job_id={job_id}, project_id={project_id}")
         except ValueError as validation_error:
-            print(f"[VALIDATION] ❌ ObjectId validation failed: {validation_error}")
+            print(f"[ERROR] ObjectId validation failed: {validation_error}")
             raise validation_error
 
         issues = []
@@ -82,8 +112,20 @@ class SEORuleEngine:
         applicable_rules = 0
         recommendation_count = 0  # FIXED: Track recommendations separately
 
+        # Detect page type once per page
+        page_type = detect_page_type_safely(normalized, url)
+        DEBUG = os.environ.get("DEBUG_SEO_RULES", "false").lower() == "true"
+        
         for rule in all_rules:
             try:
+                # NEW: Skip rule if excluded for this page type
+                if hasattr(rule, 'get_excluded_page_types') and page_type in rule.get_excluded_page_types():
+                    if DEBUG:
+                        print(f"[RULE_SKIP] {rule.rule_id} excluded for {page_type} page")
+                    continue
+                
+                # Execute rule without excessive debug logging
+                
                 rule_issues = rule.evaluate(normalized, job_id, project_id, url)
                 
                 # Initialize category stats if needed
@@ -108,22 +150,18 @@ class SEORuleEngine:
                         issues.extend(high_medium_issues)
                         failed_count += 1
                         category_stats[rule.category]["failed"] += 1
-                        print(f"[RULE] ✅ {rule.rule_id}: {len(high_medium_issues)} issues generated")
                     
                     # Add info/low severity recommendations
                     if info_recommendations:
                         recommendations.extend(info_recommendations)
                         recommendation_count += 1
                         category_stats[rule.category]["recommendations"] += 1
-                        print(f"[RULE] ℹ️ {rule.rule_id}: {len(info_recommendations)} recommendations generated")
                     
                     applicable_rules += 1
-                else:
-                    # Rule passed (empty return = passed for now)
-                    passed_count += 1
+                    
+                else:  # No issues found
                     category_stats[rule.category]["passed"] += 1
                     applicable_rules += 1
-                    print(f"[RULE] ✅ {rule.rule_id}: No issues")
                     
             except Exception as e:
                 # Rule skipped due to error
@@ -192,11 +230,10 @@ class SEORuleEngine:
             if dedupe_key not in seen_keys:
                 seen_keys.add(dedupe_key)
                 deduplicated.append(issue)
-            else:
-                print(f"[DEDUPE] Removed duplicate issue: {rule_id} - {message[:50]}...")
         
         if len(deduplicated) < len(issues):
-            print(f"[DEDUPE] Removed {len(issues) - len(deduplicated)} duplicate issues")
+            removed_count = len(issues) - len(deduplicated)
+            print(f"[INFO] Removed {removed_count} duplicate issues")
         
         return deduplicated
 

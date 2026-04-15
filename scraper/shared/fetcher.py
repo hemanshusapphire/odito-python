@@ -126,10 +126,6 @@ def fetch_html(url: str, timeout: int = 8) -> tuple[str, int, int, dict]:
     # Large HTML protection
     MAX_HTML_SIZE = MAX_HTML_SIZE_MB * 1024 * 1024  # Convert MB to bytes
     
-    # DEBUG: Add detailed URL analysis
-    print(f"[DEBUG] fetch_html input: '{url}'")
-    print(f"[DEBUG] URL repr: {repr(url)}")
-    print(f"[DEBUG] URL type: {type(url)}")
     
     # Validate URL format
     if not url or not isinstance(url, str):
@@ -171,7 +167,6 @@ def fetch_html(url: str, timeout: int = 8) -> tuple[str, int, int, dict]:
     for attempt in range(3):
         try:
             start_time = time.time()
-            print(f"[DEBUG] Making request to: {url} (attempt {attempt + 1}/3)")
             res = requests.get(url, headers=headers, timeout=timeout)
             res.raise_for_status()
             html = res.text
@@ -185,7 +180,6 @@ def fetch_html(url: str, timeout: int = 8) -> tuple[str, int, int, dict]:
                 print(f"[SAFETY] {error_msg}")
                 raise ValueError(error_msg)
             
-            print(f"[DEBUG] Response received: status={res.status_code}, size={len(html)}")
 
             if SELENIUM_AVAILABLE and needs_js_rendering(html):
                 html, status, _, _ = fetch_html_selenium(url, timeout * 3)
@@ -195,10 +189,8 @@ def fetch_html(url: str, timeout: int = 8) -> tuple[str, int, int, dict]:
             return html, res.status_code, response_time_ms, resp_headers
             
         except requests.RequestException as e:
-            print(f"[DEBUG] Request failed (attempt {attempt + 1}/3): {e}")
             if attempt == 2:  # Final attempt
                 if SELENIUM_AVAILABLE:
-                    print(f"[DEBUG] Falling back to Selenium after {attempt + 1} failed attempts")
                     html, status, response_time_ms, _ = fetch_html_selenium(url, timeout * 3)
                     _cache_js_domain(url)
                     return html, status, response_time_ms, {}

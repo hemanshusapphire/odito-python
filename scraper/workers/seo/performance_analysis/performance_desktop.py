@@ -143,18 +143,11 @@ def execute_performance_desktop_logic(job):
         # 1. Send initial progress
         send_progress_update(job_id, 10, "PERFORMANCE_DESKTOP", "Starting desktop performance analysis")
         
-        # 2. Get pages from seo_page_data collection by projectId only
-        print(f"[DEBUG] PERFORMANCE_DESKTOP MongoDB Audit:")
-        print(f"[DEBUG] - Database: {seo_page_data.database.name}")
-        print(f"[DEBUG] - Collection: {seo_page_data.name}")
-        print(f"[DEBUG] - projectId type: {type(project_id)} | value: {project_id}")
-        
+        # Get pages from seo_page_data collection by projectId only
         # Convert to ObjectId if string
-        from bson.objectid import ObjectId
         if isinstance(project_id, str):
             try:
                 project_id_obj = ObjectId(project_id)
-                print(f"[DEBUG] - projectId converted to ObjectId: {project_id_obj}")
             except Exception as e:
                 print(f"[ERROR] Failed to convert projectId to ObjectId: {e}")
                 project_id_obj = project_id
@@ -162,31 +155,7 @@ def execute_performance_desktop_logic(job):
             project_id_obj = project_id
         
         query_filter = {"projectId": project_id_obj}
-        print(f"[DEBUG] - Query filter: {query_filter}")
-        
-        # Get count first
-        total_count = seo_page_data.count_documents(query_filter)
-        print(f"[DEBUG] - Document count: {total_count}")
-        
-        # Execute query
         pages = list(seo_page_data.find(query_filter))
-        
-        print(f"[DEBUG] - Pages returned: {len(pages)}")
-        
-        # Log sample document if available
-        if pages:
-            sample_doc = pages[0]
-            print(f"[DEBUG] - Sample document keys: {list(sample_doc.keys())}")
-            print(f"[DEBUG] - Sample projectId: {sample_doc.get('projectId')} (type: {type(sample_doc.get('projectId'))})")
-            print(f"[DEBUG] - Sample page_url: {sample_doc.get('page_url', 'N/A')}")
-        else:
-            # Log what documents DO exist for debugging
-            all_docs = list(seo_page_data.find({}).limit(3))
-            if all_docs:
-                print(f"[DEBUG] - Existing document keys: {list(all_docs[0].keys())}")
-                print(f"[DEBUG] - Existing projectId field: {all_docs[0].get('projectId')} (type: {type(all_docs[0].get('projectId'))})")
-            else:
-                print(f"[DEBUG] - Collection is completely empty!")
         
         print(f"[PERFORMANCE] Pages fetched: {len(pages)}")
         
@@ -217,8 +186,7 @@ def execute_performance_desktop_logic(job):
                 continue
             
             try:
-                # Placeholder performance data - NO PageSpeed API calls yet
-                print(f"[DEBUG] Processing page {i+1}/{len(pages)} | URL: {page_url}")
+                # Process page for performance analysis
                 
                 performance_data = {
                     "projectId": ObjectId(project_id),  # FIXED: Convert to ObjectId
@@ -310,7 +278,6 @@ def send_completion_callback(job_id: str, stats: dict, result_data: dict):
         response = requests.post(node_url, json=callback_payload, timeout=10)
         response.raise_for_status()
         
-        print(f"[API] PERFORMANCE_DESKTOP completion sent | jobId={job_id}")
         
     except Exception as callback_error:
         print(f"[ERROR] Failed to send PERFORMANCE_DESKTOP completion | jobId={job_id} | error=\"{str(callback_error)}\"")
@@ -339,7 +306,6 @@ def send_failure_callback(job_id: str, error: str):
         response = requests.post(node_fail_url, json=fail_payload, timeout=10)
         response.raise_for_status()
         
-        print(f"[API] PERFORMANCE_DESKTOP failure sent | jobId={job_id}")
         
     except Exception as callback_error:
         print(f"[CRITICAL] Failed to send PERFORMANCE_DESKTOP failure | jobId={job_id} | error=\"{str(callback_error)}\"")

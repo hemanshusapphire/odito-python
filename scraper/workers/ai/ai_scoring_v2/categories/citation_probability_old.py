@@ -7,7 +7,7 @@ Focuses on authority, trustworthiness, and citation-worthy content elements.
 
 import json
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class AuthoritySignalsRule(BaseRule):
     """Evaluates authority signals in content"""

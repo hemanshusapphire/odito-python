@@ -7,7 +7,7 @@ Focuses on clarity, structure, and machine-readability factors.
 
 import json
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class ServicePages800WordsRule(BaseRule):
     """Rule 22 — Service pages 800+ words"""
@@ -26,6 +26,12 @@ class ServicePages800WordsRule(BaseRule):
     def evaluate(self, data: Dict[str, Any]) -> float:
         """Check for service pages with 800+ words"""
         content_metrics = data.get("content_metrics", {})
+        page_type_props = data.get("page_type_properties", {})
+        
+        # Only evaluate on actual service pages
+        detected_type = page_type_props.get("detected_type", "")
+        if detected_type != "Service":
+            return 0.0
         
         score = 0
         word_count = content_metrics.get("word_count", 0)
@@ -234,7 +240,8 @@ class GeoCoordinatesInSchemaRule(BaseRule):
             "description": "GeoCoordinates in schema",
             "weight": 1.0,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "is_required": False  # Geo coordinates are optional, only for local businesses
         }
         super().__init__(config)
     
@@ -311,7 +318,8 @@ class AreaServedDefinedRule(BaseRule):
             "description": "areaServed defined",
             "weight": 1.0,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "is_required": False  # Area served is optional, only for local businesses
         }
         super().__init__(config)
     

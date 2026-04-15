@@ -198,13 +198,72 @@ def extract_head_and_meta_data(soup: BeautifulSoup, seo_data: dict):
         # Canonical missing data extracted
         pass
     
+    # S1/S2 - Title pixel length analysis
+    title_pixel_width = 0
+    desktop_status = "PASS"
+    mobile_status = "PASS"
+    
+    if title:
+        # Approximate pixel width (character-based estimation)
+        # Average character width: ~8px for desktop, ~7px for mobile
+        title_pixel_width = len(title) * 8
+        
+        if title_pixel_width > 600:
+            desktop_status = "FAIL"
+        elif title_pixel_width > 500:
+            desktop_status = "WARNING"
+            
+        if title_pixel_width > 500:
+            mobile_status = "FAIL"
+        elif title_pixel_width > 400:
+            mobile_status = "WARNING"
+    
+    # S3 - Meta description CTR optimization
+    meta_description = meta_tags.get("description", [""])[0] if meta_tags.get("description") else ""
+    meta_ctr_score = 0
+    has_power_word = False
+    has_cta = False
+    
+    if meta_description:
+        # Power words that increase CTR
+        power_words = ["free", "easy", "quick", "best", "top", "proven", "guaranteed", "exclusive", "limited", "save", "new", "ultimate"]
+        # CTA words that drive action
+        cta_words = ["get", "try", "buy", "order", "download", "sign up", "register", "learn", "discover", "explore", "start"]
+        
+        desc_lower = meta_description.lower()
+        has_power_word = any(word in desc_lower for word in power_words)
+        has_cta = any(word in desc_lower for word in cta_words)
+        
+        # Calculate CTR score (0-100)
+        meta_ctr_score = 50  # Base score
+        if has_power_word:
+            meta_ctr_score += 25
+        if has_cta:
+            meta_ctr_score += 25
+        
+        # Optimal length bonus (150-160 characters)
+        if 150 <= len(meta_description) <= 160:
+            meta_ctr_score += 10
+        elif len(meta_description) < 120:
+            meta_ctr_score -= 10
+        elif len(meta_description) > 160:
+            meta_ctr_score -= 5
+    
     # Store in seo_data
     seo_data.update({
         "doctype": doctype,
         "html_lang": html_lang,
         "title": title,
         "meta_tags": meta_tags,
-        "canonical": canonical
+        "canonical": canonical,
+        # S1/S2 - Title pixel analysis
+        "title_pixel_width": title_pixel_width,
+        "desktop_status": desktop_status,
+        "mobile_status": mobile_status,
+        # S3 - Meta description CTR optimization
+        "meta_ctr_score": min(100, max(0, meta_ctr_score)),
+        "has_power_word": has_power_word,
+        "has_cta": has_cta
     })
 
 
@@ -387,6 +446,43 @@ def extract_content_analysis(soup: BeautifulSoup, seo_data: dict):
     # Get clean text content
     text_content = soup.get_text(strip=True, separator=' ')
     
+    # S5/S6 - Anchor text optimization analysis
+    internal_links = soup.find_all("a", href=True)
+    anchor_texts = []
+    generic_anchors = 0
+    keyword_rich_anchors = 0
+    anchor_text_counts = {}
+    
+    # Generic anchor patterns
+    generic_patterns = ["click here", "here", "read more", "learn more", "more", "link", "visit", "view", "check", "see"]
+    
+    for link in internal_links:
+        anchor_text = link.get_text(strip=True).lower()
+        if anchor_text and len(anchor_text) > 0:
+            anchor_texts.append(anchor_text)
+            
+            # Count anchor text frequency for diversity analysis
+            anchor_text_counts[anchor_text] = anchor_text_counts.get(anchor_text, 0) + 1
+            
+            # Classify anchor type
+            if any(pattern in anchor_text for pattern in generic_patterns):
+                generic_anchors += 1
+            elif len(anchor_text) > 3 and not any(pattern in anchor_text for pattern in generic_patterns):
+                keyword_rich_anchors += 1
+    
+    # Calculate anchor text metrics
+    total_anchors = len(anchor_texts)
+    generic_anchor_ratio = (generic_anchors / total_anchors * 100) if total_anchors > 0 else 0
+    keyword_rich_anchor_ratio = (keyword_rich_anchors / total_anchors * 100) if total_anchors > 0 else 0
+    
+    # Check for anchor text diversity issues
+    anchor_diversity_issue = False
+    if total_anchors > 5:  # Only check if there are enough anchors
+        # Find most repeated anchor text
+        max_repeat_count = max(anchor_text_counts.values()) if anchor_text_counts else 0
+        if max_repeat_count > total_anchors * 0.3:  # If one anchor text is used >30% of the time
+            anchor_diversity_issue = True
+    
     seo_data.update({
         "content": {
             "headings": headings,
@@ -397,6 +493,13 @@ def extract_content_analysis(soup: BeautifulSoup, seo_data: dict):
                 "h2_count": len(h2_texts),
                 "total_headings": len(all_headings_flat),
                 "has_proper_hierarchy": h1_count == 1 and len(skipped_levels) == 0 if all_headings_flat else False
+            },
+            # S5/S6 - Anchor text optimization metrics
+            "anchor_analysis": {
+                "total_anchors": total_anchors,
+                "generic_anchor_ratio": round(generic_anchor_ratio, 1),
+                "keyword_rich_anchor_ratio": round(keyword_rich_anchor_ratio, 1),
+                "anchor_diversity_issue": anchor_diversity_issue
             }
         }
     })
@@ -485,6 +588,12 @@ def extract_image_data(soup: BeautifulSoup, base_url: str, seo_data: dict):
     # Image lazy loading data extracted
     
     seo_data["images"] = images
+    # S4 - Alt text quality score calculation
+    alt_text_quality_score = 0
+    if total_images > 0:
+        good_alt_count = total_images - images_without_alt - images_with_empty_alt - images_with_poor_alt
+        alt_text_quality_score = (good_alt_count / total_images) * 100
+    
     seo_data["image_analysis"] = {
         "total_images": total_images,
         "images_with_alt": total_images - images_without_alt - images_with_empty_alt,
@@ -494,7 +603,10 @@ def extract_image_data(soup: BeautifulSoup, base_url: str, seo_data: dict):
         "images_with_poor_alt": images_with_poor_alt,
         "missing_dimensions": missing_dimensions,
         "cls_risk_images": sum(1 for img in images if img["cls_risk"]),
-        "decorative_images": sum(1 for img in images if img["is_decorative"])
+        "decorative_images": sum(1 for img in images if img["is_decorative"]),
+        # S4 - Alt text quality metrics
+        "alt_text_quality_score": round(alt_text_quality_score, 1),
+        "poor_alt_count": images_without_alt + images_with_empty_alt + images_with_poor_alt
     }
 
 

@@ -1,7 +1,7 @@
 """
 TECHNICAL_DOMAIN worker - Pure data collection for domain-level technical data.
 
-Fetches /robots.txt and /sitemap.xml for the project domain.
+Fetches /robots.txt, /sitemap.xml, and /llms.txt for the project domain.
 Stores raw data via the Node.js backend API.
 Reports job completion so the pipeline continues.
 
@@ -13,6 +13,7 @@ import re
 import requests
 from scraper.workers.seo.technical_domain.robots_fetcher import fetch_robots
 from scraper.workers.seo.technical_domain.sitemap_fetcher import fetch_sitemap
+from scraper.workers.seo.technical_domain.llms_fetcher import fetch_llms_txt
 from scraper.workers.seo.technical_domain.ssl_checker import check_ssl_certificate
 from scraper.workers.seo.technical_domain.https_redirect_checker import check_https_redirect
 
@@ -20,7 +21,7 @@ from scraper.workers.seo.technical_domain.https_redirect_checker import check_ht
 
 def execute_technical_domain(job):
     """
-    Execute TECHNICAL_DOMAIN job: fetch robots.txt, sitemap.xml, SSL certificate, and HTTPS redirect, store results.
+    Execute TECHNICAL_DOMAIN job: fetch robots.txt, sitemap.xml, llms.txt, SSL certificate, and HTTPS redirect, store results.
     
     Args:
         job: Pydantic model with jobId, projectId, userId, domain
@@ -64,15 +65,27 @@ def execute_technical_domain(job):
         print(f"[TECHNICAL_DOMAIN] Fetching robots.txt | domain={domain_with_protocol}")
         robots_result = fetch_robots(domain_with_protocol)
         
+        # Add delay to prevent rate limiting
+        import time
+        import random
+        time.sleep(random.uniform(2, 4))  # 2-4 second random delay between requests
+        
         # Step 2: Fetch sitemap.xml
         print(f"[TECHNICAL_DOMAIN] Fetching sitemap.xml | domain={domain_with_protocol}")
         sitemap_result = fetch_sitemap(domain_with_protocol)
         
-        # Step 3: Check HTTPS redirect first (using base domain)
+        # Add delay to prevent rate limiting
+        time.sleep(random.uniform(2, 4))  # 2-4 second random delay between requests
+        
+        # Step 3: Fetch llms.txt
+        print(f"[TECHNICAL_DOMAIN] Fetching llms.txt | domain={domain_with_protocol}")
+        llms_result = fetch_llms_txt(domain_with_protocol)
+        
+        # Step 4: Check HTTPS redirect first (using base domain)
         print(f"[TECHNICAL_DOMAIN] Checking HTTPS redirect | base_domain={base_domain}")
         https_redirect_result = check_https_redirect(base_domain)
         
-        # Step 4: Extract hostname from final URL for SSL checking
+        # Step 5: Extract hostname from final URL for SSL checking
         final_url = https_redirect_result["final_url"]
         final_hostname = None
         
@@ -88,7 +101,7 @@ def execute_technical_domain(job):
             print(f"[TECHNICAL_DOMAIN] No final URL available, using base domain for SSL | base_domain={base_domain}")
             final_hostname = base_domain
         
-        # Step 5: Check SSL certificate using hostname from final resolved URL
+        # Step 6: Check SSL certificate using hostname from final resolved URL
         print(f"[TECHNICAL_DOMAIN] Checking SSL certificate | hostname={final_hostname}")
         ssl_result = check_ssl_certificate(final_hostname)
         
@@ -98,7 +111,7 @@ def execute_technical_domain(job):
         else:
             print(f"[TECHNICAL_DOMAIN] SSL check failed | hostname={final_hostname} | ssl_valid=False")
         
-        # Step 6: Store results via Node.js API
+        # Step 7: Store results via Node.js API
         report_data = {
             "projectId": project_id,
             "domain": base_domain,  # Store base domain without www as requested
@@ -109,6 +122,7 @@ def execute_technical_domain(job):
             "sitemapExists": sitemap_result["exists"],
             "sitemapContent": sitemap_result["content"],
             "parsedSitemapUrlCount": sitemap_result["url_count"],
+            "llmsTxt": llms_result,
             "sslValid": ssl_result["ssl_valid"],
             "sslExpiryDate": ssl_result["ssl_expiry_date"],
             "sslDaysRemaining": ssl_result["ssl_days_remaining"],
@@ -126,13 +140,18 @@ def execute_technical_domain(job):
             print(f"⚠️ [TECHNICAL_DOMAIN] Failed to store report | error={str(store_error)}")
             # Non-critical: continue even if storage fails
         
-        # Step 7: Report job completion to Node.js
+        # Step 8: Report job completion to Node.js
         stats = {
             "robotsExists": robots_result["exists"],
             "robotsStatus": robots_result["status"],
             "sitemapExists": sitemap_result["exists"],
             "sitemapStatus": sitemap_result["status"],
             "parsedSitemapUrlCount": sitemap_result["url_count"],
+            "llmsTxtFound": llms_result["found"],
+            "llmsTxtHasAllow": llms_result["hasAllow"],
+            "llmsTxtHasDisallow": llms_result["hasDisallow"],
+            "llmsTxtMentionedBots": llms_result["mentionedBots"],
+            "llmsTxtRawContentLength": llms_result["rawContentLength"],
             "sslValid": ssl_result["ssl_valid"],
             "sslDaysRemaining": ssl_result["ssl_days_remaining"],
             "httpsRedirect": https_redirect_result["https_redirect"]
@@ -160,7 +179,7 @@ def execute_technical_domain(job):
             except Exception:
                 pass
         
-        print(f"[TECHNICAL_DOMAIN] Completed | jobId={job_id} | robots={robots_result['exists']} | sitemap={sitemap_result['exists']} | sitemapUrls={sitemap_result['url_count']} | ssl={ssl_result['ssl_valid']} | httpsRedirect={https_redirect_result['https_redirect']}")
+        print(f"[TECHNICAL_DOMAIN] Completed | jobId={job_id} | robots={robots_result['exists']} | sitemap={sitemap_result['exists']} | sitemapUrls={sitemap_result['url_count']} | llmsTxt={llms_result['found']} | ssl={ssl_result['ssl_valid']} | httpsRedirect={https_redirect_result['https_redirect']}")
         
         return {
             "status": "completed",
@@ -168,6 +187,11 @@ def execute_technical_domain(job):
             "robots_exists": robots_result["exists"],
             "sitemap_exists": sitemap_result["exists"],
             "sitemap_url_count": sitemap_result["url_count"],
+            "llms_txt_found": llms_result["found"],
+            "llms_txt_has_allow": llms_result["hasAllow"],
+            "llms_txt_has_disallow": llms_result["hasDisallow"],
+            "llms_txt_mentioned_bots": llms_result["mentionedBots"],
+            "llms_txt_raw_content_length": llms_result["rawContentLength"],
             "ssl_valid": ssl_result["ssl_valid"],
             "ssl_days_remaining": ssl_result["ssl_days_remaining"],
             "https_redirect": https_redirect_result["https_redirect"]

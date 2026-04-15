@@ -8,6 +8,7 @@ Unlike AI scoring BaseRule (which returns scores), SEO rules return issue docume
 from abc import ABC, abstractmethod
 from datetime import datetime
 from bson.objectid import ObjectId
+from typing import List, Optional
 
 
 class BaseSEORuleV2(ABC):
@@ -26,6 +27,7 @@ class BaseSEORuleV2(ABC):
     category: str = ""
     severity: str = "medium"
     description: str = ""
+    excluded_page_types: Optional[List[str]] = None  # Safe: None default, not mutable list
 
     @abstractmethod
     def evaluate(self, normalized: dict, job_id: str, project_id: str, url: str) -> list:
@@ -46,13 +48,13 @@ class BaseSEORuleV2(ABC):
 
     def create_issue(self, job_id, project_id, url,
                      issue_message, detected_value, expected_value,
-                     data_key=None, data_path=None):
-        """Create a standardized issue document.
+                     data_key=None, data_path=None, impact=None, recommendation=None):
+        """Create a standardized issue document with SEO insights.
         
-        Output format is IDENTICAL to the existing create_issue() in page_analysis.py.
-        This ensures zero change to DB storage format.
+        Enhanced to include impact and recommendation for actionable SEO intelligence.
+        Maintains backward compatibility with existing DB storage format.
         """
-        return {
+        issue = {
             "projectId": ObjectId(project_id),
             "seo_jobId": ObjectId(job_id),
             "page_url": url,
@@ -68,6 +70,18 @@ class BaseSEORuleV2(ABC):
             "data_path": data_path,
             "created_at": datetime.utcnow()
         }
+        
+        # Add SEO intelligence fields if provided
+        if impact:
+            issue["impact"] = impact
+        if recommendation:
+            issue["recommendation"] = recommendation
+            
+        return issue
+
+    def get_excluded_page_types(self) -> List[str]:
+        """Safely get excluded page types list, avoiding mutable default bug."""
+        return self.excluded_page_types or []
 
     def __repr__(self):
         return f"SEORule({self.rule_id}, no={self.rule_no}, cat={self.category})"

@@ -121,8 +121,7 @@ def generate_worker_id():
 @app.post("/jobs/ai-visibility")
 def handle_ai_visibility(job: AIVisibilityJob):
     """Handle AI_VISIBILITY job dispatched dealt Node.js"""
-    # Use projectId instead of aiProjectId
-    return execute_ai_visibility(job, job.projectId)
+    return execute_ai_visibility(job)
 
 @app.post("/jobs/ai-visibility-scoring")
 def handle_ai_visibility_scoring(job: AIVisibilityScoringV2Job):

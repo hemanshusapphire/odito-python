@@ -8,7 +8,7 @@ import json
 import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, Dict, List, Any
 from bson.objectid import ObjectId
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -944,7 +944,6 @@ class AIVisibilityJob(BaseModel):
     jobId: str
     projectId: str
     userId: str
-    aiProjectId: Optional[str] = None  # For standalone projects
     input_data: Optional[dict] = None  # For source_job_id and other metadata
 
 # ==================== ENTITY GRAPH EXTRACTION ====================
@@ -3614,16 +3613,15 @@ def extract_real_word_count(ai_signals: dict, html: str) -> int:
         print(f"[WORD_COUNT] Error extracting word count: {e}")
         return 1  # Safe fallback
 
-def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) -> dict:
+def analyze_single_url(url: str, job: AIVisibilityJob) -> dict:
     """Analyze a single URL for AI visibility using HTML from database (no HTTP requests)"""
     try:
         # Check cancellation before processing each URL
         if is_job_cancelled(job.jobId):
             return None
         
-        # Use projectId instead of aiProjectId
-        if not aiProjectId:
-            aiProjectId = job.projectId
+        # Use projectId from job
+        projectId = job.projectId
         
         print(f"[AI_VISIBILITY] Analyzing URL from database: {url}")
         
@@ -3646,7 +3644,7 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
         
         if not page_data:
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': 0,
@@ -3659,7 +3657,7 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
         html = page_data.get('raw_html', '')
         if not html:
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': 0,
@@ -3671,7 +3669,7 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
         # Check if content is actually HTML (basic check)
         if not html or ('<!DOCTYPE' not in html and '<html' not in html.lower()):
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': 200,  # Page exists but content is not HTML
@@ -3694,7 +3692,7 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
         if html_size > MAX_HTML_SIZE:
             print(f"[PERFORMANCE_GUARD] HTML too large: {html_size} bytes > {MAX_HTML_SIZE} bytes")
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': status_code,
@@ -3714,7 +3712,7 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
             print(f"[PERFORMANCE_GUARD] Too many DOM nodes: {dom_nodes} > {MAX_DOM_NODES}")
             soup.decompose()
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': status_code,
@@ -3995,7 +3993,7 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
         ]
         
         final_output = {
-            'projectId': ObjectId(aiProjectId),  # 🧠 Always use AI project ID for output
+            'projectId': ObjectId(projectId),  # 🧠 Always use AI project ID for output
             'ai_jobId': ObjectId(job.jobId),
             'url': url,
             'http_status_code': status_code,
@@ -4019,7 +4017,7 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
     except Exception as e:
         print(f"Error analyzing {url}: {e}")
         return {
-            'projectId': ObjectId(aiProjectId),  # 🧠 Always use AI project ID for output
+            'projectId': ObjectId(projectId),  # 🧠 Always use AI project ID for output
             'ai_jobId': ObjectId(job.jobId),
             'url': url,
             'http_status_code': 0,
@@ -4027,23 +4025,22 @@ def analyze_single_url(url: str, job: AIVisibilityJob, aiProjectId: str = None) 
             'error': str(e)
         }
 
-def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob, aiProjectId: str = None) -> dict:
+def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob) -> dict:
     """Optimized version: Analyze a single URL using provided HTML (no database fetch)"""
     try:
         # Check cancellation before processing each URL
         if is_job_cancelled(job.jobId):
             return None
         
-        # Use projectId instead of aiProjectId
-        if not aiProjectId:
-            aiProjectId = job.projectId
+        # Use projectId from job
+        projectId = job.projectId
         
         print(f"[AI_VISIBILITY] Analyzing URL with provided HTML: {url}")
         
         # Validate HTML content
         if not raw_html:
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': 0,
@@ -4055,7 +4052,7 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob, 
         # Check if content is actually HTML (basic check)
         if not raw_html or ('<!DOCTYPE' not in raw_html and '<html' not in raw_html.lower()):
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': 200,  # Page exists but content is not HTML
@@ -4078,7 +4075,7 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob, 
         if html_size > MAX_HTML_SIZE:
             print(f"[PERFORMANCE_GUARD] HTML too large: {html_size} bytes > {MAX_HTML_SIZE} bytes")
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': status_code,
@@ -4098,7 +4095,7 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob, 
             print(f"[PERFORMANCE_GUARD] Too many DOM nodes: {dom_nodes} > {MAX_DOM_NODES}")
             soup.decompose()
             return {
-                'projectId': ObjectId(aiProjectId),
+                'projectId': ObjectId(projectId),
                 'ai_jobId': ObjectId(job.jobId),
                 'url': url,
                 'http_status_code': status_code,
@@ -4255,7 +4252,7 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob, 
         ]
         
         final_output = {
-            'projectId': ObjectId(aiProjectId),  # 🧠 Always use AI project ID for output
+            'projectId': ObjectId(projectId),  # 🧠 Always use AI project ID for output
             'ai_jobId': ObjectId(job.jobId),
             'url': url,
             'http_status_code': status_code,
@@ -4279,7 +4276,7 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob, 
     except Exception as e:
         print(f"Error analyzing {url}: {e}")
         return {
-            'projectId': ObjectId(aiProjectId),  # 🧠 Always use AI project ID for output
+            'projectId': ObjectId(projectId),  # 🧠 Always use AI project ID for output
             'ai_jobId': ObjectId(job.jobId),
             'url': url,
             'http_status_code': 0,
@@ -4300,14 +4297,13 @@ def check_job_timeout(start_time: datetime, job_id: str) -> bool:
         return True
     return False
 
-def execute_ai_visibility(job: AIVisibilityJob, aiProjectId: Optional[str] = None):
+def execute_ai_visibility(job: AIVisibilityJob):
     """Execute AI visibility analysis - SAFE VERSION"""
     start_time = datetime.utcnow()
     duration_ms = 0
     
     # Defensive logging
     print(f"[AI_VISIBILITY] Starting | jobId={job.jobId}")
-    print(f"[AI_VISIBILITY] aiProjectId={aiProjectId}")
     print(f"[AI_VISIBILITY] projectId={job.projectId}")
     
     # CRITICAL LOG: Check if project keywords are accessed during AI visibility
@@ -4330,9 +4326,7 @@ def execute_ai_visibility(job: AIVisibilityJob, aiProjectId: Optional[str] = Non
     # ENGINEER-LEVEL FIX: Use time-based timeout check instead of signals
     try:
         print(f"[WORKER] AI_VISIBILITY started | jobId={job.jobId}")
-        print(f"[WORKER] Job parameters | projectId={job.projectId} | aiProjectId={aiProjectId}")
-        print(f"[WORKER] TYPE aiProjectId: {type(aiProjectId)}")
-        print(f"[WORKER] VALUE aiProjectId: {repr(aiProjectId)}")
+        print(f"[WORKER] Job parameters | projectId={job.projectId}")
         
             # Disable Selenium temporarily for AI analysis (HTTP-only mode)
         from scraper.shared import fetcher
@@ -4350,13 +4344,6 @@ def execute_ai_visibility(job: AIVisibilityJob, aiProjectId: Optional[str] = Non
             project_object_id = None
             if job.projectId and job.projectId != 'null':
                 project_object_id = ObjectId(job.projectId)
-            elif aiProjectId:
-                # For AI projects, get the associated SEO project ID
-                ai_project = seo_ai_visibility_project.find_one({"_id": ObjectId(aiProjectId)})
-                if ai_project:
-                    seo_project_id = ai_project.get("seoProjectId")
-                    if seo_project_id:
-                        project_object_id = ObjectId(seo_project_id)
             
             if not project_object_id:
                 print(f"[AI] ERROR: No valid project ID found for Page Scraper data")
@@ -4416,7 +4403,7 @@ def execute_ai_visibility(job: AIVisibilityJob, aiProjectId: Optional[str] = Non
                     raw_html = page["raw_html"]
                     if url and raw_html:
                         # Pass both url and raw_html to avoid secondary database fetch
-                        futures.append(executor.submit(analyze_single_url_with_html, url, raw_html, job, aiProjectId))
+                        futures.append(executor.submit(analyze_single_url_with_html, url, raw_html, job))
                 
                 # Collect results in submission order for deterministic progress
                 for i, future in enumerate(futures):
@@ -4794,6 +4781,46 @@ def extract_ai_visibility_signals(ai_signals, soup, url) -> dict:
             "aggregate_rating_schema_present": False,
             "service_or_product_offers_schema": False,
             "breadcrumb_schema_present": False
+        }
+    
+    # Simple organization schema detection (NEW)
+    try:
+        structured_data = semantic_dataset.get("structured_data", {})
+        if isinstance(structured_data, str):
+            try:
+                structured_data = json.loads(structured_data)
+            except:
+                structured_data = {}
+        
+        org_detected = False
+        name_present = False
+        legal_name_present = False
+        contact_complete = False
+        
+        graph = structured_data.get("@graph", [])
+        for item in graph:
+            if item.get("@type") == "Organization":
+                org_detected = True
+                if item.get("name"):
+                    name_present = True
+                if item.get("legalName"):
+                    legal_name_present = True
+                if item.get("telephone") and item.get("address"):
+                    contact_complete = True
+                break
+        
+        ai_visibility_signals["organization_schema_validation"] = {
+            "organization_detected": org_detected,
+            "name_present": name_present,
+            "legal_name_present": legal_name_present,
+            "contact_complete": contact_complete
+        }
+    except Exception:
+        ai_visibility_signals["organization_schema_validation"] = {
+            "organization_detected": False,
+            "name_present": False,
+            "legal_name_present": False,
+            "contact_complete": False
         }
     
     return ai_visibility_signals
@@ -5313,6 +5340,41 @@ def extract_direct_answer_signals(soup, text) -> dict:
 
 # ==================== TECHNICAL SIGNALS ENHANCEMENTS ====================
 
+def check_ai_crawler_access(url: str) -> Dict[str, Any]:
+    """Check AI crawler access with minimal parsing"""
+    try:
+        from urllib.parse import urlparse
+        import requests
+        
+        domain = urlparse(url).netloc
+        robots_url = f"https://{domain}/robots.txt"
+        
+        response = requests.get(robots_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+        if response.status_code != 200:
+            return {"accessible": False, "blocked_crawlers": []}
+        
+        content = response.text
+        ai_crawlers = ['GPTBot', 'PerplexityBot', 'ChatGPTUser', 'Google-Extended', 'Claude-Web']
+        blocked_crawlers = []
+        
+        lines = content.split('\n')
+        current_agent = '*'
+        
+        for line in lines:
+            line = line.strip()
+            if line.lower().startswith('user-agent:'):
+                current_agent = line.split(':', 1)[1].strip()
+            elif line.lower().startswith('disallow:') and current_agent in ai_crawlers:
+                disallow_path = line.split(':', 1)[1].strip()
+                if disallow_path in ['/', '/api/', '/admin/']:
+                    blocked_crawlers.append(current_agent)
+        
+        return {"accessible": True, "blocked_crawlers": blocked_crawlers}
+        
+    except Exception:
+        # Safe fallback - don't break existing functionality
+        return {"accessible": True, "blocked_crawlers": []}
+
 def extract_enhanced_technical_signals(soup, url) -> dict:
     """Extract enhanced technical signals for AI visibility"""
     technical_signals = {
@@ -5327,6 +5389,11 @@ def extract_enhanced_technical_signals(soup, url) -> dict:
     }
     
     try:
+        # 0. Check AI crawler access (NEW)
+        ai_crawler_access = check_ai_crawler_access(url)
+        technical_signals["crawlability"]["ai_crawler_access"] = ai_crawler_access
+        technical_signals["crawlability"]["ai_crawlers_blocked"] = ai_crawler_access.get("blocked_crawlers", [])
+        
         # 1. Check viewport meta tag
         viewport = soup.find('meta', attrs={'name': 'viewport'})
         technical_signals["mobile_optimization"]["viewport_present"] = bool(viewport)

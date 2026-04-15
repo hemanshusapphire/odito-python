@@ -7,7 +7,7 @@ Focuses on entity consistency, schema relationships, and authority signals.
 
 import json
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class OnlyOnePrimaryEntityRule(BaseRule):
     """Rule 16 — Only ONE primary entity site-wide"""
@@ -159,6 +159,23 @@ class OpeningHoursSpecificationRule(BaseRule):
         
         score = 0
         graph = structured_data.get("@graph", [])
+        
+        # Only relevant for local business types
+        business_types = {"LocalBusiness", "Restaurant", "Store", "Hotel", "ProfessionalService"}
+        has_business_type = False
+        
+        for item in graph:
+            item_type = item.get("@type", "")
+            if isinstance(item_type, list):
+                if any(bt in item_type for bt in business_types):
+                    has_business_type = True
+                    break
+            elif item_type in business_types:
+                has_business_type = True
+                break
+        
+        if not has_business_type:
+            return 0.0
         
         # Check for openingHoursSpecification
         for item in graph:

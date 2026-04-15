@@ -5,8 +5,9 @@ Evaluates content optimization for voice search and user intent.
 Focuses on conversational language, intent matching, and voice search readiness.
 """
 
+import json
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class BulletNumberedListsUsedRule(BaseRule):
     """Rule 51 — Bullet / numbered lists used"""

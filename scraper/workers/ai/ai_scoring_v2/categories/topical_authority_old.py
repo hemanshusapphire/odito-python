@@ -7,7 +7,7 @@ Focuses on entity richness, topic coverage, and authority signals.
 
 import json
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class EntityRichnessRule(BaseRule):
     """Evaluates richness and diversity of entities"""

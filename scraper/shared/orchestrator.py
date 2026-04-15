@@ -17,6 +17,7 @@ from .schema import extract_structured_data
 from .utils import create_content_hash
 from .intelligence import extract_seo_intelligence
 from .enhanced_seo_extraction import extract_enhanced_seo_signals
+from .utils import normalize_url, get_registrable_domain
 
 
 def extract_comprehensive_seo_data(html: str, base_url: str, response_headers: dict = None) -> dict:
@@ -76,7 +77,11 @@ def extract_comprehensive_seo_data(html: str, base_url: str, response_headers: d
             html, intelligence_soup, seo_data, response_headers or {}, base_url
         )
         
-        # 11. ENHANCED SEO SIGNALS (structured raw data extraction)
+        # 11. INTERNAL LINKS EXTRACTION (for SEO enrichment layer)
+        # Extract internal links for link status analysis
+        seo_data["internal_links"] = _extract_internal_links(soup, base_url)
+        
+        # 12. ENHANCED SEO SIGNALS (structured raw data extraction)
         # Uses original soup to maintain DOM context for positioning analysis
         seo_data["enhanced_signals"] = extract_enhanced_seo_signals(soup, html, base_url, response_headers or {})
         
@@ -116,3 +121,64 @@ def scrape_page_data(url: str) -> dict:
         
     except Exception as e:
         return None
+
+
+def _extract_internal_links(soup, page_url: str) -> list:
+    """
+    Extract normalized same-domain internal links from a BeautifulSoup object.
+    Lightweight — no HTTP calls, operates on already-parsed HTML.
+    
+    Args:
+        soup: BeautifulSoup object of the page
+        page_url: Base URL of the page
+        
+    Returns:
+        List of normalized internal link URLs
+    """
+    try:
+        from urllib.parse import urljoin, urlparse
+        
+        if not soup or not page_url:
+            return []
+        
+        # Get the domain for same-domain filtering
+        page_domain = get_registrable_domain(page_url)
+        if not page_domain:
+            return []
+        
+        seen = set()
+        results = []
+        
+        # Find all links with href attribute
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag.get("href", "").strip()
+            if not href:
+                continue
+            
+            # Skip excluded schemes
+            excluded_schemes = ["mailto:", "tel:", "javascript:", "ftp:", "file:"]
+            if any(href.startswith(scheme) for scheme in excluded_schemes):
+                continue
+            
+            # Convert relative URL to absolute
+            absolute_url = urljoin(page_url, href)
+            
+            # Remove fragment
+            parsed = urlparse(absolute_url)
+            if not parsed.netloc:
+                continue
+            
+            # Same-domain check
+            link_domain = get_registrable_domain(absolute_url)
+            if link_domain != page_domain:
+                continue
+            
+            # Normalize and deduplicate
+            normalized = normalize_url(absolute_url)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                results.append(normalized)
+        
+        return results
+    except Exception:
+        return []

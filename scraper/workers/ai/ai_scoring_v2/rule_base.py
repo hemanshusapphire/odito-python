@@ -22,6 +22,7 @@ class BaseRule(ABC):
         - weight: float
         - max_score: float
         - applies_to: "page" | "domain"
+        - is_required: bool (whether missing feature should create issue)
         """
         self.rule_id = rule_config["rule_id"]
         self.category = rule_config["category"]
@@ -29,6 +30,7 @@ class BaseRule(ABC):
         self.weight = rule_config["weight"]
         self.max_score = rule_config["max_score"]
         self.applies_to = rule_config["applies_to"]
+        self.is_required = rule_config.get("is_required", False)  # Default: not required
         
         # Validate configuration
         self._validate_config()
@@ -88,7 +90,8 @@ class BaseRule(ABC):
             "description": self.description,
             "weight": self.weight,
             "max_score": self.max_score,
-            "applies_to": self.applies_to
+            "applies_to": self.applies_to,
+            "is_required": self.is_required
         }
     
     def __repr__(self):

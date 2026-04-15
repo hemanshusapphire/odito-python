@@ -7,7 +7,7 @@ Focuses on structured data, entity clarity, and AI-friendly content organization
 
 import json
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class StructuredDataCompletenessRule(BaseRule):
     """Evaluates completeness and quality of structured data"""

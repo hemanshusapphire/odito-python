@@ -7,7 +7,7 @@ Focuses on authority, trustworthiness, and citation-worthy content elements.
 
 import json
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class BusinessNameIdenticalRule(BaseRule):
     """Rule 8 — Business name identical everywhere"""
@@ -227,15 +227,12 @@ class PhoneE164FormatRule(BaseRule):
         
         # Check for phone in E.164 format (+country_code number)
         import re
-        e164_pattern = r'^\+\d{1,3}\d{6,14}$'
+        e164_pattern = r'^\+\d{1,3}[\s-]?\d{6,14}$'
         
         for item in graph:
             phone = item.get("telephone") or item.get("phone")
-            if phone and re.match(e164_pattern, phone.replace(" ", "")):
+            if phone and re.match(e164_pattern, phone.replace(" ", "").replace("-", "")):
                 score += 10
-                break
-            elif phone:  # Phone exists but not E.164
-                score += 5
                 break
         
         return min(score, self.max_score)

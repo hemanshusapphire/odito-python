@@ -8,7 +8,7 @@ Focuses on question-answer format, structured answers, and voice search readines
 import json
 import re
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class First60WordsDirectAnswerRule(BaseRule):
     """Rule 27 — First 60 words contain direct answer"""
@@ -63,7 +63,8 @@ class FAQSchemaMatchesContentRule(BaseRule):
             "description": "FAQ schema matches visible content",
             "weight": 1.0,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "is_required": False  # FAQ is optional, not all pages need it
         }
         super().__init__(config)
     
@@ -106,7 +107,8 @@ class FAQSection5To10QuestionsRule(BaseRule):
             "description": "FAQ section 5–10 questions",
             "weight": 1.0,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "is_required": False  # FAQ section is optional
         }
         super().__init__(config)
     
@@ -141,7 +143,8 @@ class QuestionBasedH2HeadingsRule(BaseRule):
             "description": "Question-based H2 headings",
             "weight": 1.0,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "is_required": False  # Question headings are optional
         }
         super().__init__(config)
     

@@ -51,7 +51,6 @@ def execute_link_discovery():
             jobId=job_id,
             projectId=project_id,
             userId="test-user",
-            aiProjectId=project_id,
             url="https://www.sapphiredigitalagency.com/"
         )
         
@@ -65,7 +64,7 @@ def execute_link_discovery():
         execution_time = time.time() - start_time
         
         # Verify results
-        links_count = seo_ai_internal_links.count_documents({'aiProjectId': ObjectId(project_id)})
+        links_count = seo_ai_internal_links.count_documents({'projectId': ObjectId(project_id)})
         print(f"✅ AI_LINK_DISCOVERY completed in {execution_time:.2f}s")
         print(f"   Links discovered: {links_count}")
         
@@ -122,8 +121,7 @@ def execute_ai_visibility(project_id, job_id):
         job_data = AIVisibilityJob(
             jobId=visibility_job_id,
             projectId=project_id,
-            userId="test-user",
-            aiProjectId=project_id  # Keep as string
+            userId="test-user"
         )
         
         print(f"🚀 Starting AI_VISIBILITY")
@@ -132,7 +130,7 @@ def execute_ai_visibility(project_id, job_id):
         
         # Execute the job
         start_time = time.time()
-        execute_ai_visibility(job_data, project_id)  # Pass aiProjectId as second parameter
+        execute_ai_visibility(job_data)
         execution_time = time.time() - start_time
         
         # Verify results
@@ -177,8 +175,7 @@ def execute_ai_scoring_v2(project_id):
         job_data = {
             'jobId': scoring_job_id,
             'projectId': project_id,
-            'userId': 'test-user',
-            'aiProjectId': project_id
+            'userId': 'test-user'
         }
         
         print(f"🚀 Starting AI_VISIBILITY_SCORING_V2")
@@ -221,7 +218,7 @@ def generate_final_report(project_id):
     
     try:
         # Count results from each phase
-        links_count = seo_ai_internal_links.count_documents({'aiProjectId': ObjectId(project_id)})
+        links_count = seo_ai_internal_links.count_documents({'projectId': ObjectId(project_id)})
         pages_count = seo_ai_visibility.count_documents({'projectId': ObjectId(project_id)})
         scores_count = seo_ai_page_scores.count_documents({'projectId': ObjectId(project_id)})
         

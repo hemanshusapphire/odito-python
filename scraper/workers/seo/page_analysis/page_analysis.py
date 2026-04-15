@@ -217,9 +217,7 @@ def execute_page_analysis_logic(job):
         headless_data_list = list(db.seo_headless_data.find({"projectId": ObjectId(job.projectId)}))
         headless_lookup = {_normalize_lookup_url(h.get("url", "")): h for h in headless_data_list}
         
-        # DEBUG: Show headless lookup info
-        print(f"[DEBUG] headless_lookup keys: {list(headless_lookup.keys())[:5]}")
-        print(f"[DEBUG] headless_lookup total: {len(headless_lookup)} entries")
+        # Process headless data for accessibility analysis
 
         crawl_graph_list = list(db.seo_crawl_graph.find({"projectId": ObjectId(job.projectId)}))
         crawl_graph_lookup = {_normalize_lookup_url(c.get("page_url", "")): c for c in crawl_graph_list}
@@ -307,12 +305,7 @@ def execute_page_analysis_logic(job):
                     "created_at": datetime.utcnow()
                 }
                 all_summaries.append(summary_doc)
-
-                print(f"PAGE_ANALYSIS returned: {len(page_issues)} issues for {page.get('url')}")
-
                 all_issues.extend(page_issues)
-
-                print(f"PAGE_ANALYSIS total collected: {len(all_issues)}")
 
                 successful_analyses += 1
 
@@ -818,12 +811,8 @@ def analyze_page_seo(page, job_id, project_id,
     # Build unified rule context (superset of normalized — backward compatible)
     lookup_url = _normalize_lookup_url(url)
     
-    # DEBUG: Show URL matching
-    print(f"[DEBUG] lookup_url being used: {repr(lookup_url)}")
-    headless_match = (headless_lookup or {}).get(lookup_url, 'NOT FOUND')
-    print(f"[DEBUG] headless match: {headless_match}")
-    if headless_match != 'NOT FOUND':
-        print(f"[DEBUG] headless keys: {list(headless_match.keys())}")
+    # Match headless data for this URL
+    headless_match = (headless_lookup or {}).get(lookup_url)
     
     rule_context = {
         **normalized,
@@ -833,12 +822,7 @@ def analyze_page_seo(page, job_id, project_id,
         "technical_report": technical_report or {},
     }
     
-    # Permanent headless data log
-    headless_data = rule_context.get("headless", {})
-    print(f"[HEADLESS] url={lookup_url} | "
-          f"axe_violations={len(headless_data.get('axeViolations', []))} | "
-          f"dom_elements={headless_data.get('domMetrics', {}).get('totalElements', 'N/A')} | "
-          f"keyboard_checked={headless_data.get('keyboard_analysis', {}).get('keyboard_navigation_checked', 'N/A')}")
+    # Process headless data for accessibility analysis
 
     # Use the modular rule engine
     from scraper.workers.seo.page_analysis.rules.seo_rule_engine import get_seo_engine

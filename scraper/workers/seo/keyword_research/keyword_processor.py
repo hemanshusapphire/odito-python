@@ -88,7 +88,7 @@ class KeywordProcessor:
             import traceback
             print(f"[KEYWORD_PROCESSOR] Full traceback: {traceback.format_exc()}")
 
-        return keywords
+        return keywords  # Always returns list, never None
 
     @staticmethod
     def _extract_keyword_from_item(item, index, seed_keyword, seen_keywords):

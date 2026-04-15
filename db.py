@@ -15,28 +15,30 @@ print(f"[DB DEBUG] Mongo URI: {MONGO_URI}")
 
 client = MongoClient(MONGO_URI)
 
-# Extract database name from URI or use default
-# MongoDB Atlas URIs often don't include database name in the path
-# The database name is typically specified separately or uses a default
-if "?" in MONGO_URI:
-    # Remove query parameters and check if there's a database name
-    uri_without_query = MONGO_URI.split("?")[0]
-    
-    # Check if there's a database name in the path
-    if "/" in uri_without_query:
-        path_parts = uri_without_query.split("/")
-        # For mongodb+srv://, the database name would be after the host (index 3)
-        if len(path_parts) > 3 and path_parts[3]:
-            db_name = path_parts[3]
+# Use database name from config (already properly extracted)
+db_name = config.get('database.db_name')
+print(f"[DB DEBUG] Database name from config: {db_name}")
+
+# Fallback extraction only if config fails (should never happen)
+if not db_name:
+    print("[DB DEBUG] Config failed, extracting from URI as fallback")
+    if "?" in MONGO_URI:
+        uri_without_query = MONGO_URI.split("?")[0]
+        if "/" in uri_without_query:
+            path_parts = uri_without_query.split("/")
+            if len(path_parts) > 3 and path_parts[3]:
+                db_name = path_parts[3]
+            else:
+                db_name = "odito_dev"  # Fixed: Use dev default
         else:
-            db_name = "odito"  # Default database name
+            db_name = "odito_dev"
     else:
-        db_name = "odito"
-else:
-    db_name = "odito"
+        db_name = "odito_dev"
+
 db = client[db_name]
 
-print(f"[DB DEBUG] Database name: {db_name}")
+print(f"[DB DEBUG] Final database name: {db_name}")
+print(f"[DB DEBUG] Database object: {db}")
 print(f"🔗 Connected to MongoDB database: {db_name}")
 
 # collections for link discovery results

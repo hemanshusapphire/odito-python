@@ -6,7 +6,7 @@ Focuses on clarity, structure, and machine-readability factors.
 """
 
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class ContentStructureClarityRule(BaseRule):
     """Evaluates clarity of content structure for LLM processing"""

@@ -7,7 +7,7 @@ Focuses on structured data, entity clarity, and AI-friendly content organization
 
 import json
 from typing import Dict, Any
-from rule_base import BaseRule
+from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class PrimaryOrganizationSchemaRule(BaseRule):
     """Rule 1 — Primary Organization schema on homepage"""
@@ -19,7 +19,8 @@ class PrimaryOrganizationSchemaRule(BaseRule):
             "description": "Primary Organization schema on homepage",
             "weight": 1.0,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "is_required": True  # Organization schema is required for businesses
         }
         super().__init__(config)
     
@@ -97,7 +98,8 @@ class SchemaValidJSONLDRule(BaseRule):
             "description": "Schema valid JSON-LD",
             "weight": 1.0,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "is_required": True  # Valid schema is required if present
         }
         super().__init__(config)
     
@@ -260,30 +262,23 @@ class LogoURLReturns200Rule(BaseRule):
         return min(score, self.max_score)
 
 class XMLSitemapExistsValidRule(BaseRule):
-    """Rule 14 — XML sitemap exists and valid"""
+    """Rule 14 — XML sitemap exists and valid - DISABLED"""
     
     def __init__(self):
         config = {
             "rule_id": "xml_sitemap_exists_valid",
             "category": "ai_impact",
-            "description": "XML sitemap exists and valid",
-            "weight": 1.0,
+            "description": "XML sitemap exists and valid - DISABLED",
+            "weight": 0.0,  # Disabled - no weight
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "enabled": False  # Explicitly disabled
         }
         super().__init__(config)
     
     def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for XML sitemap presence"""
-        # Check the actual extracted signal for sitemap
-        technical_signals = data.get("enhanced_technical_signals", {})
-        crawlability = technical_signals.get("crawlability", {})
-        
-        # Check if sitemap is referenced
-        if crawlability.get("sitemap_referenced", False):
-            return 10.0  # Full score if sitemap is referenced
-        else:
-            return 0.0  # No score if sitemap not referenced
+        """Rule disabled - always returns neutral score"""
+        return 0.0  # Disabled rule - no impact on score
 
 class RobotsTxtNonBlockingRule(BaseRule):
     """Rule 15 — robots.txt non-blocking"""
@@ -306,10 +301,16 @@ class RobotsTxtNonBlockingRule(BaseRule):
         crawlability = technical_signals.get("crawlability", {})
         
         # Check if robots.txt is accessible (not blocking)
-        if crawlability.get("robots_txt_accessible", False):
-            return 10.0  # Full score if robots.txt is accessible
-        else:
+        if not crawlability.get("robots_txt_accessible", False):
             return 0.0  # No score if robots.txt is blocking
+        
+        # NEW: Check AI crawler access
+        blocked_crawlers = crawlability.get("ai_crawlers_blocked", [])
+        if blocked_crawlers:
+            # CRITICAL: Block score if AI crawlers are blocked
+            return 0.0
+        
+        return 10.0  # Full score only if robots.txt accessible AND AI crawlers allowed
 
 class NoPluginDuplicateSchemasRule(BaseRule):
     """Rule 34 — No plugin duplicate schemas"""
@@ -357,7 +358,8 @@ class LLMsTxtFileExistsRule(BaseRule):
             "description": "llms.txt file exists",
             "weight": 1.0,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
+            "is_required": False  # Optional feature, no issue if missing
         }
         super().__init__(config)
     
