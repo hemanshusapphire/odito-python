@@ -107,8 +107,17 @@ class Config:
     def _extract_db_name_from_uri(self) -> str:
         """Extract database name from MongoDB URI"""
         uri = os.getenv('MONGODB_URI')
+        
+        # Remove query parameters first
+        if '?' in uri:
+            uri = uri.split('?')[0]
+        
+        # Extract database name from path
         if '/' in uri:
-            return uri.split('/')[-1]
+            path_parts = uri.split('/')
+            if len(path_parts) > 3 and path_parts[3]:
+                return path_parts[3]
+        
         return 'odito_dev'
     
     def get(self, key_path: str, default=None):
