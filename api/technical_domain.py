@@ -28,7 +28,7 @@ def handle_technical_domain(job: TechnicalDomainJob):
                     "message": "Job already completed"
                 }
         
-        print(f"[WORKER] TECHNICAL_DOMAIN started | jobId={job.jobId} | domain={job.domain}")
+        print(f"[HANDLER] TECHNICAL_DOMAIN job received | jobId={job.jobId} | domain={job.domain}")
         
         # Execute technical domain data collection
         result = execute_technical_domain(job)
@@ -45,6 +45,8 @@ def handle_technical_domain(job: TechnicalDomainJob):
         
     except Exception as e:
         print(f"[ERROR] TECHNICAL_DOMAIN handler failed | jobId={job.jobId} | reason=\"{str(e)}\"")
+        import traceback
+        traceback.print_exc()
         return {
             "status": "error",
             "jobId": job.jobId,

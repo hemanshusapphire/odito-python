@@ -51,15 +51,25 @@ class ScoringEngine:
     
     def _validate_registry(self):
         """Validate rule registry is complete and valid"""
+        print(f"[ENGINE] Validating registry...")
         validation_report = self.rule_registry.validate_registry()
+        
+        # [ENGINE] Log all rules and their weights
+        print(f"[ENGINE] Total rules: {validation_report['total_rules']}")
+        for category, report in validation_report["categories"].items():
+            print(f"[ENGINE] Category {category}: {report['rule_count']} rules, total_weight={report['total_weight']}")
         
         if validation_report["issues"]:
             logger.warning(f"Registry validation issues: {validation_report['issues']}")
         
-        # Validate category weights
+        # [SAFETY] Validate category weights
         if not CategoryWeights.validate_weights(self.category_weights):
+            print(f"[ENGINE_ERROR] Invalid category weights: {self.category_weights}")
             raise ValueError("Invalid category weights configuration")
         
+        # Note: Individual rule weight validation is now handled at registration level
+        # Rules with weight <= 0 are automatically skipped during registration
+        print(f"[ENGINE] Registry validation complete - all weights valid")
         logger.info(f"Scoring engine initialized with {validation_report['total_rules']} rules")
     
     def score_page(self, page_data: Dict[str, Any]) -> Dict[str, Any]:

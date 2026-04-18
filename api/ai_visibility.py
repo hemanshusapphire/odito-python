@@ -6,11 +6,54 @@ import traceback
 
 router = APIRouter()
 
+
+def process_ai_visibility_core(job: AIVisibilityJob):
+    """
+    Core AI_VISIBILITY processing logic (shared between API and worker).
+    
+    Args:
+        job: Pydantic AIVisibilityJob model
+        
+    Returns:
+        dict with status and result
+    """
+    # Import here to avoid circular imports
+    from main import completed_jobs, completed_jobs_lock
+    from scraper.workers.ai.ai_visibility.ai_visibility import execute_ai_visibility
+    
+    # Defensive guard: skip if already completed
+    with completed_jobs_lock:
+        if job.jobId in completed_jobs:
+            print(f"ℹ️ Skipping already completed AI_VISIBILITY job | jobId={job.jobId}")
+            return {
+                "status": "already_completed",
+                "jobId": job.jobId,
+                "message": "Job already completed"
+            }
+    
+    print(f"[WORKER] AI_VISIBILITY started | jobId={job.jobId}")
+    
+    # Execute AI visibility immediately (no polling loop)
+    result = execute_ai_visibility(job=job)
+    
+    # Mark as completed
+    with completed_jobs_lock:
+        completed_jobs.add(job.jobId)
+    
+    print(f"[WORKER] AI_VISIBILITY completed | jobId={job.jobId}")
+    
+    return {
+        "status": "accepted",
+        "jobId": job.jobId,
+        "message": "AI_VISIBILITY job accepted and processing"
+    }
+
+
 @router.post("/jobs/ai-visibility")
-async def handle_ai_visibility(request: Request):
-    """Handle AI_VISIBILITY job dispatched from Node.js"""
+async def api_ai_visibility(request: Request):
+    """API route for AI_VISIBILITY (HTTP dispatch from Node.js)"""
     try:
-        # Debug: Print raw request body
+        # Parse request body
         body = await request.json()
         print("RAW BODY:", body)
         
@@ -44,42 +87,41 @@ async def handle_ai_visibility(request: Request):
         print(f"  projectId: {job.projectId}")
         print(f"  userId: {job.userId}")
         
-        # Import here to avoid circular imports
-        from main import completed_jobs, completed_jobs_lock
-        from scraper.workers.ai.ai_visibility.ai_visibility import execute_ai_visibility
-        
-        # Defensive guard: skip if already completed
-        with completed_jobs_lock:
-            if job.jobId in completed_jobs:
-                print(f"ℹ️ Skipping already completed AI_VISIBILITY job | jobId={job.jobId}")
-                return {
-                    "status": "already_completed",
-                    "jobId": job.jobId,
-                    "message": "Job already completed"
-                }
-        
-        print(f"[WORKER] AI_VISIBILITY started | jobId={job.jobId}")
-        
-        # Execute AI visibility immediately (no polling loop)
-        result = execute_ai_visibility(job=job)
-        
-        # Mark as completed
-        with completed_jobs_lock:
-            completed_jobs.add(job.jobId)
-        
-        print(f"[WORKER] AI_VISIBILITY completed | jobId={job.jobId}")
-        
-        return {
-            "status": "accepted",
-            "jobId": job.jobId,
-            "message": "AI_VISIBILITY job accepted and processing"
-        }
+        # Call core logic
+        return process_ai_visibility_core(job)
         
     except Exception as e:
-        print(f"[ERROR] AI_VISIBILITY handler failed | reason=\"{str(e)}\"")
+        print(f"[ERROR] AI_VISIBILITY API handler failed | reason=\"{str(e)}\"")
         print(f"[ERROR] Full traceback: {traceback.format_exc()}")
         return {
             "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+
+async def handle_ai_visibility(job: AIVisibilityJob):
+    """
+    Worker handler for AI_VISIBILITY (called from polling loop).
+    
+    Args:
+        job: Pydantic AIVisibilityJob model (already normalized from dict)
+        
+    Returns:
+        dict with status and result
+    """
+    try:
+        print(f"[WORKER-AI] AI_VISIBILITY handler entered | jobId={job.jobId}")
+        
+        # Call core logic directly (no request.json() needed)
+        return process_ai_visibility_core(job)
+        
+    except Exception as e:
+        print(f"[ERROR] AI_VISIBILITY worker handler failed | jobId={job.jobId} | reason=\"{str(e)}\"")
+        print(f"[ERROR] Full traceback: {traceback.format_exc()}")
+        return {
+            "status": "error",
+            "jobId": job.jobId,
             "error": str(e),
             "traceback": traceback.format_exc()
         }

@@ -269,7 +269,9 @@ class anchorTextDiversityRule(BaseSEORuleV2):
 def register_seo_enhancement_rules(registry):
     """Register all SEO enhancement rules with the registry."""
     registry.register(titlePixelLengthRule())
-    registry.register(metaDescriptionCtrRule())
-    registry.register(imageAltTextQualityRule())
+    # DISABLED: Meta description CTR optimization issues
+    # registry.register(metaDescriptionCtrRule())
+    # DISABLED: Low image alt text quality
+    # registry.register(imageAltTextQualityRule())
     registry.register(anchorTextOptimizationRule())
     registry.register(anchorTextDiversityRule())

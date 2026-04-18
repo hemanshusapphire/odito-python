@@ -92,7 +92,7 @@ class Config:
             
             # Worker configuration
             'worker': {
-                'timeout': int(os.getenv('WORKER_TIMEOUT', '300000')),  # 5 minutes default
+                'timeout': int(os.getenv('WORKER_TIMEOUT', '900000')),  # 15 minutes default - increased for 25-page scraping
                 'max_retries': int(os.getenv('MAX_RETRIES', '3')),
                 'log_level': os.getenv('LOG_LEVEL', 'INFO')
             },

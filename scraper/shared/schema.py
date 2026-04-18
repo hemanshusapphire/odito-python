@@ -174,18 +174,26 @@ def extract_structured_data(soup: BeautifulSoup, seo_data: dict):
 
 def validate_seo_scoring_input(job_data):
     """Validate SEO scoring job input data"""
-    required_fields = ["jobId", "projectId", "userId", "sourceJobId"]
+    required_fields = ["jobId", "projectId", "sourceJobId"]
     
     for field in required_fields:
         if not job_data.get(field):
             raise ValueError(f"Missing required field: {field}")
     
+    # userId is optional (may not be provided by backend)
+    userId = job_data.get("userId")
+    
     # Validate MongoDB ObjectId format for IDs
     import re
     objectid_pattern = re.compile(r'^[0-9a-fA-F]{24}$')
     
-    for id_field in ["jobId", "projectId", "userId", "sourceJobId"]:
+    for id_field in ["jobId", "projectId", "sourceJobId"]:
         if not objectid_pattern.match(job_data[id_field]):
             raise ValueError(f"Invalid ObjectId format for {id_field}")
+    
+    # Only validate userId if it's provided and not 'unknown'
+    if userId and userId != 'unknown':
+        if not objectid_pattern.match(userId):
+            raise ValueError(f"Invalid ObjectId format for userId")
     
     return True

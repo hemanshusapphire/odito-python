@@ -103,16 +103,17 @@ class CanonicalTagErrorsRule(BaseSEORuleV2):
                 data_key="canonical",
                 data_path="canonical"
             ))
-        elif canonical != url:
-            # Check if canonical points to a different URL
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"Canonical points to different URL: {canonical}",
-                f"Canonical: {canonical}, Page URL: {url}",
-                f"Canonical should point to: {url}",
-                data_key="canonical",
-                data_path="canonical"
-            ))
+        # DISABLED: Canonical points to different URL check
+        # elif canonical != url:
+        #     # Check if canonical points to a different URL
+        #     issues.append(self.create_issue(
+        #         job_id, project_id, url,
+        #         f"Canonical points to different URL: {canonical}",
+        #         f"Canonical: {canonical}, Page URL: {url}",
+        #         f"Canonical should point to: {url}",
+        #         data_key="canonical",
+        #         data_path="canonical"
+        #     ))
         
         return issues
 

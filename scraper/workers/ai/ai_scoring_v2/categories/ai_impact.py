@@ -445,7 +445,7 @@ class BreadcrumbListSchemaRule(BaseRule):
         
         return min(score, self.max_score)
 
-# Register all AI Impact rules (13 rules)
+# Register all AI Impact rules (12 rules - XMLSitemapExistsValidRule removed due to weight=0)
 def register_ai_impact_rules(registry):
     """Register all AI Impact category rules"""
     registry.register(PrimaryOrganizationSchemaRule())
@@ -455,7 +455,7 @@ def register_ai_impact_rules(registry):
     registry.register(NameFieldMatchesBrandRule())
     registry.register(URLPointsToCanonicalHomepageRule())
     registry.register(LogoURLReturns200Rule())
-    registry.register(XMLSitemapExistsValidRule())
+    # XMLSitemapExistsValidRule removed - had weight=0 and was disabled
     registry.register(RobotsTxtNonBlockingRule())
     registry.register(NoPluginDuplicateSchemasRule())
     registry.register(LLMsTxtFileExistsRule())

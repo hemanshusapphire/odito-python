@@ -823,7 +823,9 @@ def register_eeat_rules(registry):
     registry.register(AuthorNameBioRule())
     registry.register(AuthorPhotoRule())
     registry.register(PersonSchemaLinkedRule())
-    registry.register(AboutPageRule())
+    # DISABLED: About page too short
+    # registry.register(AboutPageRule())
     registry.register(PrivacyTermsPagesRule())
-    registry.register(FirstHandExperienceRule())
+    # DISABLED: Content lacks first-hand experience signals
+    # registry.register(FirstHandExperienceRule())
     registry.register(ContentFreshnessRule())

@@ -13,7 +13,7 @@ config = get_config()
 MONGO_URI = config.get('database.uri')
 print(f"[DB DEBUG] Mongo URI: {MONGO_URI}")
 
-client = MongoClient(MONGO_URI)
+client = MongoClient(MONGO_URI, maxPoolSize=100, minPoolSize=10)
 
 # Use database name from config (already properly extracted)
 db_name = config.get('database.db_name')

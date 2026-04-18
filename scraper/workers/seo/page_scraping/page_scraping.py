@@ -732,14 +732,15 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
     try:
 
-        # Use SAME deterministic type-based URL selection as Headless Worker
+        # Always use deterministic type-based URL selection for quality filtering
         urls_to_scrape = get_top_urls(job.projectId, limit=25)
+        print(f"[DEBUG] Using deterministic URL selection: {len(urls_to_scrape)} URLs")
         
         total_pages = len(urls_to_scrape)
         
         print(f"[DEBUG] Initial selected URLs: {len(urls_to_scrape)} URLs")
         print(f"[DEBUG] URLs: {urls_to_scrape[:5]}...")  # Show first 5 for debugging
-        print(f"[WORKER] PAGE_SCRAPING started | jobId={job.jobId} | selectedUrls={total_pages} | sameLogicAsHeadless=true")
+        print(f"[WORKER] PAGE_SCRAPING started | jobId={job.jobId} | selectedUrls={total_pages}")
 
         
 
@@ -785,12 +786,58 @@ def execute_page_scraping_logic(job: PageScrapingJob):
             
 
             try:
-
-                # Scrape page data using comprehensive extraction
-
-                page_data = scrape_page_data(url)
-
+                print(f"[SCRAPE] Starting URL: {url}")
                 
+                # Scrape page data using comprehensive extraction with timeout
+                # Use threading.Timer for cross-platform timeout (Windows-compatible)
+                import threading
+                
+                result_container = {'page_data': None, 'exception': None}
+                
+                def scrape_with_timeout():
+                    try:
+                        result_container['page_data'] = scrape_page_data(url)
+                    except Exception as e:
+                        result_container['exception'] = e
+                
+                # Start scraping in a thread
+                thread = threading.Thread(target=scrape_with_timeout)
+                thread.start()
+                thread.join(timeout=120)  # 120-second timeout
+                
+                if thread.is_alive():
+                    print(f"[SCRAPE] TIMEOUT for URL: {url} | timeout=120s")
+                    failed_pages += 1
+                    return None
+                
+                # Check for exceptions
+                if result_container['exception']:
+                    print(f"[SCRAPE] EXCEPTION for URL: {url} | error={str(result_container['exception'])}")
+                    failed_pages += 1
+                    return None
+                
+                page_data = result_container['page_data']
+                
+                # Check if scraping succeeded
+                if not page_data:
+                    print(f"[SCRAPE] FAILED for URL: {url} | reason=scrape_page_data returned None")
+                    failed_pages += 1
+                    return None
+                
+                # Check status code
+                status_code = page_data.get("http_status_code")
+                if status_code and status_code != 200:
+                    print(f"[SCRAPE] FAILED for URL: {url} | status_code={status_code} | reason=non-200 status")
+                    failed_pages += 1
+                    return None
+                
+                # Check extraction status
+                if page_data.get("extraction_status") != "SUCCESS":
+                    print(f"[SCRAPE] FAILED for URL: {url} | extraction_status={page_data.get('extraction_status')} | reason=extraction failed")
+                    failed_pages += 1
+                    return None
+                
+                print(f"[SCRAPE] SUCCESS for URL: {url} | status_code={status_code}")
 
                 # Take screenshot (best-effort, failures don't affect scraping) - DISABLED
                 screenshot_path = None
@@ -1078,6 +1125,58 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
                     
 
+            except TimeoutError as te:
+
+                failed_pages += 1
+
+                completed_pages += 1
+
+                print(f"[TIMEOUT] URL scraping timed out after 60s: {url}")
+
+                
+
+                # Send progress update after each timeout
+
+                percentage = int((completed_pages / total_pages) * 100)
+
+                send_progress_update(
+
+                    job.jobId, 
+
+                    percentage, 
+
+                    "Scraping", 
+
+                    "Scraping website pages", 
+
+                    f"{completed_pages} of {total_pages} pages scraped"
+
+                )
+
+                
+
+                return {
+
+                    "url": url,
+
+                    "seo_jobId": ObjectId(job.jobId),
+
+                    "projectId": ObjectId(job.projectId),
+
+                    "sourceJobId": ObjectId(job.sourceJobId) if job.sourceJobId else None,
+
+                    "scrapedAt": datetime.utcnow(),
+
+                    "scrape_status": "TIMEOUT",
+
+                    "error": f"Timeout after 60 seconds: {str(te)}",
+
+                    "screenshot_path": None,
+
+                    "internal_links": []
+
+                }
+
             except Exception as e:
 
                 failed_pages += 1
@@ -1130,7 +1229,7 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
         
 
-        # Process URLs with ThreadPoolExecutor (max 6 workers as required)
+        # Process URLs with ThreadPoolExecutor (OPTIMIZED: increased to 8 workers for better performance)
 
         all_results = []
         
@@ -1138,7 +1237,7 @@ def execute_page_scraping_logic(job: PageScrapingJob):
         print(f"[DEBUG] Before scraping: {len(urls_to_scrape)} URLs ready for processing")
         print(f"[DEBUG] Final URLs to scrape: {urls_to_scrape[:5]}...")  # Show first 5
         
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:  # Increased from 6 to 8 for faster processing
 
             # Submit only first 25 scraping tasks
             futures = [executor.submit(scrape_single_url, url) for url in urls_to_scrape]

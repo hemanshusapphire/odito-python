@@ -195,19 +195,20 @@ class MetaDescriptionTooShortRule(BaseSEORuleV2):
                     impact="Short meta descriptions fail to communicate value proposition and waste SERP real estate, reducing click-through rates.",
                     recommendation="Expand meta description to 120-158 characters. Include value proposition, keywords, and compelling reasons to click."
                 ))
-            elif desc_length >= 120 and desc_length <= 158 and quality_issues:
-                # Borderline case - length OK but quality poor
-                issues_text = ", ".join(quality_issues)
-                issues.append(self.create_issue(
-                    job_id, project_id, url,
-                    f"Meta description length acceptable ({desc_length} chars) but quality issues: {issues_text}",
-                    f"Length: {desc_length} chars | Issues: {len(quality_issues)} | CTR score: {meta_ctr_score}/100",
-                    "Strong meta description with power words and CTA",
-                    data_key="meta_tags",
-                    data_path="meta_tags.description",
-                    impact="Meta description meets length requirements but lacks compelling elements that drive click-through rates and engagement.",
-                    recommendation="Improve meta description quality by adding power words (free, expert, proven), clear call-to-action, and stronger value proposition while maintaining 120-158 character length."
-                ))
+            # DISABLED: Meta description quality issues check (CTR, power words, CTA)
+            # elif desc_length >= 120 and desc_length <= 158 and quality_issues:
+            #     # Borderline case - length OK but quality poor
+            #     issues_text = ", ".join(quality_issues)
+            #     issues.append(self.create_issue(
+            #         job_id, project_id, url,
+            #         f"Meta description length acceptable ({desc_length} chars) but quality issues: {issues_text}",
+            #         f"Length: {desc_length} chars | Issues: {len(quality_issues)} | CTR score: {meta_ctr_score}/100",
+            #         "Strong meta description with power words and CTA",
+            #         data_key="meta_tags",
+            #         data_path="meta_tags.description",
+            #         impact="Meta description meets length requirements but lacks compelling elements that drive click-through rates and engagement.",
+            #         recommendation="Improve meta description quality by adding power words (free, expert, proven), clear call-to-action, and stronger value proposition while maintaining 120-158 character length."
+            #     ))
         
         return issues
 

@@ -110,22 +110,41 @@ def is_job_cancelled(job_id: str) -> bool:
         return False
 
 def initialize_scoring_engine() -> ScoringEngine:
-    """Initialize and configure the scoring engine"""
+    """Initialize and configure the scoring engine with fault tolerance"""
     try:
-        # Register all category rules
-        register_ai_impact_rules(rule_registry)
-        register_citation_probability_rules(rule_registry)
-        register_llm_readiness_rules(rule_registry)
-        register_aeo_score_rules(rule_registry)
-        register_topical_authority_rules(rule_registry)
-        register_voice_intent_rules(rule_registry)
+        print(f"[ENGINE] Starting scoring engine initialization...")
+        
+        # Register all category rules with fault tolerance
+        print(f"[ENGINE] Registering category rules...")
+        
+        category_registrations = [
+            ("ai_impact", register_ai_impact_rules),
+            ("citation_probability", register_citation_probability_rules),
+            ("llm_readiness", register_llm_readiness_rules),
+            ("aeo_score", register_aeo_score_rules),
+            ("topical_authority", register_topical_authority_rules),
+            ("voice_intent", register_voice_intent_rules)
+        ]
+        
+        for category_name, register_fn in category_registrations:
+            try:
+                print(f"[ENGINE] Registering {category_name} rules...")
+                register_fn(rule_registry)
+                print(f"[ENGINE] {category_name} rules registered successfully")
+            except Exception as e:
+                print(f"[ENGINE_WARN] Failed to register {category_name} rules: {e}")
+                print(f"[ENGINE_WARN] Continuing with other categories...")
+                # Don't crash - continue with other categories
+        
+        print(f"[ENGINE] All category rules registered")
         
         # Validate registry
         validation_report = rule_registry.validate_registry()
         if validation_report["issues"]:
             logger.warning(f"Registry validation issues: {validation_report['issues']}")
         
-        # Create scoring engine
+        # Create scoring engine (this will trigger weight validation)
+        print(f"[ENGINE] Creating scoring engine...")
         engine = ScoringEngine(rule_registry)
         
         # Set global registry reference for issue validation
@@ -138,10 +157,16 @@ def initialize_scoring_engine() -> ScoringEngine:
         for category, report in validation_report["categories"].items():
             logger.info(f"  {category}: {report['rule_count']} rules, weight: {report['total_weight']}")
         
+        print(f"[ENGINE] Scoring engine initialization complete")
         return engine
         
     except Exception as e:
-        logger.error(f"Failed to initialize scoring engine: {e}")
+        error_msg = f"Failed to initialize scoring engine: {str(e)}"
+        logger.error(f"[CRITICAL] {error_msg}")
+        print(f"[CRITICAL] {error_msg}")
+        import traceback
+        print(f"[CRITICAL] Traceback: {traceback.format_exc()}")
+        # Re-raise to ensure worker fails properly
         raise
 
 def discover_collection_schema() -> Dict[str, Any]:

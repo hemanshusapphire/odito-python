@@ -36,16 +36,30 @@ class BaseRule(ABC):
         self._validate_config()
     
     def _validate_config(self):
-        """Validate rule configuration"""
+        """Validate rule configuration with fault tolerance"""
         if not self.rule_id or not isinstance(self.rule_id, str):
             raise ValueError(f"Invalid rule_id: {self.rule_id}")
         
         if not self.category or not isinstance(self.category, str):
             raise ValueError(f"Invalid category: {self.category}")
-            
-        if not isinstance(self.weight, (int, float)) or self.weight <= 0:
-            raise ValueError(f"Invalid weight: {self.weight}")
-            
+        
+        # [RULE_DEBUG] Log rule configuration
+        print(f"[RULE_DEBUG] rule={self.rule_id} | weight={self.weight} | enabled={getattr(self, 'enabled', True)}")
+        
+        # Handle weight validation with auto-disable for zero weight
+        if self.weight is None:
+            print(f"[RULE_FIX] Rule {self.rule_id} has weight=None, defaulting to 1.0")
+            self.weight = 1.0
+        
+        if not isinstance(self.weight, (int, float)):
+            raise ValueError(f"Invalid weight type for {self.rule_id}: expected float/int, got {type(self.weight)}")
+        
+        if self.weight <= 0:
+            print(f"[RULE_FIX] Rule {self.rule_id} has weight={self.weight}, auto-disabling")
+            self.enabled = False
+            # Don't raise exception - auto-disable instead
+        
+        # Validate other fields
         if not isinstance(self.max_score, (int, float)) or self.max_score <= 0:
             raise ValueError(f"Invalid max_score: {self.max_score}")
             

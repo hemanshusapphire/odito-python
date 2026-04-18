@@ -3,9 +3,16 @@ Accessibility SEO Rules
 Rules for WCAG compliance, screen reader accessibility, and inclusive design.
 """
 
+import os
 from ..base_seo_rule import BaseSEORuleV2
 from bson.objectid import ObjectId
 from datetime import datetime
+
+
+# Feature flag check - Defensive guard to prevent rule execution when disabled
+def _should_skip_accessibility_rules():
+    """Check if accessibility rules should be skipped via feature flag."""
+    return os.getenv('DISABLE_ACCESSIBILITY_RULES', '').lower() == 'true'
 
 
 class FormInputsLabelsRule(BaseSEORuleV2):
@@ -24,6 +31,10 @@ class TextContrastRule(BaseSEORuleV2):
     description = "Low contrast fails WCAG 2.2 Level AA — Google and users with visual impairments penalise this"
 
     def evaluate(self, normalized, job_id, project_id, url):
+        # Defensive guard - skip if feature flag is enabled
+        if _should_skip_accessibility_rules():
+            return []
+        
         issues = []
         
         # This requires CSS analysis which may not be available in normalized data
@@ -43,6 +54,10 @@ class FormInputsLabelsRule(BaseSEORuleV2):
     description = "Unlabelled form inputs break screen reader accessibility and fail WCAG 1.3.1"
 
     def evaluate(self, normalized, job_id, project_id, url):
+        # Defensive guard - skip if feature flag is enabled
+        if _should_skip_accessibility_rules():
+            return []
+        
         issues = []
         
         # ✅ Use headless data instead of missing forms array
@@ -91,6 +106,10 @@ class KeyboardAccessibilityRule(BaseSEORuleV2):
     description = "Keyboard-only users must reach every interactive element without a mouse"
 
     def evaluate(self, normalized, job_id, project_id, url):
+        # Defensive guard - skip if feature flag is enabled
+        if _should_skip_accessibility_rules():
+            return []
+        
         issues = []
         
         # ✅ Use real keyboard navigation data from headless worker
@@ -147,6 +166,10 @@ class FocusIndicatorsRule(BaseSEORuleV2):
     description = "Removing CSS focus outlines fails WCAG 2.4.11 — WCAG 2.2 criterion"
 
     def evaluate(self, normalized, job_id, project_id, url):
+        # Defensive guard - skip if feature flag is enabled
+        if _should_skip_accessibility_rules():
+            return []
+        
         issues = []
         
         # Check for CSS that removes focus indicators
@@ -185,6 +208,10 @@ class PageLanguageRule(BaseSEORuleV2):
     description = "Missing lang attribute prevents screen readers using correct pronunciation"
 
     def evaluate(self, normalized, job_id, project_id, url):
+        # Defensive guard - skip if feature flag is enabled
+        if _should_skip_accessibility_rules():
+            return []
+        
         issues = []
         
         # Check for html lang attribute
@@ -220,6 +247,10 @@ class VideoCaptionsRule(BaseSEORuleV2):
     description = "Videos without captions fail WCAG 1.2.2 and exclude deaf/hard-of-hearing users"
 
     def evaluate(self, normalized, job_id, project_id, url):
+        # Defensive guard - skip if feature flag is enabled
+        if _should_skip_accessibility_rules():
+            return []
+        
         issues = []
         
         # ❌ videos array not available in normalized data
@@ -259,6 +290,10 @@ class TapTargetSizeRule(BaseSEORuleV2):
     description = "WCAG 2.2 criterion 2.5.8 requires minimum 24×24px tap targets — new in 2024"
 
     def evaluate(self, normalized, job_id, project_id, url):
+        # Defensive guard - skip if feature flag is enabled
+        if _should_skip_accessibility_rules():
+            return []
+        
         issues = []
         
         # ✅ Use real tap target data from headless worker keyboard analysis
@@ -302,6 +337,10 @@ class AxeViolationsRule(BaseSEORuleV2):
     description = "Professional accessibility violations detected by axe-core testing"
 
     def evaluate(self, normalized, job_id, project_id, url):
+        # Defensive guard - skip if feature flag is enabled
+        if _should_skip_accessibility_rules():
+            return []
+        
         issues = []
         
         # 🚀 GAME CHANGER: Use real axe-core violations

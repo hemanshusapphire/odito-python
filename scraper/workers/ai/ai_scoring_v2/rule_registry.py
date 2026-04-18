@@ -16,13 +16,23 @@ class RuleRegistry:
     
     def register(self, rule: BaseRule):
         """
-        Register a rule in the registry
+        Register a rule in the registry with fault tolerance
         
         Args:
             rule: Rule instance to register
         """
+        # [RULE_DEBUG] Log rule registration
+        is_disabled = getattr(rule, 'enabled', True) == False
+        print(f"[RULE_DEBUG] Registering rule={rule.rule_id} | weight={rule.weight} | enabled={not is_disabled}")
+        
+        # Skip disabled rules or rules with zero weight
+        if is_disabled or rule.weight <= 0:
+            print(f"[SKIP] Rule skipped: {rule.rule_id} (disabled or zero weight)")
+            return
+        
         if rule.rule_id in self._rules:
-            raise ValueError(f"Rule {rule.rule_id} already registered")
+            print(f"[WARN] Rule {rule.rule_id} already registered, skipping")
+            return
         
         self._rules[rule.rule_id] = rule
         

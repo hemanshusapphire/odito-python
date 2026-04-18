@@ -103,7 +103,7 @@ def scrape_page_data(url: str) -> dict:
     """
     try:
         # Use existing fetch_html function (includes JS detection and Selenium fallback)
-        html, status_code, response_time, response_headers = fetch_html(url, timeout=10)
+        html, status_code, response_time, response_headers = fetch_html(url, timeout=30)
         
         if status_code != 200 or not html:
             return None

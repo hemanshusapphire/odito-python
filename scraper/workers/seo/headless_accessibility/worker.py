@@ -23,6 +23,7 @@ from bson.objectid import ObjectId
 # Import database collections
 from db import seo_page_data
 from scraper.shared.url_selector import get_top_urls
+from scraper.shared.http_client import get_http_client
 
 
 # ---------------------------------------------------------------------------
@@ -206,21 +207,41 @@ async def _scan_single_url(browser, url, semaphore, timeout_ms=30000):
             )
             page = await context.new_page()
 
-            # Navigate
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            status_code = response.status if response else 0
-
-            # Wait briefly for JS rendering
-            await page.wait_for_timeout(2000)
-
-            # Inject axe-core
+            # Navigate with asyncio.wait_for to guarantee timeout enforcement
+            # Use domcontentloaded instead of commit for more reliable page load detection
             try:
-                axe_script = requests.get(AXE_CDN_URL, timeout=10).text
-                await page.evaluate(axe_script)
-            except Exception as axe_load_err:
-                print(f"  ⚠️ axe-core CDN load failed for {url}: {axe_load_err}")
-                # Try to continue without axe — still collect DOM metrics
-                result["error"] = f"axe-core load failed: {str(axe_load_err)}"
+                response = await asyncio.wait_for(
+                    page.goto(url, wait_until="domcontentloaded", timeout=55000),
+                    timeout=60
+                )
+                status_code = response.status if response else 0
+            except asyncio.TimeoutError:
+                print(f"  ⚠️ Page navigation timeout for {url}")
+                result["error"] = "Page navigation timeout (60s)"
+                raise
+            except Exception as nav_err:
+                print(f"  ⚠️ Page navigation failed for {url}: {nav_err}")
+                result["error"] = f"Navigation failed: {str(nav_err)}"
+                raise
+
+            # Wait for JS rendering with increased timeout
+            await page.wait_for_timeout(3000)  # Increased from 2s to 3s
+
+            # Inject axe-core with retry logic
+            axe_loaded = False
+            for attempt in range(2):  # Retry twice
+                try:
+                    http_client = get_http_client()
+                    axe_response = await http_client.get(AXE_CDN_URL, timeout=15)
+                    axe_script = axe_response.text
+                    await page.evaluate(axe_script)
+                    axe_loaded = True
+                    break
+                except Exception as axe_load_err:
+                    print(f"  ⚠️ axe-core CDN load attempt {attempt + 1} failed for {url}: {axe_load_err}")
+                    if attempt == 1:
+                        # Last attempt failed
+                        result["error"] = f"axe-core load failed: {str(axe_load_err)}"
 
             # Run axe-core
             try:
@@ -244,8 +265,17 @@ async def _scan_single_url(browser, url, semaphore, timeout_ms=30000):
 
             # --- Feature 4: Keyboard Accessibility Simulation ---
             try:
-                keyboard_result = await _simulate_keyboard_navigation(page)
+                keyboard_result = await asyncio.wait_for(
+                    _simulate_keyboard_navigation(page),
+                    timeout=30
+                )
                 result["keyboard_analysis"] = keyboard_result
+            except asyncio.TimeoutError:
+                print(f"  ⚠️ Keyboard navigation timeout for {url}")
+                result["keyboard_analysis"] = {
+                    "keyboard_navigation_checked": False,
+                    "error": "Keyboard navigation timeout (30s)"
+                }
             except Exception as kb_err:
                 print(f"  ⚠️ Keyboard navigation failed for {url}: {kb_err}")
                 result["keyboard_analysis"] = {
@@ -303,8 +333,9 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
 
         try:
             # Process URLs in batches with semaphore-limited concurrency
+            # Wrap each task with asyncio.wait_for to prevent indefinite hangs
             tasks = [
-                _scan_single_url(browser, url, semaphore)
+                asyncio.wait_for(_scan_single_url(browser, url, semaphore), timeout=90)
                 for url in urls
             ]
             all_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -345,7 +376,8 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
             "results": all_results
         }
         print(f"[HEADLESS_A11Y] Posting to storage endpoint | url={store_url} | resultsCount={len(all_results)}")
-        store_response = requests.post(store_url, json=store_payload, timeout=30)
+        http_client = get_http_client()
+        store_response = await http_client.post(store_url, json=store_payload, timeout=30)
         
         # Validate response status
         if store_response.status_code == 200:
@@ -358,15 +390,8 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
             
     except Exception as store_err:
         print(f"❌ [HEADLESS_A11Y] CRITICAL: Failed to store results | jobId={job_id} | error={store_err} | timestamp={datetime.now(timezone.utc).isoformat()}")
-        # CRITICAL: Mark job as FAILED if storage fails
-        return {
-            "status": "failed",
-            "jobId": job_id,
-            "error": f"Storage failed: {str(store_err)}",
-            "totalUrls": total,
-            "successCount": 0,
-            "failedCount": total
-        }
+        # CRITICAL: Raise exception to ensure completion API is called in execute_headless_accessibility
+        raise Exception(f"Storage failed: {str(store_err)}")
 
     return {
         "totalUrls": total,
@@ -376,7 +401,7 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
     }
 
 
-def execute_headless_accessibility(job):
+async def execute_headless_accessibility(job):
     """
     Execute HEADLESS_ACCESSIBILITY job.
 
@@ -454,7 +479,8 @@ def execute_headless_accessibility(job):
         try:
             print(f"[HEADLESS_A11Y] Calling completion endpoint | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
             complete_url = f"{node_backend_url}/api/jobs/{job_id}/complete"
-            requests.post(complete_url, json={"stats": {"totalUrls": 0, "successCount": 0, "failedCount": 0}}, timeout=10)
+            http_client = get_http_client()
+            await http_client.post(complete_url, json={"stats": {"totalUrls": 0, "successCount": 0, "failedCount": 0}}, timeout=10)
             print(f"[HEADLESS_A11Y] Completion endpoint called | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
         except Exception:
             pass
@@ -462,16 +488,13 @@ def execute_headless_accessibility(job):
 
     try:
         print(f"[HEADLESS_A11Y] Starting async scan | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
-        # Run the async scan
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            scan_results = loop.run_until_complete(
-                _run_accessibility_scan(job_id, project_id, urls, node_backend_url)
-            )
-            print(f"[HEADLESS_A11Y] Async scan completed | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
-        finally:
-            loop.close()
+        # Run the async scan with global timeout to prevent indefinite hangs
+        # 25 URLs * 90s per URL = 2250s, but we limit to 900s (15 min) total
+        scan_results = await asyncio.wait_for(
+            _run_accessibility_scan(job_id, project_id, urls, node_backend_url),
+            timeout=900
+        )
+        print(f"[HEADLESS_A11Y] Async scan completed | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
 
         # Report job completion
         stats = {
@@ -483,7 +506,8 @@ def execute_headless_accessibility(job):
         try:
             print(f"[HEADLESS_A11Y] Calling completion endpoint | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
             complete_url = f"{node_backend_url}/api/jobs/{job_id}/complete"
-            complete_response = requests.post(
+            http_client = get_http_client()
+            complete_response = await http_client.post(
                 complete_url,
                 json={"stats": stats},
                 timeout=10
@@ -495,7 +519,8 @@ def execute_headless_accessibility(job):
             # Try to report failure
             try:
                 fail_url = f"{node_backend_url}/api/jobs/{job_id}/fail"
-                requests.post(
+                http_client = get_http_client()
+                await http_client.post(
                     fail_url,
                     json={"error": f"Completion reporting failed: {str(complete_error)}", "stats": stats},
                     timeout=10
@@ -511,6 +536,26 @@ def execute_headless_accessibility(job):
             **stats
         }
 
+    except asyncio.TimeoutError:
+        print(f"❌ [HEADLESS_A11Y] Global timeout exceeded (900s) | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
+        # Report failure to Node.js
+        try:
+            fail_url = f"{node_backend_url}/api/jobs/{job_id}/fail"
+            http_client = get_http_client()
+            await http_client.post(
+                fail_url,
+                json={"error": "Global timeout exceeded (15 minutes)", "stats": {"totalUrls": len(urls), "successCount": 0, "failedCount": len(urls)}},
+                timeout=10
+            )
+            print(f"[HEADLESS_A11Y] Timeout failure reported | jobId={job_id}")
+        except Exception as fail_error:
+            print(f"⚠️ [HEADLESS_A11Y] Failed to report timeout failure | error={str(fail_error)}")
+        return {
+            "status": "failed_gracefully",
+            "jobId": job_id,
+            "error": "Global timeout exceeded (15 minutes)"
+        }
+
     except Exception as e:
         print(f"❌ [HEADLESS_A11Y] Worker failed | jobId={job_id} | error={str(e)} | timestamp={datetime.now(timezone.utc).isoformat()}")
         traceback.print_exc()
@@ -518,7 +563,8 @@ def execute_headless_accessibility(job):
         # Report failure to Node.js
         try:
             fail_url = f"{node_backend_url}/api/jobs/{job_id}/fail"
-            requests.post(
+            http_client = get_http_client()
+            await http_client.post(
                 fail_url,
                 json={"error": str(e), "stats": {}},
                 timeout=10
@@ -527,6 +573,11 @@ def execute_headless_accessibility(job):
         except Exception as fail_error:
             print(f"⚠️ [HEADLESS_A11Y] Failed to report failure | error={str(fail_error)}")
 
+        return {
+            "status": "failed_gracefully",
+            "jobId": job_id,
+            "error": str(e)
+        }
         return {
             "status": "failed_gracefully",
             "jobId": job_id,

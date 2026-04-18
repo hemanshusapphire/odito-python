@@ -22,9 +22,10 @@ class PerformanceDesktopJob(BaseModel):
     sourceJobId: str  # Reference to PAGE_SCRAPING job
 
 @router.post("/jobs/performance-mobile")
-def handle_performance_mobile(job: PerformanceMobileJob):
+async def handle_performance_mobile(job: PerformanceMobileJob):
     """Handle PERFORMANCE_MOBILE job dispatched from Node.js"""
     print(f"[DEBUG] PERFORMANCE_MOBILE endpoint called | jobId={job.jobId} | projectId={job.projectId}")
+    print(f"[DEBUG] PERFORMANCE_MOBILE handler START | jobId={job.jobId}")
     
     # Import here to avoid circular imports
     from main import completed_jobs, completed_jobs_lock
@@ -44,12 +45,15 @@ def handle_performance_mobile(job: PerformanceMobileJob):
         print(f"[WORKER] PERFORMANCE_MOBILE started | jobId={job.jobId}")
         
         # Execute performance analysis immediately (no polling loop)
-        result = execute_performance_mobile_logic(job)
+        print(f"[DEBUG] BEFORE execute_performance_mobile_logic | jobId={job.jobId}")
+        result = await execute_performance_mobile_logic(job)
+        print(f"[DEBUG] AFTER execute_performance_mobile_logic | jobId={job.jobId} | result={result}")
         
         # Mark as completed
         with completed_jobs_lock:
             completed_jobs.add(job.jobId)
         
+        print(f"[DEBUG] PERFORMANCE_MOBILE handler RETURNING | jobId={job.jobId}")
         return {
             "status": "accepted",
             "jobId": job.jobId,

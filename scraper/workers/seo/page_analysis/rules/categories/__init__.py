@@ -5,6 +5,7 @@ Imports and calls all category registration functions so that
 all rules are registered with the SEORuleRegistry on startup.
 """
 
+import os
 from ..seo_rule_registry import SEORuleRegistry
 
 # Category registration imports - NEW RULES ONLY
@@ -49,8 +50,12 @@ def register_all_seo_categories(registry=None):
     # E-E-A-T & Trust
     register_eeat_rules(registry)
 
-    # Accessibility
-    register_accessibility_rules(registry)
+    # Accessibility - Feature flag controlled
+    # When DISABLE_ACCESSIBILITY_RULES=true, rules are skipped but data collection still runs
+    if not os.getenv('DISABLE_ACCESSIBILITY_RULES', '').lower() == 'true':
+        register_accessibility_rules(registry)
+    else:
+        print("⚠️ Accessibility rules skipped via feature flag DISABLE_ACCESSIBILITY_RULES=true")
 
     # SEO Enhancements (S1-S6)
     register_seo_enhancement_rules(registry)

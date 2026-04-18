@@ -17,7 +17,7 @@ class HeadlessAccessibilityJob(BaseModel):
 
 
 @router.post("/jobs/headless-accessibility")
-def handle_headless_accessibility(job: HeadlessAccessibilityJob):
+async def handle_headless_accessibility(job: HeadlessAccessibilityJob):
     """Handle HEADLESS_ACCESSIBILITY job dispatched from Node.js"""
     from main import completed_jobs, completed_jobs_lock
     from scraper.workers.seo.headless_accessibility.worker import execute_headless_accessibility
@@ -37,9 +37,9 @@ def handle_headless_accessibility(job: HeadlessAccessibilityJob):
 
         print(f"[WORKER] HEADLESS_ACCESSIBILITY started | jobId={job.jobId} | urls={len(job.urls)} | timestamp={datetime.now(timezone.utc).isoformat()}")
 
-        # Execute headless accessibility scanning
+        # Execute headless accessibility scanning (async)
         print(f"[ROUTE] Calling execute_headless_accessibility | jobId={job.jobId} | timestamp={datetime.now(timezone.utc).isoformat()}")
-        result = execute_headless_accessibility(job)
+        result = await execute_headless_accessibility(job)
         print(f"[ROUTE] execute_headless_accessibility returned | jobId={job.jobId} | result={result.get('status', 'unknown')} | timestamp={datetime.now(timezone.utc).isoformat()}")
 
         # Mark as completed

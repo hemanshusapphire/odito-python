@@ -628,7 +628,8 @@ def register_internal_rules(registry):
     registry.register(MixedHttpHttpsRule())
     registry.register(NonSeoFriendlyUrlsRule())
     registry.register(DoubleSlashUrlsRule())
-    registry.register(LowCodeToHtmlRatioRule())
+    # DISABLED: Very low content ratio
+    # registry.register(LowCodeToHtmlRatioRule())
     registry.register(KeywordDensityRule())
     registry.register(IframeWrappingRule())
     registry.register(LongUrlsRule())
