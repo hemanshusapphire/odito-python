@@ -49,7 +49,11 @@ AXE_RUN_SCRIPT = """
                     description: v.description,
                     helpUrl: v.helpUrl,
                     nodes: v.nodes.length,
-                    tags: v.tags
+                    tags: v.tags,
+                    nodeDetails: v.nodes.slice(0, 5).map(n => ({
+                        target: n.target || [],
+                        html: n.html || ''
+                    }))
                 })),
                 violationCount: results.violations.length,
                 passedCount: results.passes ? results.passes.length : 0
@@ -75,6 +79,14 @@ DOM_METRICS_SCRIPT = """
         inputs: document.querySelectorAll('input, textarea, select').length,
         buttons: document.querySelectorAll('button, [role="button"]').length,
         ariaLandmarks: document.querySelectorAll('[role="banner"],[role="navigation"],[role="main"],[role="contentinfo"],[role="complementary"],[role="search"]').length,
+        ariaLandmarksDetail: {
+            main: document.querySelectorAll('main, [role="main"]').length,
+            nav: document.querySelectorAll('nav, [role="navigation"]').length,
+            header: document.querySelectorAll('header, [role="banner"]').length,
+            footer: document.querySelectorAll('footer, [role="contentinfo"]').length,
+            aside: document.querySelectorAll('aside, [role="complementary"]').length,
+            search: document.querySelectorAll('[role="search"]').length
+        },
         title: document.title || '',
         lang: document.documentElement.lang || ''
     };
@@ -94,16 +106,36 @@ KEYBOARD_FOCUS_COLLECTOR = """
     }
     const rect = el.getBoundingClientRect();
     const styles = window.getComputedStyle(el);
+    
+    // Generate CSS selector for element reference
+    let selector = el.tagName.toLowerCase();
+    if (el.id) {
+        selector += '#' + el.id;
+    } else if (el.className && typeof el.className === 'string' && el.className) {
+        selector += '.' + el.className.split(' ').filter(c => c).join('.');
+    }
+    
     return {
         tag: el.tagName.toLowerCase(),
         id: el.id || '',
         className: (el.className && typeof el.className === 'string') ? el.className.substring(0, 100) : '',
+        selector: selector,
         focused: true,
         width: Math.round(rect.width),
         height: Math.round(rect.height),
         outlineStyle: styles.outlineStyle || 'none',
         outlineWidth: styles.outlineWidth || '0px',
         outlineColor: styles.outlineColor || ''
+    };
+}
+"""
+
+
+META_VIEWPORT_SCRIPT = """
+() => {
+    const viewportMeta = document.querySelector('meta[name="viewport"]');
+    return {
+        viewportContent: viewportMeta ? viewportMeta.getAttribute('content') : null
     };
 }
 """
@@ -123,6 +155,7 @@ async def _simulate_keyboard_navigation(page) -> dict:
     TAB_COUNT = 20
     focus_order = []
     small_click_targets = 0
+    small_click_targets_list = []
     missing_focus_outline = 0
     focus_trap_detected = False
     unreachable_count = 0
@@ -148,6 +181,11 @@ async def _simulate_keyboard_navigation(page) -> dict:
         h = focus_info.get("height", 0)
         if (w > 0 and w < 24) or (h > 0 and h < 24):
             small_click_targets += 1
+            small_click_targets_list.append({
+                "selector": focus_info.get("selector", ""),
+                "width": w,
+                "height": h
+            })
 
         # Check missing focus outline
         outline_style = focus_info.get("outlineStyle", "none")
@@ -174,10 +212,11 @@ async def _simulate_keyboard_navigation(page) -> dict:
         "focus_trap_detected": focus_trap_detected,
         "unreachable_elements": unreachable_count,
         "small_click_targets": small_click_targets,
+        "small_click_targets_list": small_click_targets_list,
         "missing_focus_outline": missing_focus_outline,
         "total_tab_presses": TAB_COUNT,
         "focus_order": [
-            {"tag": f.get("tag"), "id": f.get("id", "")}
+            {"tag": f.get("tag"), "id": f.get("id", ""), "selector": f.get("selector", "")}
             for f in focus_order if f.get("focused", False)
         ]
     }
@@ -185,123 +224,229 @@ async def _simulate_keyboard_navigation(page) -> dict:
 
 async def _scan_single_url(browser, url, semaphore, timeout_ms=30000):
     """
-    Scan a single URL in its own browser context.
-    Returns structured result dict.
+    Scan a single URL in its own browser context with retry mechanism.
+    Returns structured result dict with comprehensive error handling.
     """
     async with semaphore:
-        context = None
-        page = None
         result = {
             "url": url,
             "render_status": "failed",
             "axeViolations": [],
             "domMetrics": {},
             "error": None,
-            "scannedAt": datetime.now(timezone.utc).isoformat()
+            "scannedAt": datetime.now(timezone.utc).isoformat(),
+            "attempts": 0,
+            "statusCode": None
         }
 
-        try:
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                ignore_https_errors=True
-            )
-            page = await context.new_page()
+        # Retry up to 3 times for robustness
+        MAX_RETRIES = 3
+        NAVIGATION_TIMEOUT = 90000  # 90s
+        SELECTOR_TIMEOUT = 30000    # 30s
 
-            # Navigate with asyncio.wait_for to guarantee timeout enforcement
-            # Use domcontentloaded instead of commit for more reliable page load detection
+        for attempt in range(1, MAX_RETRIES + 1):
+            result["attempts"] = attempt
+            attempt_start_time = time.time()
+            context = None
+            page = None
+
+            print(f"  🔄 Attempt {attempt}/{MAX_RETRIES} for {url} | timestamp={datetime.now(timezone.utc).isoformat()}")
+
             try:
-                response = await asyncio.wait_for(
-                    page.goto(url, wait_until="domcontentloaded", timeout=55000),
-                    timeout=60
+                # Create browser context with realistic user agent and anti-bot settings
+                context = await browser.new_context(
+                    viewport={"width": 1366, "height": 768},
+                    ignore_https_errors=True,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    locale="en-US",
+                    timezone_id="America/New_York"
                 )
-                status_code = response.status if response else 0
-            except asyncio.TimeoutError:
-                print(f"  ⚠️ Page navigation timeout for {url}")
-                result["error"] = "Page navigation timeout (60s)"
-                raise
-            except Exception as nav_err:
-                print(f"  ⚠️ Page navigation failed for {url}: {nav_err}")
-                result["error"] = f"Navigation failed: {str(nav_err)}"
-                raise
+                page = await context.new_page()
 
-            # Wait for JS rendering with increased timeout
-            await page.wait_for_timeout(3000)  # Increased from 2s to 3s
+                # Set default timeout for all operations
+                page.set_default_timeout(SELECTOR_TIMEOUT)
 
-            # Inject axe-core with retry logic
-            axe_loaded = False
-            for attempt in range(2):  # Retry twice
+                # Navigate with domcontentloaded (more reliable than networkidle for SPAs)
                 try:
-                    http_client = get_http_client()
-                    axe_response = await http_client.get(AXE_CDN_URL, timeout=15)
-                    axe_script = axe_response.text
-                    await page.evaluate(axe_script)
-                    axe_loaded = True
-                    break
-                except Exception as axe_load_err:
-                    print(f"  ⚠️ axe-core CDN load attempt {attempt + 1} failed for {url}: {axe_load_err}")
-                    if attempt == 1:
-                        # Last attempt failed
-                        result["error"] = f"axe-core load failed: {str(axe_load_err)}"
+                    response = await asyncio.wait_for(
+                        page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT),
+                        timeout=NAVIGATION_TIMEOUT / 1000 + 5  # Add buffer
+                    )
+                    status_code = response.status if response else 0
+                    result["statusCode"] = status_code
+                    load_time = time.time() - attempt_start_time
+                    print(f"  ✅ Navigation successful for {url} | status={status_code} | loadTime={load_time:.2f}s")
+                except asyncio.TimeoutError:
+                    load_time = time.time() - attempt_start_time
+                    print(f"  ⚠️ Navigation timeout for {url} | attempt={attempt} | loadTime={load_time:.2f}s")
+                    result["error"] = f"Navigation timeout (90s) on attempt {attempt}"
+                    if attempt < MAX_RETRIES:
+                        print(f"  🔄 Retrying {url} after timeout...")
+                        continue
+                    raise
+                except Exception as nav_err:
+                    load_time = time.time() - attempt_start_time
+                    print(f"  ⚠️ Navigation failed for {url} | attempt={attempt} | error={nav_err} | loadTime={load_time:.2f}s")
+                    result["error"] = f"Navigation failed on attempt {attempt}: {str(nav_err)}"
+                    if attempt < MAX_RETRIES:
+                        print(f"  🔄 Retrying {url} after navigation error...")
+                        continue
+                    raise
 
-            # Run axe-core
-            try:
-                axe_results = await page.evaluate(AXE_RUN_SCRIPT)
-                result["axeViolations"] = axe_results.get("violations", [])
-                result["axeViolationCount"] = axe_results.get("violationCount", 0)
-                result["axePassedCount"] = axe_results.get("passedCount", 0)
-            except Exception as axe_err:
-                print(f"  ⚠️ axe-core run failed for {url}: {axe_err}")
-                result["axeViolations"] = []
-                if not result["error"]:
-                    result["error"] = f"axe-core run failed: {str(axe_err)}"
+                # Wait for SPA hydration (JS rendering)
+                await page.wait_for_timeout(5000)  # 5s for SPA hydration
 
-            # Collect DOM metrics
-            try:
-                dom_metrics = await page.evaluate(DOM_METRICS_SCRIPT)
-                result["domMetrics"] = dom_metrics
-            except Exception as dom_err:
-                print(f"  ⚠️ DOM metrics failed for {url}: {dom_err}")
-                result["domMetrics"] = {}
-
-            # --- Feature 4: Keyboard Accessibility Simulation ---
-            try:
-                keyboard_result = await asyncio.wait_for(
-                    _simulate_keyboard_navigation(page),
-                    timeout=30
-                )
-                result["keyboard_analysis"] = keyboard_result
-            except asyncio.TimeoutError:
-                print(f"  ⚠️ Keyboard navigation timeout for {url}")
-                result["keyboard_analysis"] = {
-                    "keyboard_navigation_checked": False,
-                    "error": "Keyboard navigation timeout (30s)"
-                }
-            except Exception as kb_err:
-                print(f"  ⚠️ Keyboard navigation failed for {url}: {kb_err}")
-                result["keyboard_analysis"] = {
-                    "keyboard_navigation_checked": False,
-                    "error": str(kb_err)
-                }
-
-            result["render_status"] = "success"
-            result["statusCode"] = status_code
-
-        except Exception as e:
-            result["render_status"] = "failed"
-            result["error"] = str(e)
-            print(f"  ❌ Scan failed for {url}: {e}")
-
-        finally:
-            if page:
+                # Verify DOM is ready - check document.readyState and body content
                 try:
-                    await page.close()
-                except Exception:
-                    pass
-            if context:
+                    dom_ready = await page.evaluate("""
+                        () => {
+                            return {
+                                readyState: document.readyState,
+                                hasBody: document.body !== null,
+                                bodyChildren: document.body ? document.body.children.length : 0
+                            };
+                        }
+                    """)
+                    print(f"  📊 DOM state for {url} | readyState={dom_ready['readyState']} | hasBody={dom_ready['hasBody']} | bodyChildren={dom_ready['bodyChildren']}")
+
+                    # If document is not complete or body is empty, wait longer
+                    if dom_ready['readyState'] != 'complete' or dom_ready['bodyChildren'] == 0:
+                        print(f"  ⏳ Waiting for full DOM load for {url}...")
+                        await page.wait_for_timeout(3000)  # Additional 3s wait
+
+                        # Try optional networkidle as fallback for SPAs
+                        try:
+                            await page.wait_for_load_state('networkidle', timeout=10000)
+                            print(f"  ✅ Networkidle achieved for {url}")
+                        except Exception:
+                            print(f"  ℹ️ Networkidle timeout (non-critical) for {url}")
+                except Exception as dom_check_err:
+                    print(f"  ⚠️ DOM check failed for {url}: {dom_check_err}")
+                    # Continue anyway, DOM might still be usable
+
+                # Inject axe-core with retry logic
+                axe_loaded = False
+                for axe_attempt in range(2):
+                    try:
+                        http_client = get_http_client()
+                        axe_response = await http_client.get(AXE_CDN_URL, timeout=15)
+                        axe_script = axe_response.text
+                        await page.evaluate(axe_script)
+                        axe_loaded = True
+                        print(f"  ✅ axe-core loaded for {url} | attempt={axe_attempt + 1}")
+                        break
+                    except Exception as axe_load_err:
+                        print(f"  ⚠️ axe-core CDN load attempt {axe_attempt + 1} failed for {url}: {axe_load_err}")
+                        if axe_attempt == 1:
+                            result["error"] = f"axe-core load failed: {str(axe_load_err)}"
+
+                if not axe_loaded:
+                    print(f"  ❌ axe-core failed to load for {url} after retries")
+                    if attempt < MAX_RETRIES:
+                        print(f"  🔄 Retrying {url} after axe-core load failure...")
+                        continue
+                    raise Exception("axe-core failed to load after retries")
+
+                # Run axe-core (only after DOM is confirmed ready)
                 try:
-                    await context.close()
-                except Exception:
-                    pass
+                    axe_results = await page.evaluate(AXE_RUN_SCRIPT)
+                    result["axeViolations"] = axe_results.get("violations", [])
+                    result["axeViolationCount"] = axe_results.get("violationCount", 0)
+                    result["axePassedCount"] = axe_results.get("passedCount", 0)
+                    print(f"  ✅ axe-core executed for {url} | violations={result['axeViolationCount']}")
+                except Exception as axe_err:
+                    print(f"  ⚠️ axe-core run failed for {url}: {axe_err}")
+                    result["axeViolations"] = []
+                    if not result["error"]:
+                        result["error"] = f"axe-core run failed: {str(axe_err)}"
+                    if attempt < MAX_RETRIES:
+                        print(f"  🔄 Retrying {url} after axe-core run failure...")
+                        continue
+                    raise
+
+                # Collect DOM metrics
+                try:
+                    dom_metrics = await page.evaluate(DOM_METRICS_SCRIPT)
+                    result["domMetrics"] = dom_metrics
+                    print(f"  ✅ DOM metrics collected for {url} | totalElements={dom_metrics.get('totalElements', 0)}")
+                except Exception as dom_err:
+                    print(f"  ⚠️ DOM metrics failed for {url}: {dom_err}")
+                    result["domMetrics"] = {}
+
+                # Collect meta viewport
+                try:
+                    viewport_data = await page.evaluate(META_VIEWPORT_SCRIPT)
+                    result["viewportMeta"] = viewport_data
+                except Exception as viewport_err:
+                    print(f"  ⚠️ Viewport meta failed for {url}: {viewport_err}")
+                    result["viewportMeta"] = {}
+
+                # Feature 4: Keyboard Accessibility Simulation
+                try:
+                    keyboard_result = await asyncio.wait_for(
+                        _simulate_keyboard_navigation(page),
+                        timeout=30
+                    )
+                    result["keyboard_analysis"] = keyboard_result
+                    print(f"  ✅ Keyboard navigation completed for {url}")
+                except asyncio.TimeoutError:
+                    print(f"  ⚠️ Keyboard navigation timeout for {url}")
+                    result["keyboard_analysis"] = {
+                        "keyboard_navigation_checked": False,
+                        "error": "Keyboard navigation timeout (30s)"
+                    }
+                except Exception as kb_err:
+                    print(f"  ⚠️ Keyboard navigation failed for {url}: {kb_err}")
+                    result["keyboard_analysis"] = {
+                        "keyboard_navigation_checked": False,
+                        "error": str(kb_err)
+                    }
+
+                # Success! Mark as successful and break retry loop
+                result["render_status"] = "success"
+                total_load_time = time.time() - attempt_start_time
+                result["loadTime"] = round(total_load_time, 2)
+                print(f"  ✅ Scan successful for {url} | attempt={attempt} | totalLoadTime={total_load_time:.2f}s | status={status_code}")
+                break
+
+            except Exception as e:
+                total_load_time = time.time() - attempt_start_time
+                print(f"  ❌ Attempt {attempt} failed for {url} | error={e} | loadTime={total_load_time:.2f}s")
+                result["error"] = str(e)
+
+                # Clean up on failure
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                if context:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+
+                # If this was the last attempt, mark as failed
+                if attempt == MAX_RETRIES:
+                    result["render_status"] = "failed"
+                    result["loadTime"] = round(total_load_time, 2)
+                    print(f"  ❌ All retries exhausted for {url} | finalStatus=failed | error={e}")
+                else:
+                    print(f"  🔄 Retrying {url} (attempt {attempt + 1}/{MAX_RETRIES})...")
+
+            finally:
+                # Clean up resources on success too
+                if result["render_status"] == "success":
+                    if page:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
 
         return result
 
@@ -326,7 +471,12 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu"
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--window-size=1366,768"
             ]
         )
         print(f"[HEADLESS_A11Y] Browser launched | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
@@ -334,8 +484,9 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
         try:
             # Process URLs in batches with semaphore-limited concurrency
             # Wrap each task with asyncio.wait_for to prevent indefinite hangs
+            # Increased timeout to 300s (5 min) to account for 3 retry attempts
             tasks = [
-                asyncio.wait_for(_scan_single_url(browser, url, semaphore), timeout=90)
+                asyncio.wait_for(_scan_single_url(browser, url, semaphore), timeout=300)
                 for url in urls
             ]
             all_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -489,10 +640,10 @@ async def execute_headless_accessibility(job):
     try:
         print(f"[HEADLESS_A11Y] Starting async scan | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
         # Run the async scan with global timeout to prevent indefinite hangs
-        # 25 URLs * 90s per URL = 2250s, but we limit to 900s (15 min) total
+        # Increased to 1800s (30 min) to account for retry mechanism and slower pages
         scan_results = await asyncio.wait_for(
             _run_accessibility_scan(job_id, project_id, urls, node_backend_url),
-            timeout=900
+            timeout=1800
         )
         print(f"[HEADLESS_A11Y] Async scan completed | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
 
@@ -537,14 +688,14 @@ async def execute_headless_accessibility(job):
         }
 
     except asyncio.TimeoutError:
-        print(f"❌ [HEADLESS_A11Y] Global timeout exceeded (900s) | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
+        print(f"❌ [HEADLESS_A11Y] Global timeout exceeded (1800s) | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
         # Report failure to Node.js
         try:
             fail_url = f"{node_backend_url}/api/jobs/{job_id}/fail"
             http_client = get_http_client()
             await http_client.post(
                 fail_url,
-                json={"error": "Global timeout exceeded (15 minutes)", "stats": {"totalUrls": len(urls), "successCount": 0, "failedCount": len(urls)}},
+                json={"error": "Global timeout exceeded (30 minutes)", "stats": {"totalUrls": len(urls), "successCount": 0, "failedCount": len(urls)}},
                 timeout=10
             )
             print(f"[HEADLESS_A11Y] Timeout failure reported | jobId={job_id}")
@@ -553,7 +704,7 @@ async def execute_headless_accessibility(job):
         return {
             "status": "failed_gracefully",
             "jobId": job_id,
-            "error": "Global timeout exceeded (15 minutes)"
+            "error": "Global timeout exceeded (30 minutes)"
         }
 
     except Exception as e:

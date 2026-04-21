@@ -15,14 +15,6 @@ def _should_skip_accessibility_rules():
     return os.getenv('DISABLE_ACCESSIBILITY_RULES', '').lower() == 'true'
 
 
-class FormInputsLabelsRule(BaseSEORuleV2):
-    rule_id = "form_inputs_labels"
-    rule_no = 111  # Updated rule number since we removed the previous rule
-    category = "Accessibility"
-    severity = "high"
-    description = "Unlabelled form inputs break screen reader accessibility and fail WCAG 1.3.1"
-
-
 class TextContrastRule(BaseSEORuleV2):
     rule_id = "text_contrast"
     rule_no = 112
@@ -73,6 +65,7 @@ class FormInputsLabelsRule(BaseSEORuleV2):
             axe_violations = headless.get("axeViolations", [])
             form_violations = [v for v in axe_violations if any(tag in v.get("tags", []) for tag in ["wcag2aa", "forms", "labels"])]
             
+            found_form_issue = False
             if form_violations:
                 for violation in form_violations:
                     if "label" in violation.get("description", "").lower() or "form" in violation.get("description", "").lower():
@@ -84,8 +77,10 @@ class FormInputsLabelsRule(BaseSEORuleV2):
                             data_key="headless",
                             data_path="axeViolations"
                         ))
-            else:
-                # If no specific violations found but forms exist, flag for manual review
+                        found_form_issue = True
+            
+            # If no specific form violations found but forms exist, flag for manual review
+            if not found_form_issue:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
                     f"Forms detected ({forms_count} forms, {inputs_count} inputs) - manual accessibility review recommended",
@@ -100,7 +95,7 @@ class FormInputsLabelsRule(BaseSEORuleV2):
 
 class KeyboardAccessibilityRule(BaseSEORuleV2):
     rule_id = "keyboard_accessibility"
-    rule_no = 113  # Updated from 114
+    rule_no = 114
     category = "Accessibility"
     severity = "high"
     description = "Keyboard-only users must reach every interactive element without a mouse"
@@ -160,7 +155,7 @@ class KeyboardAccessibilityRule(BaseSEORuleV2):
 
 class FocusIndicatorsRule(BaseSEORuleV2):
     rule_id = "focus_indicators"
-    rule_no = 114  # Updated from 115
+    rule_no = 115
     category = "Accessibility"
     severity = "high"
     description = "Removing CSS focus outlines fails WCAG 2.4.11 — WCAG 2.2 criterion"
@@ -202,7 +197,7 @@ class FocusIndicatorsRule(BaseSEORuleV2):
 
 class PageLanguageRule(BaseSEORuleV2):
     rule_id = "page_language"
-    rule_no = 115  # Updated from 116
+    rule_no = 116
     category = "Accessibility"
     severity = "high"
     description = "Missing lang attribute prevents screen readers using correct pronunciation"
@@ -214,8 +209,10 @@ class PageLanguageRule(BaseSEORuleV2):
         
         issues = []
         
-        # Check for html lang attribute
-        html_lang = normalized.get("html_lang", "")
+        # Check for html lang attribute from headless data
+        headless = normalized.get("headless", {})
+        dom_metrics = headless.get("domMetrics", {})
+        html_lang = dom_metrics.get("lang", "")
         
         if not html_lang:
             issues.append(self.create_issue(
@@ -223,8 +220,8 @@ class PageLanguageRule(BaseSEORuleV2):
                 "HTML missing lang attribute",
                 "No lang attribute on html tag",
                 "lang attribute present and correct on every page",
-                data_key="html_lang",
-                data_path="html_lang"
+                data_key="headless",
+                data_path="domMetrics.lang"
             ))
         elif len(html_lang) < 2:  # Basic validation for ISO 639-1 codes
             issues.append(self.create_issue(
@@ -232,8 +229,8 @@ class PageLanguageRule(BaseSEORuleV2):
                 f"Invalid lang attribute: '{html_lang}'",
                 f"Lang attribute: '{html_lang}' (too short)",
                 "Valid ISO 639-1 language code (e.g., 'en', 'es')",
-                data_key="html_lang",
-                data_path="html_lang"
+                data_key="headless",
+                data_path="domMetrics.lang"
             ))
         
         return issues
@@ -241,7 +238,7 @@ class PageLanguageRule(BaseSEORuleV2):
 
 class VideoCaptionsRule(BaseSEORuleV2):
     rule_id = "video_captions"
-    rule_no = 116  # Updated from 117
+    rule_no = 117
     category = "Accessibility"
     severity = "medium"
     description = "Videos without captions fail WCAG 1.2.2 and exclude deaf/hard-of-hearing users"
@@ -284,7 +281,7 @@ class VideoCaptionsRule(BaseSEORuleV2):
 
 class TapTargetSizeRule(BaseSEORuleV2):
     rule_id = "tap_target_size"
-    rule_no = 117  # Updated from 118
+    rule_no = 118
     category = "Accessibility"
     severity = "medium"
     description = "WCAG 2.2 criterion 2.5.8 requires minimum 24×24px tap targets — new in 2024"
@@ -331,7 +328,7 @@ class TapTargetSizeRule(BaseSEORuleV2):
 
 class AxeViolationsRule(BaseSEORuleV2):
     rule_id = "axe_violations"
-    rule_no = 118  # New rule number
+    rule_no = 119
     category = "Accessibility"
     severity = "high"
     description = "Professional accessibility violations detected by axe-core testing"
