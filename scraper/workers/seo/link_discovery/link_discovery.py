@@ -263,7 +263,7 @@ def execute_link_discovery(job: LinkDiscoveryJob):
                         all_internal_urls.add(normalized_link)
                         all_internal_links.append(normalized_link)  # Add to accumulator for iteration
                         
-                print(f"📊 Main page extracted: {len(main_internal_links)} internal, {len(main_external_links)} external, {len(main_social_links)} social links")
+                print(f"📊 Main page extracted: {len(main_internal_links)} internal, 0 external (disabled), {len(main_social_links)} social links")
         except Exception as main_error:
             print(f"⚠️ Failed to extract from main URL: {main_error}")
 
@@ -474,14 +474,14 @@ def execute_link_discovery(job: LinkDiscoveryJob):
                 
                 # Normalize all discovered links
                 normalized_page_internal = [normalize_url(link) if isinstance(link, str) else normalize_url(link.get("url", "")) for link in page_internal_links]
-                normalized_external = [{**link_data, "url": normalize_url(link_data["url"])} for link_data in external_links]
+                # External links disabled - skip normalization
                 normalized_social = [{**link_data, "url": normalize_url(link_data["url"])} for link_data in social_links]
                 
                 # Update progress after each page
                 processed_pages += 1
                 
-                # Update total links found count
-                total_links_found = len(seen_internal) + len(seen_external) + len(seen_social)
+                # Update total links found count (external links excluded)
+                total_links_found = len(seen_internal) + len(seen_social)
                 
                 progress_percentage = 30 + int((processed_pages / total_pages) * 60)  # 30% to 90%
                 send_progress_update(
@@ -492,7 +492,7 @@ def execute_link_discovery(job: LinkDiscoveryJob):
                     f"Discovered {total_links_found} links so far..."
                 )
                 
-                return internal_url, normalized_external, normalized_social, normalized_page_internal
+                return internal_url, [], normalized_social, normalized_page_internal  # External links disabled
 
                 
 
@@ -554,29 +554,7 @@ def execute_link_discovery(job: LinkDiscoveryJob):
 
                 
 
-                # Add external links (deduplicated)
-
-                for link_data in external_links:
-
-                    normalized_url = link_data["url"]
-
-                    if normalized_url not in seen_external:
-
-                        external_docs.append({
-
-                            "seo_jobId": ObjectId(job.jobId),
-
-                            "projectId": ObjectId(job.projectId),
-
-                            "url": normalized_url,
-
-                            "sourceUrl": link_data["sourceUrl"],
-
-                            "discoveredAt": datetime.utcnow()
-
-                        })
-
-                        seen_external.add(normalized_url)
+                # External links disabled - skip storage
 
                 
 
@@ -618,19 +596,13 @@ def execute_link_discovery(job: LinkDiscoveryJob):
 
         
 
-        # Bulk insert external and social links
-
-        if external_docs:
-
-            seo_external_links.insert_many(external_docs, ordered=False)
-
+        # Bulk insert social links (external links disabled - skip insert)
         if social_docs:
-
             seo_social_links.insert_many(social_docs, ordered=False)
 
             
 
-        external_count = len(external_docs)
+        external_count = 0  # External links disabled
 
         social_count = len(social_docs)
 
@@ -642,11 +614,11 @@ def execute_link_discovery(job: LinkDiscoveryJob):
 
         duration_ms = int((end_time - start_time).total_seconds() * 1000)
 
-        
 
-        # 5. Prepare completion stats
 
-        total_urls = len(seen_internal) + len(seen_external) + len(seen_social)
+        # 5. Prepare completion stats (external links excluded from total)
+
+        total_urls = len(seen_internal) + len(seen_social)
 
         stats = {
             "internalLinksCount": internal_count,
@@ -679,7 +651,7 @@ def execute_link_discovery(job: LinkDiscoveryJob):
 
         print(f"✅ Job {job.jobId} completed: {stats}")
 
-        print(f"📊 Found {internal_count} internal, {external_count} external, {social_count} social links")
+        print(f"📊 Found {internal_count} internal, 0 external (disabled), {social_count} social links")
 
         
 

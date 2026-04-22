@@ -110,7 +110,7 @@ def execute_technical_domain(job):
         print(f"[STEP 3] Fetching llms.txt")
         print(f"[STEP 3] domain={domain_with_protocol}")
         llms_result = fetch_llms_txt(domain_with_protocol)
-        print(f"[STEP 3] ✅ llms.txt fetch complete | found={llms_result['found']} | hasAllow={llms_result['hasAllow']} | hasDisallow={llms_result['hasDisallow']}")
+        print(f"[STEP 3] ✅ llms.txt fetch complete | status={llms_result['status']} | exists={llms_result['exists']} | hasAllow={llms_result['hasAllow']} | hasDisallow={llms_result['hasDisallow']}")
         print(f"[STEP 3] ═══════════════════════════════════════════════════════════")
         
         # Step 4: Check HTTPS redirect first (using base domain)
@@ -205,11 +205,11 @@ def execute_technical_domain(job):
             "sitemapExists": sitemap_result["exists"],
             "sitemapStatus": sitemap_result["status"],
             "parsedSitemapUrlCount": sitemap_result["url_count"],
-            "llmsTxtFound": llms_result["found"],
+            "llmsTxtFound": llms_result.get("found", llms_result.get("exists", False)),
             "llmsTxtHasAllow": llms_result["hasAllow"],
             "llmsTxtHasDisallow": llms_result["hasDisallow"],
             "llmsTxtMentionedBots": llms_result["mentionedBots"],
-            "llmsTxtRawContentLength": llms_result["rawContentLength"],
+            "llmsTxtRawContentLength": llms_result.get("rawContentLength", 0),
             "sslValid": ssl_result["ssl_valid"],
             "sslDaysRemaining": ssl_result["ssl_days_remaining"],
             "httpsRedirect": https_redirect_result["https_redirect"]
@@ -248,7 +248,7 @@ def execute_technical_domain(job):
         print(f"[END] ═══════════════════════════════════════════════════════════════")
         print(f"[END] Job completed successfully")
         print(f"[END] jobId={job_id}")
-        print(f"[END] robots={robots_result['exists']} | sitemap={sitemap_result['exists']} | sitemapUrls={sitemap_result['url_count']} | llmsTxt={llms_result['found']} | ssl={ssl_result['ssl_valid']} | httpsRedirect={https_redirect_result['https_redirect']}")
+        print(f"[END] robots={robots_result['exists']} | sitemap={sitemap_result['exists']} | sitemapUrls={sitemap_result['url_count']} | llmsTxt={llms_result.get('found', llms_result.get('exists', False))} | ssl={ssl_result['ssl_valid']} | httpsRedirect={https_redirect_result['https_redirect']}")
         print(f"[END] ═══════════════════════════════════════════════════════════════")
         
         print(f"[WORKER] TECHNICAL_DOMAIN COMPLETED | jobId={job_id}")
@@ -259,11 +259,11 @@ def execute_technical_domain(job):
             "robots_exists": robots_result["exists"],
             "sitemap_exists": sitemap_result["exists"],
             "sitemap_url_count": sitemap_result["url_count"],
-            "llms_txt_found": llms_result["found"],
-            "llms_txt_has_allow": llms_result["hasAllow"],
-            "llms_txt_has_disallow": llms_result["hasDisallow"],
-            "llms_txt_mentioned_bots": llms_result["mentionedBots"],
-            "llms_txt_raw_content_length": llms_result["rawContentLength"],
+            "llms_exists": llms_result["exists"],
+            "llms_status": llms_result["status"],
+            "llms_has_allow": llms_result["hasAllow"],
+            "llms_has_disallow": llms_result["hasDisallow"],
+            "llms_mentioned_bots": llms_result["mentionedBots"],
             "ssl_valid": ssl_result["ssl_valid"],
             "ssl_days_remaining": ssl_result["ssl_days_remaining"],
             "https_redirect": https_redirect_result["https_redirect"]

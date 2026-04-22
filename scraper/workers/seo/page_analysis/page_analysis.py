@@ -1045,7 +1045,7 @@ def send_crawl_summary(job_id, project_id, analysis_stats, analysis_duration_ms,
 
             internal_links = seo_internal_links.count_documents({"projectId": project_object_id})
 
-            external_links = seo_external_links.count_documents({"projectId": project_object_id})
+            external_links = 0  # External links disabled
 
             social_links = seo_social_links.count_documents({"projectId": project_object_id})
 

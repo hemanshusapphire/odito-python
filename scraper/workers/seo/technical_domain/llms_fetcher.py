@@ -61,10 +61,12 @@ def fetch_llms_txt(domain: str) -> dict:
         domain: Domain with protocol (e.g., https://example.com)
         
     Returns:
-        dict with keys: found, hasAllow, hasDisallow, mentionedBots, rawContentLength
+        dict with keys: status, exists, content, hasAllow, hasDisallow, mentionedBots
     """
     result = {
-        "found": False,
+        "status": None,
+        "exists": False,
+        "content": "",
         "hasAllow": False,
         "hasDisallow": False,
         "mentionedBots": {
@@ -73,8 +75,7 @@ def fetch_llms_txt(domain: str) -> dict:
             "PerplexityBot": False,
             "GitHubCopilot": False,
             "Gemini": False
-        },
-        "rawContentLength": 0
+        }
     }
     
     # Extract hostname from domain
@@ -131,11 +132,12 @@ def fetch_llms_txt(domain: str) -> dict:
                     parsed = parse_llms_txt_content(content)
                     
                     result.update({
-                        "found": True,
+                        "status": response.status_code,
+                        "exists": True,
+                        "content": content[:50000],  # Cap at 50KB to avoid huge files
                         "hasAllow": parsed["hasAllow"],
                         "hasDisallow": parsed["hasDisallow"],
-                        "mentionedBots": parsed["mentionedBots"],
-                        "rawContentLength": len(content)
+                        "mentionedBots": parsed["mentionedBots"]
                     })
                     
                     print(f"[LLMS_TXT] Allow found: {parsed['hasAllow']}")
@@ -146,6 +148,8 @@ def fetch_llms_txt(domain: str) -> dict:
                     return result
                 elif response.status_code == 404:
                     print(f"[LLMS_TXT] Not found (404) | url={llms_url}")
+                    if result["status"] is None:
+                        result["status"] = 404
                     # 404 is expected for many domains, continue trying other hostnames
                     break
                 elif response.status_code == 429:
@@ -156,9 +160,13 @@ def fetch_llms_txt(domain: str) -> dict:
                         continue
                     else:
                         print(f"[LLMS_TXT] Rate limited after retries | url={llms_url}")
+                        if result["status"] is None:
+                            result["status"] = 429
                         break
                 else:
                     print(f"[LLMS_TXT] Returned status {response.status_code} | url={llms_url}")
+                    if result["status"] is None:
+                        result["status"] = response.status_code
                     break  # Don't retry non-429 errors
                 
             except requests.exceptions.Timeout:
@@ -169,12 +177,18 @@ def fetch_llms_txt(domain: str) -> dict:
                     continue
                 else:
                     print(f"[LLMS_TXT] Request timed out after retries | url={llms_url}")
+                    if result["status"] is None:
+                        result["status"] = 0
                     break
             except requests.exceptions.ConnectionError as e:
                 print(f"[LLMS_TXT] Connection error | url={llms_url} | error={str(e)}")
+                if result["status"] is None:
+                    result["status"] = 0
                 break  # Don't retry connection errors
             except Exception as e:
                 print(f"[LLMS_TXT] Fetch failed | url={llms_url} | error={str(e)}")
+                if result["status"] is None:
+                    result["status"] = 0
                 break
     
     # If we get here, no llms.txt was found on any hostname variation
