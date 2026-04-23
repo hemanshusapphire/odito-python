@@ -1,6 +1,139 @@
 """Link discovery worker implementation."""
 
 
+def normalize_url_for_selection(url: str) -> str:
+    """
+    Normalize URL for deterministic selection.
+    
+    Args:
+        url: URL to normalize
+        
+    Returns:
+        Normalized URL (lowercase, trimmed, no trailing slash)
+    """
+    if not url:
+        return url
+    
+    # Convert to lowercase
+    normalized = url.lower()
+    
+    # Trim whitespace
+    normalized = normalized.strip()
+    
+    # Remove trailing slash (except for root URL)
+    if normalized != "https:///" and normalized != "http:///" and normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    
+    return normalized
+
+
+def classify_url_type(url: str) -> str:
+    """
+    Classify URL into priority categories.
+    
+    Priority order (highest to lowest):
+    1. main - /pages/, /services/, /service/, /about, /contact
+    2. collection - /collections/
+    3. product - /products/
+    4. blog - /blogs/
+    5. other - everything else
+    
+    Args:
+        url: URL to classify
+        
+    Returns:
+        Type string: "main", "collection", "product", "blog", or "other"
+    """
+    if not url:
+        return "other"
+    
+    url_lower = url.lower()
+    
+    # MAIN - highest priority
+    main_patterns = ["/pages/", "/services/", "/service/", "/about", "/contact"]
+    for pattern in main_patterns:
+        if pattern in url_lower:
+            return "main"
+    
+    # COLLECTION
+    if "/collections/" in url_lower:
+        return "collection"
+    
+    # PRODUCT
+    if "/products/" in url_lower:
+        return "product"
+    
+    # BLOG
+    if "/blogs/" in url_lower:
+        return "blog"
+    
+    # OTHER - lowest priority
+    return "other"
+
+
+def select_urls_deterministically(urls_set, limit: int = 25) -> set:
+    """
+    Select URLs using deterministic priority-based selection.
+    
+    Selection order (strict priority):
+    1. main (pages + services + about + contact)
+    2. collection
+    3. product
+    4. blog
+    5. other
+    
+    Each group is sorted alphabetically to ensure determinism.
+    
+    Args:
+        urls_set: Set of discovered URLs
+        limit: Maximum number of URLs to select (default: 25)
+        
+    Returns:
+        Set of selected URLs
+    """
+    # Group URLs by type
+    groups = {
+        "main": [],
+        "collection": [],
+        "product": [],
+        "blog": [],
+        "other": []
+    }
+    
+    for url in urls_set:
+        url_type = classify_url_type(url)
+        groups[url_type].append(url)
+    
+    # Sort each group alphabetically for determinism
+    for url_type in groups:
+        groups[url_type].sort()
+    
+    # Select URLs in priority order
+    selected_urls = []
+    priority_order = ["main", "collection", "product", "blog", "other"]
+    
+    for url_type in priority_order:
+        # Add URLs from this group until we reach the limit
+        for url in groups[url_type]:
+            if len(selected_urls) >= limit:
+                break
+            selected_urls.append(url)
+        
+        if len(selected_urls) >= limit:
+            break
+    
+    # Log selection results
+    print(f"[DETERMINISTIC_SELECTION] Total URLs discovered: {len(urls_set)}")
+    print(f"[DETERMINISTIC_SELECTION] URLs per type:")
+    for url_type in priority_order:
+        count = len(groups[url_type])
+        selected_count = sum(1 for url in selected_urls if classify_url_type(url) == url_type)
+        print(f"  {url_type}: {count} discovered, {selected_count} selected")
+    print(f"[DETERMINISTIC_SELECTION] Final selection: {len(selected_urls)} URLs")
+    
+    return set(selected_urls)
+
+
 
 import os
 
@@ -335,11 +468,8 @@ def execute_link_discovery(job: LinkDiscoveryJob):
             print(f"🛑 Job {job.jobId} cancelled before analysis phase")
             return {"status": "cancelled", "jobId": job.jobId, "message": "Job cancelled by user"}
 
-        # 3. Cap crawl depth for Phase-1 (max 100 internal pages)
-
-        if len(all_internal_urls) > 100:
-
-            all_internal_urls = set(list(all_internal_urls)[:100])
+        # 3. Apply deterministic URL selection (max 25 URLs with priority ordering)
+        all_internal_urls = select_urls_deterministically(all_internal_urls, limit=25)
 
         
 
