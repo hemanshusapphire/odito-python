@@ -141,13 +141,24 @@ class CategoryWeights:
     """Defines category weights for scoring"""
     
     # Default weights - must sum to 100
+    #
+    # ai_accessibility  10% — domain crawler access (signal-quality scored)
+    #                         Low enough to prevent wildcard inflation;
+    #                         high enough to reward deliberate AI configuration.
+    # aeo_score         21% — answer-engine extraction signals
+    # ai_impact         20% — schema validity + crawlability gate
+    # llm_readiness     20% — content depth + entity signals
+    # voice_intent      13% — structured content
+    # topical_authority 10% — entity graph authority
+    # citation_probability 6% — author + entity attribution
     DEFAULT_WEIGHTS = {
-        "ai_impact": 15.0,           # AI processing optimization
-        "citation_probability": 15.0, # Citation likelihood
-        "llm_readiness": 15.0,       # LLM processing readiness
-        "aeo_score": 15.0,           # Answer engine optimization
-        "topical_authority": 15.0,    # Topical authority
-        "voice_intent": 25.0          # Voice search and intent (increased for gaming resistance)
+        "ai_impact": 20.0,
+        "citation_probability": 6.0,
+        "llm_readiness": 20.0,
+        "aeo_score": 21.0,
+        "topical_authority": 10.0,
+        "voice_intent": 13.0,
+        "ai_accessibility": 10.0,
     }
     
     @staticmethod

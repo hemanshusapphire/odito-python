@@ -10,180 +10,164 @@ from typing import Dict, Any
 from scraper.workers.ai.ai_scoring_v2.rule_base import BaseRule
 
 class BulletNumberedListsUsedRule(BaseRule):
-    """Rule 51 — Bullet / numbered lists used"""
-    
+    """Rule 51 — Bullet / numbered lists are present in the content.
+
+    Previously checked H2/H3 counts and short-paragraph ratios — headings are
+    NOT lists.  This produced high false positives (pages with multiple H2s but
+    no lists scored 8/10).  Fixed to use ai_visibility_signals.lists when
+    available, with a content-structure fallback using short_paragraph_ratio and
+    HowTo/ItemList schema signals as proxies.
+    """
+
     def __init__(self):
         config = {
             "rule_id": "bullet_numbered_lists_used",
             "category": "voice_intent",
-            "description": "Bullet / numbered lists used",
-            "weight": 1.0,
+            "description": "Bullet / numbered lists present in content",
+            "weight": 1.8,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
         }
         super().__init__(config)
-    
+
     def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for bullet and numbered lists"""
+        # Tier 1: real list detection from old pipeline
+        ai_signals = data.get("ai_visibility_signals", {})
+        lists = ai_signals.get("lists", {})
+        if lists:
+            total_items = lists.get("total_items", 0) or lists.get("item_count", 0)
+            list_count  = lists.get("list_count", 0)
+            if total_items >= 10 or list_count >= 3:  return 10.0
+            if total_items >= 5  or list_count >= 2:  return  7.0
+            if total_items >= 1  or list_count >= 1:  return  4.0
+            return 0.0
+
+        # Tier 2: schema ItemList / HowTo as list-content proxy
+        graph = data.get("structured_data", {}).get("@graph", [])
+        schema_list_signal = 0
+        for item in graph:
+            raw_type = item.get("@type", "")
+            types = raw_type if isinstance(raw_type, list) else [raw_type]
+            if "ItemList" in types:
+                items = item.get("itemListElement", [])
+                schema_list_signal = max(schema_list_signal, len(items) if isinstance(items, list) else 1)
+            if "HowTo" in types:
+                steps = item.get("step", [])
+                schema_list_signal = max(schema_list_signal, len(steps) if isinstance(steps, list) else 1)
+        if schema_list_signal >= 5: return 8.0
+        if schema_list_signal >= 2: return 5.0
+        if schema_list_signal >= 1: return 3.0
+
+        # Tier 3: short-paragraph ratio + step_metrics as weakest proxy
         content_metrics = data.get("content_metrics", {})
-        heading_metrics = data.get("heading_metrics", {})
-        
+        step_metrics    = data.get("step_metrics", {})
         score = 0
-        
-        # Check for structured content (indicates lists)
-        h2_count = heading_metrics.get("h2_count", 0)
-        h3_count = heading_metrics.get("h3_count", 0)
-        h2_count = h2_count[0] if isinstance(h2_count, list) else h2_count
-        h3_count = h3_count[0] if isinstance(h3_count, list) else h3_count
-        
-        # Multiple headings often indicate list-based content
-        if h2_count >= 2 or h3_count >= 3:
-            score += 5
-        elif h2_count >= 1 or h3_count >= 1:
-            score += 3
-        
-        # Check for short paragraphs (often used in lists)
         short_ratio = content_metrics.get("short_paragraph_ratio", 0)
-        if short_ratio >= 0.2:
-            score += 3
-        elif short_ratio >= 0.1:
-            score += 2
-        
-        # Check for content length (lists need sufficient content)
-        word_count = content_metrics.get("word_count", 0)
-        if word_count >= 300:
-            score += 2
-        elif word_count >= 150:
-            score += 1
-        
-        return min(score, self.max_score)
+        if short_ratio >= 0.4:   score += 4
+        elif short_ratio >= 0.2: score += 2
+        elif short_ratio >= 0.1: score += 1
+        if step_metrics.get("howto_schema_present", False):
+            score = min(score + 3, self.max_score)
+        elif step_metrics.get("steps_detected", 0) >= 3:
+            score = min(score + 2, self.max_score)
+        return min(float(score), self.max_score)
 
 class ComparisonTablesPresentRule(BaseRule):
-    """Rule 52 — Comparison tables present"""
-    
+    """Rule 52 — Comparison tables are present in the content.
+
+    Previously always returned 0 in the normalized pipeline because
+    ai_visibility_signals was not populated by to_legacy_aliases.  Fixed with
+    a two-tier fallback: real table data from ai_visibility_signals when
+    available, then schema Table/ItemList/Dataset types as a secondary proxy.
+    """
+
     def __init__(self):
         config = {
             "rule_id": "comparison_tables_present",
             "category": "voice_intent",
-            "description": "Comparison tables present",
-            "weight": 1.0,
+            "description": "Comparison tables present in page content",
+            "weight": 1.7,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
         }
         super().__init__(config)
-    
+
     def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for comparison tables"""
-        # Check the actual extracted signal for tables
+        # Tier 1: real HTML table detection (old pipeline)
         ai_signals = data.get("ai_visibility_signals", {})
         tables = ai_signals.get("tables", {})
-        
-        # Return score based on actual table presence
-        if tables.get("present", False):
-            # Bonus points for more substantial tables
-            rows = tables.get("rows", 0)
+        if tables:
+            if not tables.get("present", False):
+                return 0.0
+            rows    = tables.get("rows", 0)
             headers = tables.get("headers", 0)
-            
             if rows >= 3 and headers >= 2:
-                return 10.0  # Full score for substantial tables
-            elif rows >= 1:
-                return 7.0   # Partial score for simple tables
-            else:
-                return 5.0   # Minimal score for table detection
-        else:
-            return 0.0  # No score if no tables present
+                return 10.0   # Substantial table with headers and data rows
+            if rows >= 1:
+                return 7.0    # Simple table
+            return 5.0        # Table element detected but no row data
 
-class ConversationalToneRule(BaseRule):
-    """Rule 53 — Conversational tone detected"""
-    
-    def __init__(self):
-        config = {
-            "rule_id": "conversational_tone",
-            "category": "voice_intent",
-            "description": "Conversational tone detected",
-            "weight": 1.0,
-            "max_score": 10,
-            "applies_to": "page"
-        }
-        super().__init__(config)
-    
-    def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for conversational language patterns"""
-        content_metrics = data.get("content_metrics", {})
-        heading_metrics = data.get("heading_metrics", {})
-        faq_metrics = data.get("faq_metrics", {})
-        
-        score = 0
-        
-        # Check for question-based headings (conversational structure)
-        question_headings = heading_metrics.get("question_headings", 0)
-        question_headings = len(question_headings) if isinstance(question_headings, list) else question_headings
-        if question_headings >= 2:
-            score += 4
-        elif question_headings >= 1:
-            score += 2
-        
-        # Check for Q&A pairs (direct conversational format)
-        qa_pairs = faq_metrics.get("qa_pairs_detected", 0)
-        if qa_pairs >= 3:
-            score += 3
-        elif qa_pairs >= 1:
-            score += 2
-        
-        # Check for reasonable sentence length (conversational = shorter)
-        avg_sentence_length = content_metrics.get("avg_sentence_length", 0)
-        if 8 <= avg_sentence_length <= 18:
-            score += 3  # Short, conversational sentences
-        elif 6 <= avg_sentence_length <= 22:
-            score += 1
-        
-        return min(score, self.max_score)
+        # Tier 2: schema types that imply tabular/structured data
+        graph = data.get("structured_data", {}).get("@graph", [])
+        _TABLE_TYPES = {"Table", "DataTable", "Dataset", "ItemList"}
+        for item in graph:
+            raw_type = item.get("@type", "")
+            types = set(raw_type if isinstance(raw_type, list) else [raw_type])
+            if types & _TABLE_TYPES:
+                return 6.0   # Schema indicates tabular data; can't verify HTML
+
+        return 0.0
 
 class StepByStepContentRule(BaseRule):
-    """Rule 55 — Step-by-step / how-to content"""
-    
+    """Rule 55 — Step-by-step / how-to content.
+
+    Previously permanently capped at 2/10 because step_metrics was hardcoded
+    to {"step_section_present": False} in to_legacy_aliases — steps_detected
+    and howto_detected were always missing keys that defaulted to 0/False.
+
+    Fixed: to_legacy_aliases now provides steps_detected (substantial_sections
+    proxy) and howto_schema_present (HowTo @type check).  This rule consumes
+    those real signals.
+    """
+
     def __init__(self):
         config = {
             "rule_id": "step_by_step_content",
             "category": "voice_intent",
-            "description": "Step-by-step / how-to content",
-            "weight": 1.0,
+            "description": "Step-by-step or how-to content structure present",
+            "weight": 1.8,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
         }
         super().__init__(config)
-    
-    def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for step-by-step content patterns"""
-        step_metrics = data.get("step_metrics", {})
-        heading_metrics = data.get("heading_metrics", {})
-        content_metrics = data.get("content_metrics", {})
-        
-        score = 0
-        
-        # Check for step-by-step detection via step_metrics
-        steps_detected = step_metrics.get("steps_detected", 0)
-        if steps_detected >= 3:
-            score += 5
-        elif steps_detected >= 1:
-            score += 3
-        
-        # Check for how-to schema signal
-        if step_metrics.get("howto_detected", False):
-            score += 3
-        
-        # Check for numbered/ordered content via heading structure
-        h3_count = heading_metrics.get("h3_count", 0)
-        h3_count = h3_count[0] if isinstance(h3_count, list) else h3_count
-        if h3_count >= 3:
-            score += 2  # Multiple sub-headings suggest sequential steps
-        
-        return min(score, self.max_score)
 
-# Register all Voice & Intent rules (4 rules)
+    def evaluate(self, data: Dict[str, Any]) -> float:
+        step_metrics    = data.get("step_metrics", {})
+        heading_metrics = data.get("heading_metrics", {})
+        score = 0
+
+        # HowTo schema is the strongest single signal
+        if step_metrics.get("howto_schema_present", False):
+            score += 5
+        elif step_metrics.get("howto_detected", False):
+            score += 3
+
+        # Substantial content sections as sequential-step proxy
+        steps = step_metrics.get("steps_detected", 0)
+        if steps >= 4:   score += 3
+        elif steps >= 2: score += 2
+        elif steps >= 1: score += 1
+
+        # H3 depth implies sequential breakdown
+        h3_count = heading_metrics.get("h3_count", 0)
+        if h3_count >= 3 and score < self.max_score:
+            score = min(score + 2, self.max_score)
+
+        return min(float(score), self.max_score)
+
+# Register Voice & Intent rules (3 pure AI visibility rules)
 def register_voice_intent_rules(registry):
     """Register all Voice & Intent category rules"""
     registry.register(BulletNumberedListsUsedRule())
     registry.register(ComparisonTablesPresentRule())
-    registry.register(ConversationalToneRule())
     registry.register(StepByStepContentRule())

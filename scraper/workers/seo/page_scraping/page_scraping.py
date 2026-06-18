@@ -33,9 +33,11 @@ from bs4 import BeautifulSoup
 
 from scraper.shared.orchestrator import scrape_page_data
 from scraper.shared.url_selector import get_top_urls
+from scraper.shared.fetcher import probe_rendering_need, set_audit_user_agent
 # from scraper.shared.screenshots import clear_screenshot_registry, take_page_screenshot  # DISABLED
 
 from scraper.shared.utils import normalize_url, get_registrable_domain
+from shared.context_enrichment import enrich_from_page_data
 
 from db import seo_internal_links, seo_page_data
 from config.config import USER_AGENTS
@@ -227,89 +229,38 @@ def detect_media_elements(html: str) -> dict:
 # SEO ENRICHMENT LAYER - P0 FUNCTIONS
 # ---------------------------------------------------------------------------
 
-def check_link_status_batch(links: list, base_url: str, timeout: int = 7, max_links: int = 30) -> dict:
-    """
-    Check HTTP status for internal/external links with parallel processing.
-    
-    Args:
-        links: List of URLs to check
-        base_url: Base URL for domain comparison
-        timeout: Request timeout in seconds
-        max_links: Maximum links to process
-        
-    Returns:
-        dict with internal_links_status, external_links_status, broken_links_count
-    """
+def check_link_status_batch(links: list, base_url: str, timeout: int = 3, max_links: int = 20) -> dict:
+    """Check HTTP status for links in parallel. Returns only broken_links_count."""
     if not links:
-        return {
-            "internal_links_status": {},
-            "external_links_status": {},
-            "broken_links_count": 0
-        }
-    
+        return {"broken_links_count": 0}
+
     try:
-        base_domain = get_registrable_domain(base_url)
-        link_status = {"internal": {}, "external": {}}
         broken_count = 0
-        
+
         def check_single_link(url):
             try:
                 response = requests.head(
-                    url, 
-                    timeout=timeout, 
+                    url,
+                    timeout=(1, timeout),
                     allow_redirects=True,
                     headers={'User-Agent': random.choice(USER_AGENTS)}
                 )
-                return {
-                    'status_code': response.status_code,
-                    'final_url': response.url,
-                    'redirect_count': len(response.history) if hasattr(response, 'history') else 0,
-                    'error': None
-                }
-            except Exception as e:
-                return {
-                    'status_code': None,
-                    'final_url': url,
-                    'redirect_count': 0,
-                    'error': str(e)[:100]
-                }
-        
-        # Process links in parallel with limits
+                return response.status_code
+            except Exception:
+                return None
+
         limited_links = links[:max_links]
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(check_single_link, url): url for url in limited_links}
-            
             for future in as_completed(futures):
-                url = futures[future]
-                result = future.result()
-                
-                # Categorize as internal/external
-                link_domain = get_registrable_domain(url)
-                is_internal = link_domain == base_domain
-                
-                category = "internal" if is_internal else "external"
-                link_status[category][url] = result
-                
-                # Count broken links (only real 4XX/5XX errors, not timeouts)
-                if result['status_code'] is None:
-                    # timeout / network issue - DO NOT COUNT as broken
-                    continue
-                elif result['status_code'] >= 400:
+                status_code = future.result()
+                if status_code is not None and status_code >= 400:
                     broken_count += 1
-        
-        return {
-            "internal_links_status": link_status["internal"],
-            "external_links_status": link_status["external"],
-            "broken_links_count": broken_count
-        }
-        
+
+        return {"broken_links_count": broken_count}
+
     except Exception as e:
-        return {
-            "internal_links_status": {},
-            "external_links_status": {},
-            "broken_links_count": 0,
-            "error": str(e)
-        }
+        return {"broken_links_count": 0, "error": str(e)}
 
 
 def calculate_html_metrics(html: str) -> dict:
@@ -478,139 +429,184 @@ def detect_mixed_content(soup: BeautifulSoup, base_url: str) -> dict:
         }
 
 
-def calculate_keyword_density(text: str, title: str, meta_description: str) -> dict:
+def detect_navigation_enhanced(soup: BeautifulSoup) -> dict:
     """
-    Calculate keyword density and identify primary keyword.
+    Enhanced navigation detection using multi-layered approach.
     
-    Args:
-        text: Page text content
-        title: Page title
-        meta_description: Meta description
-        
-    Returns:
-        dict with keyword analysis
-    """
-    try:
-        if not text or len(text.strip()) < 50:
-            return {
-                "keyword_density": 0,
-                "primary_keyword": None,
-                "keyword_count": 0,
-                "total_words": 0,
-                "error": "insufficient_text"
-            }
-        
-        # Clean and normalize text
-        words = re.findall(r'\b[a-z]+\b', text.lower())
-        total_words = len(words)
-        
-        if total_words < 10:
-            return {
-                "keyword_density": 0,
-                "primary_keyword": None,
-                "keyword_count": 0,
-                "total_words": total_words
-            }
-        
-        # Get word frequencies
-        from collections import Counter
-        word_freq = Counter(words)
-        
-        # Remove common stop words
-        stop_words = {
-            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
-            'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did',
-            'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these',
-            'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what', 'which', 'who',
-            'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more',
-            'most', 'other', 'some', 'such', 'only', 'own', 'same', 'so', 'than', 'too',
-            'very', 'just', 'now', 'also', 'back', 'even', 'further', 'still', 'yet'
-        }
-        
-        # Filter out stop words and short words
-        meaningful_words = {word: count for word, count in word_freq.items() 
-                          if word not in stop_words and len(word) > 2}
-        
-        # Find primary keyword (most frequent meaningful word)
-        if meaningful_words:
-            primary_keyword = max(meaningful_words, key=meaningful_words.get)
-            keyword_count = meaningful_words[primary_keyword]
-            keyword_density = (keyword_count / total_words * 100)
-            
-            # Check if keyword appears in title/meta
-            in_title = primary_keyword in title.lower() if title else False
-            in_meta = primary_keyword in meta_description.lower() if meta_description else False
-            
-            return {
-                "keyword_density": round(keyword_density, 2),
-                "primary_keyword": primary_keyword,
-                "keyword_count": keyword_count,
-                "total_words": total_words,
-                "in_title": in_title,
-                "in_meta_description": in_meta
-            }
-        
-        return {
-            "keyword_density": 0,
-            "primary_keyword": None,
-            "keyword_count": 0,
-            "total_words": total_words
-        }
-        
-    except Exception as e:
-        return {
-            "keyword_density": 0,
-            "primary_keyword": None,
-            "keyword_count": 0,
-            "total_words": 0,
-            "error": str(e)
-        }
-
-
-def detect_iframe_wrapping(soup: BeautifulSoup) -> dict:
-    """
-    Detect full-site iframe wrapping.
+    Detects navigation through:
+    1. Semantic HTML (<nav>, role="navigation", aria-label)
+    2. Structural patterns (ul > li > a with multiple links)
+    3. Link density and context validation
+    4. Fallback content analysis
     
     Args:
         soup: BeautifulSoup object
         
     Returns:
-        dict with iframe analysis
+        dict with navigation detection results
     """
+    detection_result = {
+        "has_navigation": False,
+        "detection_method": None,
+        "nav_elements_found": [],
+        "link_count": 0
+    }
+    
     try:
-        iframes = soup.find_all('iframe')
+        # Layer 1: Semantic HTML Detection
+        nav_elements = []
         
-        for iframe in iframes:
-            # Check for full-site iframe indicators
-            width = iframe.get('width', '').lower()
-            height = iframe.get('height', '').lower()
-            src = iframe.get('src', '')
-            
-            # Full-site iframe characteristics
-            is_full_width = width in ['100%', '100vw', '1000px', '1200px', '1920px']
-            is_full_height = height in ['100%', '100vh', '800px', '900px', '1080px']
-            
-            if is_full_width and is_full_height:
-                return {
-                    "full_site_iframe_detected": True,
-                    "iframe_src": src,
-                    "iframe_dimensions": {"width": width, "height": height},
-                    "is_external": bool(src and src.startswith('http') and not src.startswith('https://www.sapphiredigitalagency.com'))
-                }
+        # Check for <nav> tag (any class)
+        nav_tags = soup.find_all('nav')
+        for nav in nav_tags:
+            nav_elements.append({
+                'type': 'nav_tag',
+                'class': nav.get('class', []),
+                'id': nav.get('id', ''),
+                'role': nav.get('role', '')
+            })
         
-        return {"full_site_iframe_detected": False}
+        # Check for role="navigation"
+        role_nav = soup.find_all(attrs={'role': re.compile(r'navigation', re.IGNORECASE)})
+        for nav in role_nav:
+            if nav.name not in ['nav']:  # Avoid duplicates
+                nav_elements.append({
+                    'type': 'role_navigation',
+                    'tag': nav.name,
+                    'class': nav.get('class', []),
+                    'id': nav.get('id', '')
+                })
+        
+        # Check for aria-label containing navigation/menu
+        aria_nav = soup.find_all(attrs={'aria-label': re.compile(r'(navigation|menu|main)', re.IGNORECASE)})
+        for nav in aria_nav:
+            if nav.name not in ['nav'] and not any(n['type'] == 'role_navigation' for n in nav_elements):
+                nav_elements.append({
+                    'type': 'aria_label',
+                    'tag': nav.name,
+                    'class': nav.get('class', []),
+                    'aria_label': nav.get('aria-label', '')
+                })
+        
+        if nav_elements:
+            detection_result['nav_elements_found'] = nav_elements
+            detection_result['has_navigation'] = True
+            detection_result['detection_method'] = 'semantic_html'
+            return detection_result
+        
+        # Layer 2: Structural Pattern Detection
+        # Look for ul > li > a structures with multiple links
+        all_uls = soup.find_all('ul')
+        for ul in all_uls:
+            # Get all direct li children
+            lis = ul.find_all('li', recursive=False)
+            if len(lis) >= 3:  # Require at least 3 items for navigation
+                # Check if lis contain links
+                link_count = 0
+                for li in lis:
+                    links = li.find_all('a', href=True)
+                    if links:
+                        link_count += 1
+                
+                if link_count >= 3:
+                    # Check if this ul is in a navigation-like container
+                    parent = ul.parent
+                    if parent:
+                        parent_class = ' '.join(parent.get('class', [])).lower()
+                        parent_id = parent.get('id', '').lower()
+                        parent_role = parent.get('role', '').lower()
+                        
+                        # Check for navigation indicators in parent
+                        nav_indicators = ['nav', 'menu', 'navigation', 'header', 'sidebar', 'aside']
+                        has_nav_indicator = (
+                            any(ind in parent_class for ind in nav_indicators) or
+                            any(ind in parent_id for ind in nav_indicators) or
+                            'navigation' in parent_role
+                        )
+                        
+                        if has_nav_indicator:
+                            nav_elements.append({
+                                'type': 'structural_pattern',
+                                'parent_tag': parent.name,
+                                'parent_class': parent.get('class', []),
+                                'parent_id': parent.get('id', ''),
+                                'link_count': link_count
+                            })
+                            detection_result['link_count'] = link_count
+                            detection_result['has_navigation'] = True
+                            detection_result['detection_method'] = 'structural_pattern'
+                            return detection_result
+        
+        # Layer 3: Header/Footer Context Detection
+        # Check header for link lists
+        header = soup.find('header')
+        if header:
+            header_links = header.find_all('a', href=True)
+            if len(header_links) >= 3:
+                # Filter out footer-like links
+                non_footer_links = [
+                    link for link in header_links
+                    if not any(term in link.get_text().lower() for term in ['privacy', 'terms', 'legal', 'copyright'])
+                ]
+                if len(non_footer_links) >= 3:
+                    nav_elements.append({
+                        'type': 'header_context',
+                        'link_count': len(non_footer_links)
+                    })
+                    detection_result['link_count'] = len(non_footer_links)
+                    detection_result['has_navigation'] = True
+                    detection_result['detection_method'] = 'header_context'
+                    return detection_result
+        
+        # Layer 4: Fallback - Class Pattern Detection (Enhanced)
+        # Check for any element with navigation-related classes
+        class_patterns = [
+            r'nav', r'menu', r'navigation', r'navbar', r'main-menu',
+            r'primary-menu', r'secondary-menu', r'top-menu', r'header-menu'
+        ]
+        
+        for pattern in class_patterns:
+            elements = soup.find_all(class_=re.compile(pattern, re.IGNORECASE))
+            for elem in elements:
+                # Check if element has links
+                links = elem.find_all('a', href=True)
+                if len(links) >= 3:
+                    # Filter out footer links
+                    non_footer_links = [
+                        link for link in links
+                        if not any(term in link.get_text().lower() for term in ['privacy', 'terms', 'legal'])
+                    ]
+                    if len(non_footer_links) >= 3:
+                        nav_elements.append({
+                            'type': 'class_pattern',
+                            'tag': elem.name,
+                            'class': elem.get('class', []),
+                            'link_count': len(non_footer_links)
+                        })
+                        detection_result['link_count'] = len(non_footer_links)
+                        detection_result['has_navigation'] = True
+                        detection_result['detection_method'] = 'class_pattern'
+                        return detection_result
+        
+        detection_result['nav_elements_found'] = nav_elements
+        return detection_result
         
     except Exception as e:
-        return {"full_site_iframe_detected": False, "error": str(e)}
+        return {
+            "has_navigation": False,
+            "detection_method": "error",
+            "error": str(e)
+        }
 
 
-def analyze_404_page(soup: BeautifulSoup, status_code: int) -> dict:
+def analyze_404_page(soup: BeautifulSoup, status_code: int, nav_detection: dict = None) -> dict:
     """
     Analyze 404 page content for helpful navigation.
     
     Args:
         soup: BeautifulSoup object
         status_code: HTTP status code
+        nav_detection: Optional pre-computed navigation detection results
         
     Returns:
         dict with 404 page analysis
@@ -619,15 +615,15 @@ def analyze_404_page(soup: BeautifulSoup, status_code: int) -> dict:
         if status_code != 404:
             return {
                 "is_404_page": False,
-                "custom_404_detected": False,
-                "has_navigation": False,
-                "has_home_link": False,
-                "has_search": False,
-                "has_helpful_text": False
+                "custom_404_detected": False
             }
         
-        # Check for helpful elements (improved detection)
-        has_navigation = bool(soup.find('nav') or soup.find('header') or soup.find('div', class_=re.compile(r'nav|menu', re.IGNORECASE)))
+        # Use provided or enhanced navigation detection
+        if not nav_detection:
+            nav_detection = detect_navigation_enhanced(soup)
+        
+        has_navigation = nav_detection.get('has_navigation', False)
+        
         has_home_link = bool(soup.find('a', href=re.compile(r'^(\/|#|https?:\/\/.*\/?$)', re.IGNORECASE)) or 
                            soup.find('a', string=re.compile(r'home|homepage', re.IGNORECASE)))
         has_search = bool(soup.find('input', type='search') or soup.find('form'))
@@ -646,7 +642,8 @@ def analyze_404_page(soup: BeautifulSoup, status_code: int) -> dict:
             "has_navigation": has_navigation,
             "has_home_link": has_home_link,
             "has_search": has_search,
-            "has_helpful_text": has_helpful_text
+            "has_helpful_text": has_helpful_text,
+            "navigation_detection": nav_detection
         }
         
     except Exception as e:
@@ -732,13 +729,17 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
     try:
 
-        # Always use deterministic type-based URL selection for quality filtering
-        urls_to_scrape = get_top_urls(job.projectId, limit=25)
-        print(f"[DEBUG] Using deterministic URL selection: {len(urls_to_scrape)} URLs")
-        
+        # Use canonical_urls from URL_QUALIFICATION if provided; fall back to DB selection.
+        # canonical_urls guarantees the same URL set across all parallel workers.
+        if getattr(job, 'canonical_urls', None):
+            urls_to_scrape = list(job.canonical_urls)
+            print(f"[DEBUG] Using canonical_urls from URL_QUALIFICATION: {len(urls_to_scrape)} URLs")
+        else:
+            urls_to_scrape = get_top_urls(job.projectId, limit=25)
+            print(f"[DEBUG] Fallback: deterministic URL selection: {len(urls_to_scrape)} URLs")
+
         total_pages = len(urls_to_scrape)
-        
-        print(f"[DEBUG] Initial selected URLs: {len(urls_to_scrape)} URLs")
+
         print(f"[DEBUG] URLs: {urls_to_scrape[:5]}...")  # Show first 5 for debugging
         print(f"[WORKER] PAGE_SCRAPING started | jobId={job.jobId} | selectedUrls={total_pages}")
 
@@ -759,20 +760,17 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
         
 
-        # Initialize counters for failure tolerance
-
+        # Thread-safe counters — shared across 8 worker threads.
+        # All mutations go through _counter_lock to prevent race conditions.
         successful_pages = 0
-
         failed_pages = 0
-
         completed_pages = 0
+        _counter_lock = __import__('threading').Lock()
 
-        
+        TARGET_SUCCESSES = 25  # Stop collecting results once this many succeed
 
         def scrape_single_url(url):
-
             """Scrape a single URL - optimized for concurrent processing"""
-
             nonlocal successful_pages, failed_pages, completed_pages
 
             
@@ -807,34 +805,44 @@ def execute_page_scraping_logic(job: PageScrapingJob):
                 
                 if thread.is_alive():
                     print(f"[SCRAPE] TIMEOUT for URL: {url} | timeout=120s")
-                    failed_pages += 1
+                    with _counter_lock:
+                        failed_pages += 1
+                        completed_pages += 1
                     return None
-                
+
                 # Check for exceptions
                 if result_container['exception']:
                     print(f"[SCRAPE] EXCEPTION for URL: {url} | error={str(result_container['exception'])}")
-                    failed_pages += 1
+                    with _counter_lock:
+                        failed_pages += 1
+                        completed_pages += 1
                     return None
-                
+
                 page_data = result_container['page_data']
-                
+
                 # Check if scraping succeeded
                 if not page_data:
                     print(f"[SCRAPE] FAILED for URL: {url} | reason=scrape_page_data returned None")
-                    failed_pages += 1
+                    with _counter_lock:
+                        failed_pages += 1
+                        completed_pages += 1
                     return None
-                
-                # Check status code
+
+                # Check status code — non-200 is a content failure for PAGE_SCRAPING
                 status_code = page_data.get("http_status_code")
                 if status_code and status_code != 200:
                     print(f"[SCRAPE] FAILED for URL: {url} | status_code={status_code} | reason=non-200 status")
-                    failed_pages += 1
+                    with _counter_lock:
+                        failed_pages += 1
+                        completed_pages += 1
                     return None
-                
+
                 # Check extraction status
                 if page_data.get("extraction_status") != "SUCCESS":
                     print(f"[SCRAPE] FAILED for URL: {url} | extraction_status={page_data.get('extraction_status')} | reason=extraction failed")
-                    failed_pages += 1
+                    with _counter_lock:
+                        failed_pages += 1
+                        completed_pages += 1
                     return None
                 
                 print(f"[SCRAPE] SUCCESS for URL: {url} | status_code={status_code}")
@@ -869,29 +877,29 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
                     })
 
-                    successful_pages += 1
+                    with _counter_lock:
+                        successful_pages += 1
+                        completed_pages += 1
+                        _completed_snap = completed_pages
 
-                    completed_pages += 1
+                    # Throttled progress update (every 3 pages or at 100%)
+                    percentage = int((_completed_snap / total_pages) * 100) if total_pages > 0 else 100
 
-                    
+                    if _completed_snap % 3 == 0 or _completed_snap == total_pages or percentage == 100:
 
-                    # Send progress update after each successful page
+                        send_progress_update(
 
-                    percentage = int((completed_pages / total_pages) * 100)
+                            job.jobId,
 
-                    send_progress_update(
+                            percentage,
 
-                        job.jobId, 
+                            "Scraping",
 
-                        percentage, 
+                            "Scraping website pages",
 
-                        "Scraping", 
+                            f"{_completed_snap} of {total_pages} pages scraped"
 
-                        "Scraping website pages", 
-
-                        f"{completed_pages} of {total_pages} pages scraped"
-
-                    )
+                        )
 
                     # --- Internal Link Extraction for CRAWL_GRAPH ---
                     try:
@@ -929,227 +937,122 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
                     # --- SEO ENRICHMENT LAYER - P0 FUNCTIONS ---
                     try:
-                        print(f"\n🔍 [SEO DEBUG] Starting enrichment for URL: {url}")
-                        
                         # Get necessary data for SEO analysis
                         raw_html = page_data.get("raw_html", "")
                         internal_links = page_data.get("internal_links", [])
                         http_status = page_data.get("http_status_code", 200)
-                        
-                        # Create BeautifulSoup object for DOM analysis
+
+                        # Create BeautifulSoup object ONCE for all DOM analysis
                         seo_soup = BeautifulSoup(raw_html, "lxml") if raw_html else None
                         
-                        print(f"[SEO DEBUG] raw_html exists: {bool(raw_html)}, length: {len(raw_html) if raw_html else 0}")
-                        print(f"[SEO DEBUG] internal_links count: {len(internal_links)}")
-                        print(f"[SEO DEBUG] http_status: {http_status}")
-                        print(f"[SEO DEBUG] seo_soup exists: {bool(seo_soup)}")
-                        
                         # A. Link Status Analysis
-                        print(f"[SEO DEBUG] Checking link status analysis...")
                         if internal_links:
-                            print(f"[SEO DEBUG] Running link analysis with {len(internal_links)} links")
                             link_analysis = check_link_status_batch(internal_links, url)
-                            print(f"[SEO DEBUG] Link analysis result keys: {list(link_analysis.keys())}")
                             page_data.update(link_analysis)
-                        else:
-                            print(f"[SEO DEBUG] Skipping link analysis - no internal links")
                         
                         # B. HTML Metrics
-                        print(f"[SEO DEBUG] Checking HTML metrics...")
                         if raw_html:
-                            print(f"[SEO DEBUG] Running HTML metrics calculation")
                             html_metrics = calculate_html_metrics(raw_html)
-                            print(f"[SEO DEBUG] HTML metrics keys: {list(html_metrics.keys())}")
                             page_data.update(html_metrics)
-                        else:
-                            print(f"[SEO DEBUG] Skipping HTML metrics - no raw HTML")
                         
                         # C. URL Structure Analysis
-                        print(f"[SEO DEBUG] Running URL structure analysis...")
                         url_structure = analyze_url_structure(url, internal_links)
-                        print(f"[SEO DEBUG] URL structure keys: {list(url_structure.keys())}")
                         page_data.update(url_structure)
                         
                         # D. Mixed Content Detection
-                        print(f"[SEO DEBUG] Checking mixed content detection...")
                         if seo_soup:
-                            print(f"[SEO DEBUG] Running mixed content detection")
                             mixed_content = detect_mixed_content(seo_soup, url)
-                            print(f"[SEO DEBUG] Mixed content keys: {list(mixed_content.keys())}")
                             page_data.update(mixed_content)
-                        else:
-                            print(f"[SEO DEBUG] Skipping mixed content - no soup")
                         
-                        # E. Keyword Density
-                        print(f"[SEO DEBUG] Checking keyword density...")
-                        content_text = page_data.get("content", {}).get("text", "")
-                        page_title = page_data.get("title", "")
-                        meta_desc_list = page_data.get("meta_tags", {}).get("description", [])
-                        meta_description = meta_desc_list[0] if meta_desc_list else ""
-                        
-                        print(f"[SEO DEBUG] content_text length: {len(content_text)}")
-                        print(f"[SEO DEBUG] page_title: {page_title}")
-                        print(f"[SEO DEBUG] meta_description exists: {bool(meta_description)}")
-                        
-                        if content_text:
-                            print(f"[SEO DEBUG] Running keyword density calculation")
-                            keyword_analysis = calculate_keyword_density(content_text, page_title, meta_description)
-                            print(f"[SEO DEBUG] Keyword analysis keys: {list(keyword_analysis.keys())}")
-                            page_data.update(keyword_analysis)
-                        else:
-                            print(f"[SEO DEBUG] Skipping keyword density - no content text")
-                        
-                        # F. iFrame Detection
-                        print(f"[SEO DEBUG] Checking iframe detection...")
+                        # E. Navigation Detection (for ALL pages)
                         if seo_soup:
-                            print(f"[SEO DEBUG] Running iframe detection")
-                            iframe_analysis = detect_iframe_wrapping(seo_soup)
-                            print(f"[SEO DEBUG] iFrame analysis keys: {list(iframe_analysis.keys())}")
-                            page_data.update(iframe_analysis)
+                            nav_detection = detect_navigation_enhanced(seo_soup)
+                            has_home_link = bool(seo_soup.find('a', href=re.compile(r'^(\/|#|https?:\/\/.*\/?$)', re.IGNORECASE)) or 
+                                               seo_soup.find('a', string=re.compile(r'home|homepage', re.IGNORECASE)))
+                            
+                            page_data.update({
+                                "has_navigation": nav_detection.get('has_navigation', False),
+                                "has_home_link": has_home_link,
+                                "navigation_detection": nav_detection
+                            })
                         else:
-                            print(f"[SEO DEBUG] Skipping iframe detection - no soup")
+                            nav_detection = None
                         
-                        # G. 404 Page Analysis
-                        print(f"[SEO DEBUG] Running 404 page analysis...")
-                        error_page_analysis = analyze_404_page(seo_soup, http_status)
-                        print(f"[SEO DEBUG] 404 analysis keys: {list(error_page_analysis.keys())}")
+                        # H. 404 Page Analysis
+                        error_page_analysis = analyze_404_page(seo_soup, http_status, nav_detection)
                         page_data.update(error_page_analysis)
                         
-                        # FINAL VALIDATION
-                        print(f"\n🔍 [SEO DEBUG] ENRICHMENT COMPLETE - VALIDATING REQUIRED FIELDS:")
+                        # Concise validation log (replaces verbose debug block)
                         required_fields = [
-                            'broken_links_count', 'internal_links_status', 'external_links_status',
-                            'code_to_html_ratio', 'keyword_density', 'primary_keyword',
-                            'mixed_content_detected', 'url_length', 'has_parameters',
-                            'has_double_slash', 'long_urls_count', 'full_site_iframe_detected',
-                            'custom_404_detected'
+                            'broken_links_count', 'code_to_html_ratio',
+                            'mixed_content_detected', 'url_length', 'custom_404_detected'
                         ]
-                        
-                        missing_fields = []
-                        present_fields = []
-                        for field in required_fields:
-                            if field in page_data:
-                                present_fields.append(f"{field}: {page_data[field]}")
-                            else:
-                                missing_fields.append(field)
-                        
-                        print(f"[SEO DEBUG] ✅ PRESENT FIELDS ({len(present_fields)}):")
-                        for field in present_fields:
-                            print(f"  - {field}")
-                        
-                        if missing_fields:
-                            print(f"[SEO DEBUG] ❌ MISSING FIELDS ({len(missing_fields)}):")
-                            for field in missing_fields:
-                                print(f"  - {field}")
-                        else:
-                            print(f"[SEO DEBUG] 🎉 ALL REQUIRED FIELDS PRESENT!")
+                        missing = [f for f in required_fields if f not in page_data]
+                        if missing:
+                            print(f"[SEO] ⚠️ Missing fields for {url}: {missing}")
                         
                     except Exception as seo_err:
-                        print(f"[SEO ERROR] ❌ SEO enrichment failed for {url}: {seo_err}")
+                        print(f"[SEO ERROR] Enrichment failed for {url}: {seo_err}")
                         import traceback
                         traceback.print_exc()
-                        # Add error status but don't crash
                         page_data.update({
                             "seo_enrichment_status": "partial",
                             "seo_enrichment_error": str(seo_err)[:200]
                         })
 
-                    # FINAL OUTPUT LOGGING
-                    print(f"\n🔍 [SEO DEBUG] FINAL PAGE DATA OUTPUT:")
-                    import json
+                    # --- CONTEXT ENRICHMENT (framework, CMS, page type) ---
+                    # Runs after SEO enrichment so raw_html is guaranteed to be present.
+                    # Stores structured results under page_context AND flattens to top-level
+                    # framework / cms / page_type fields for backward compat.
                     try:
-                        output_sample = json.dumps(page_data, indent=2, default=str)[:3000]
-                        print(output_sample)
-                        if len(json.dumps(page_data, indent=2, default=str)) > 3000:
-                            print("\n... (truncated for display)")
-                    except Exception as json_err:
-                        print(f"[SEO DEBUG] Could not serialize page_data: {json_err}")
-                        print(f"[SEO DEBUG] page_data keys: {list(page_data.keys()) if isinstance(page_data, dict) else 'not_dict'}")
-                        print(f"[SEO DEBUG] page_data type: {type(page_data)}")
+                        page_context = enrich_from_page_data(page_data, url)
+                        page_data["page_context"] = page_context
+
+                        # Flatten for backward-compat with existing queries
+                        fw = page_context.get("framework", {})
+                        cms = page_context.get("cms")
+                        pt = page_context.get("pageType", {})
+
+                        page_data["framework"] = fw.get("key", "generic")
+                        page_data["cms"] = cms.get("name") if cms else None
+                        # Dedicated page_type fields — top-level, directly queryable
+                        page_data["page_type"] = pt.get("name", "Generic")
+                        page_data["page_type_confidence"] = pt.get("confidence", 0)
+
+                        print(
+                            f"[CONTEXT] {url} | "
+                            f"framework={fw.get('name')} ({fw.get('confidence')}%) | "
+                            f"cms={cms.get('name') if cms else 'none'} | "
+                            f"pageType={pt.get('name')} ({pt.get('confidence')}%)"
+                        )
+                    except Exception as ctx_err:
+                        print(f"[CONTEXT ERROR] Context enrichment failed for {url}: {ctx_err}")
+                        # Non-fatal: leave framework/cms/page_type as whatever was set before
 
                     return page_data
 
-                else:
-
-                    failed_pages += 1
-
-                    completed_pages += 1
-
-                    
-
-                    # Send progress update after each failed page
-
-                    percentage = int((completed_pages / total_pages) * 100)
-
-                    send_progress_update(
-
-                        job.jobId, 
-
-                        percentage, 
-
-                        "Scraping", 
-
-                        "Scraping website pages", 
-
-                        f"{completed_pages} of {total_pages} pages scraped"
-
-                    )
-
-                    
-
-                    return {
-
-                        "url": url,
-
-                        "seo_jobId": ObjectId(job.jobId),
-
-                        "projectId": ObjectId(job.projectId),
-
-                        "sourceJobId": ObjectId(job.sourceJobId) if job.sourceJobId else None,
-
-                        "scrapedAt": datetime.utcnow(),
-
-                        "scrape_status": "FAILED",
-
-                        "error": page_data.get("error", "Extraction failed"),
-
-                        "screenshot_path": screenshot_path,
-
-                        "http_status_code": page_data.get("http_status_code"),
-
-                        "response_time_ms": page_data.get("response_time_ms"),
-
-                        "internal_links": []
-
-                    }
-
-                    
-
             except TimeoutError as te:
 
-                failed_pages += 1
-
-                completed_pages += 1
+                with _counter_lock:
+                    failed_pages += 1
+                    completed_pages += 1
+                    _snap = completed_pages
 
                 print(f"[TIMEOUT] URL scraping timed out after 60s: {url}")
 
-                
-
-                # Send progress update after each timeout
-
-                percentage = int((completed_pages / total_pages) * 100)
+                percentage = int((_snap / total_pages) * 100) if total_pages > 0 else 100
 
                 send_progress_update(
 
-                    job.jobId, 
+                    job.jobId,
 
-                    percentage, 
+                    percentage,
 
-                    "Scraping", 
+                    "Scraping",
 
-                    "Scraping website pages", 
+                    "Scraping website pages",
 
-                    f"{completed_pages} of {total_pages} pages scraped"
+                    f"{_snap} of {total_pages} pages scraped"
 
                 )
 
@@ -1179,27 +1082,24 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
             except Exception as e:
 
-                failed_pages += 1
+                with _counter_lock:
+                    failed_pages += 1
+                    completed_pages += 1
+                    _snap = completed_pages
 
-                completed_pages += 1
-
-                
-
-                # Send progress update after each exception
-
-                percentage = int((completed_pages / total_pages) * 100)
+                percentage = int((_snap / total_pages) * 100) if total_pages > 0 else 100
 
                 send_progress_update(
 
-                    job.jobId, 
+                    job.jobId,
 
-                    percentage, 
+                    percentage,
 
-                    "Scraping", 
+                    "Scraping",
 
-                    "Scraping website pages", 
+                    "Scraping website pages",
 
-                    f"{completed_pages} of {total_pages} pages scraped"
+                    f"{_snap} of {total_pages} pages scraped"
 
                 )
 
@@ -1236,39 +1136,48 @@ def execute_page_scraping_logic(job: PageScrapingJob):
         # DEBUG: Verify URLs before scraping (no modifications should happen)
         print(f"[DEBUG] Before scraping: {len(urls_to_scrape)} URLs ready for processing")
         print(f"[DEBUG] Final URLs to scrape: {urls_to_scrape[:5]}...")  # Show first 5
-        
-        with ThreadPoolExecutor(max_workers=8) as executor:  # Increased from 6 to 8 for faster processing
 
-            # Submit only first 25 scraping tasks
+        # Fix B: one stable User-Agent shared by all 8 threads for this audit run.
+        # Eliminates per-request random UA variation that can cause servers to return
+        # different HTML (UA-differentiated content) between audit runs.
+        audit_ua = random.choice(USER_AGENTS)
+        set_audit_user_agent(audit_ua)
+
+        # Probe first 5 URLs before fan-out so all worker threads agree on
+        # static vs Playwright from the start, eliminating the render race condition.
+        if urls_to_scrape:
+            for probe_url in urls_to_scrape[:5]:
+                if probe_rendering_need(probe_url):
+                    break  # Domain flagged as JS — cache populated, stop probing
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+
+            # Submit ALL canonical URLs — success-targeting means we keep collecting
+            # until TARGET_SUCCESSES succeed or the full pool is exhausted.
             futures = [executor.submit(scrape_single_url, url) for url in urls_to_scrape]
 
-            
-
             # Collect results as they complete
-
             for future in as_completed(futures):
-
-                # Check cancellation during result collection
 
                 if is_job_cancelled(job.jobId):
 
                     print(f"🛑 Job {job.jobId} cancelled during scraping")
 
-                    # Cancel remaining futures
-
                     for f in futures:
-
                         f.cancel()
 
                     return {"status": "cancelled", "jobId": job.jobId, "message": "Job cancelled by user"}
 
-                
-
                 result = future.result()
 
                 if result:
-
                     all_results.append(result)
+                    # Stop collecting once we have enough successful pages.
+                    # In-flight threads still run to completion but their results are discarded.
+                    if len(all_results) >= TARGET_SUCCESSES:
+                        for f in futures:
+                            f.cancel()
+                        break
 
         
 
@@ -1302,53 +1211,28 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
             # Update each internal link with crawl status and HTTP metrics
 
+            # Build bulk operations instead of sequential update_one calls
+            from pymongo import UpdateOne
+            bulk_ops = []
             for result in all_results:
-
-                # Defensive guard: ensure result is a dictionary and has required fields
-
                 if not result or not isinstance(result, dict):
-
                     continue
-
-                    
-
                 url = result.get("url")
-
                 if not url or not isinstance(url, str):
-
                     continue
-
-                    
-
-                update_result = seo_internal_links.update_one(
-
-                    {"url": url, "seo_jobId": ObjectId(job.sourceJobId)},
-
-                    {
-
-                        "$set": {
-
-                            "crawledAt": datetime.utcnow()
-
-                        }
-
-                    }
-
+                bulk_ops.append(
+                    UpdateOne(
+                        {"url": url, "seo_jobId": ObjectId(job.sourceJobId)},
+                        {"$set": {"crawledAt": datetime.utcnow()}}
+                    )
                 )
-
-                if update_result.matched_count == 0:
-
-                    print(f"[WARNING] No matching internal link found for update | url={url} | seo_jobId={job.sourceJobId}")
-
-                elif update_result.modified_count == 0:
-
-                    print(f"[WARNING] Internal link found but not modified | url={url} | seo_jobId={job.sourceJobId}")
-
-            print(f"[WORKER] Updated internal links with crawl timestamp | jobId={job.jobId} | updated={len([r for r in all_results if r and isinstance(r, dict) and r.get('url')])}")
+            
+            if bulk_ops:
+                bulk_result = seo_internal_links.bulk_write(bulk_ops, ordered=False)
+                print(f"[WORKER] Bulk updated internal links | jobId={job.jobId} | matched={bulk_result.matched_count} | modified={bulk_result.modified_count}")
 
         except Exception as update_error:
-
-            print(f"[ERROR] Failed to update internal links with crawl timestamp | jobId={job.jobId} | reason=\"{str(update_error)}\"")
+            print(f"[ERROR] Failed to update internal links | jobId={job.jobId} | reason=\"{str(update_error)}\"")
 
         
 
@@ -1360,41 +1244,41 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
 
 
-        # Prepare completion stats
+        # Read final counter values once under lock for consistent reporting
+        with _counter_lock:
+            _final_successful = successful_pages
+            _final_failed = failed_pages
+            _final_completed = completed_pages
 
+        attempted_urls = _final_completed
+        _success_rate = round((_final_successful / attempted_urls) * 100, 2) if attempted_urls > 0 else 0
+
+        # Prepare completion stats (backward-compatible keys + new metrics)
         stats = {
-
             "totalUrls": total_pages,
-
-            "successfulPages": successful_pages,
-
-            "failedPages": failed_pages,
-
-            "successRate": round((successful_pages / total_pages) * 100, 2) if total_pages > 0 else 0
-
+            "attemptedUrls": attempted_urls,
+            "successfulPages": _final_successful,
+            "failedPages": _final_failed,
+            "successRate": _success_rate,
+            "targetReached": _final_successful >= TARGET_SUCCESSES,
+            "poolExhausted": attempted_urls >= total_pages and _final_successful < TARGET_SUCCESSES,
         }
-
-        
-
-        # Store stats in result_data for summary aggregation
 
         result_data = {
-
-            "totalUrls": total_pages,
-
-            "successfulPages": successful_pages,
-
-            "failedPages": failed_pages,
-
-            "successRate": round((successful_pages / total_pages) * 100, 2) if total_pages > 0 else 0,
-
-            "duration_ms": duration_ms
-
+            "discoveredUrls": total_pages,
+            "candidateUrls": total_pages,
+            "attemptedUrls": attempted_urls,
+            "successfulPages": _final_successful,
+            "failedUrls": _final_failed,
+            "successRate": _success_rate,
+            "targetReached": _final_successful >= TARGET_SUCCESSES,
+            "poolExhausted": attempted_urls >= total_pages and _final_successful < TARGET_SUCCESSES,
+            "duration_ms": duration_ms,
         }
 
         
 
-        print(f"[WORKER] PAGE_SCRAPING completed | jobId={job.jobId} | success={successful_pages} | failed={failed_pages}")
+        print(f"[WORKER] PAGE_SCRAPING completed | jobId={job.jobId} | success={_final_successful} | failed={_final_failed} | targetReached={stats['targetReached']}")
 
         
 
@@ -1481,4 +1365,9 @@ def execute_page_scraping_logic(job: PageScrapingJob):
             
 
         raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        # Always clear the audit-level UA so the module-level variable doesn't
+        # leak into subsequent audit runs within the same process lifetime.
+        set_audit_user_agent(None)
 

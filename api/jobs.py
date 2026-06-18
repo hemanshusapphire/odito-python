@@ -1,6 +1,7 @@
 """Job management API routes."""
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import datetime
 
@@ -15,35 +16,43 @@ class LinkDiscoveryJob(BaseModel):
     userId: str
     main_url: str
 
-@router.post("/jobs/link-discovery")
-def handle_link_discovery(job: LinkDiscoveryJob, request: Request):
-    """Handle LINK_DISCOVERY job dispatched from Node.js"""
-    
-    # DEBUG: Log all incoming request details
-    print(f"🎯 [PYTHON] Link discovery endpoint called at {datetime.datetime.now()}")
-    print(f"🎯 [PYTHON] Request URL: {request.url}")
-    print(f"🎯 [PYTHON] Client IP: {request.client.host}")
-    print(f"🎯 [PYTHON] Request headers: {dict(request.headers)}")
-    print(f"🎯 [PYTHON] Request body: {job.dict()}")
-    print(f"🎯 [PYTHON] Job details - jobId: {job.jobId}, projectId: {job.projectId}, userId: {job.userId}")
-    print(f"🎯 [PYTHON] Main URL: {job.main_url}")
-    
+
+def _run_link_discovery(job: "LinkDiscoveryJob"):
+    """Execute the crawl in the background (off the request lifecycle).
+
+    Completion/failure is reported via the existing /complete and /fail
+    callbacks — the HTTP request lifetime is NO LONGER the source of truth.
+    Any exception is swallowed here because execute_link_discovery already
+    posts a /fail callback to Node before raising.
+    """
     try:
-        print(f"✅ [PYTHON] Starting link discovery for jobId: {job.jobId}")
-        
-        # Import here to avoid circular imports
         from scraper.workers.seo.link_discovery.link_discovery import execute_link_discovery
-        
         result = execute_link_discovery(job)
-        
-        print(f"✅ [PYTHON] Link discovery completed for jobId: {job.jobId}")
-        print(f"✅ [PYTHON] Result: {result}")
-        
-        return result
-        
+        print(f"✅ [PYTHON] Link discovery finished for jobId: {job.jobId} | result={result}")
     except Exception as e:
-        print(f"❌ [PYTHON] Error in link discovery: {str(e)}")
-        print(f"❌ [PYTHON] Full error details: {type(e).__name__}: {str(e)}")
+        # execute_link_discovery already fired the /fail callback; just log here.
+        print(f"❌ [PYTHON] Background link discovery error for jobId {job.jobId}: {type(e).__name__}: {e}")
+
+
+@router.post("/jobs/link-discovery")
+def handle_link_discovery(job: LinkDiscoveryJob, background_tasks: BackgroundTasks):
+    """Accept a LINK_DISCOVERY job and run it asynchronously.
+
+    Returns 202 Accepted immediately so the Node dispatcher's request never
+    blocks for the full crawl. This eliminates the 30s-timeout false-FAILED
+    race (and the duplicate-crawl risk it caused): the worker reports the real
+    outcome through the /complete and /fail callbacks instead.
+    """
+    print(f"🎯 [PYTHON] Link discovery accepted at {datetime.datetime.now()} | jobId={job.jobId} | url={job.main_url}")
+
+    try:
+        background_tasks.add_task(_run_link_discovery, job)
+        return JSONResponse(
+            status_code=202,
+            content={"status": "accepted", "jobId": job.jobId, "message": "Link discovery started"},
+        )
+    except Exception as e:
+        print(f"❌ [PYTHON] Failed to schedule link discovery: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/jobs/cancel")

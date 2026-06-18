@@ -727,7 +727,16 @@ def normalize_page_data(page):
         images_normalized.append(normalized_img)
 
     # Normalize all fields with proper fallbacks - FIXED MAPPING
-    return {
+    
+    # 1. Start with a full copy of the raw page data to prevent losing any signals
+    # This preserves raw_html, navigation_detection, author_signals, etc.
+    result = dict(page)
+    
+    # 2. Extract the string text for backwards compatibility with rules
+    content_text_val = normalize_text(page.get("content", {}).get("text"))
+    
+    # 3. Apply specific normalizations on top
+    result.update({
         # Top-level fields (correct as-is)
         "url": normalize_text(page.get("url")),
         "title": normalize_text(page.get("title")),
@@ -743,7 +752,12 @@ def normalize_page_data(page):
 
         # NESTED fields — these were all broken before
         "headings": headings_list,  # Already properly converted from content.headings
-        "content_text": normalize_text(page.get("content", {}).get("text")),
+        
+        # FIX: Provide content as a string for rules that call .lower() on it, 
+        # while keeping content_text for newer implementations
+        "content": content_text_val,
+        "content_text": content_text_val,
+        
         "word_count": page.get("content", {}).get("word_count", 0),
         "meta_description": normalize_text(page.get("meta_tags", {}).get("description", "")),
         "viewport": normalize_text(page.get("meta_tags", {}).get("viewport", "")),
@@ -768,8 +782,20 @@ def normalize_page_data(page):
 
         # Include new page signals for enhanced rule compatibility
         "review_schema_present": page.get("review_schema_present", False),
-        "hreflang_present": page.get("hreflang_present", False)
-    }
+        "hreflang_present": page.get("hreflang_present", False),
+        
+        # Include HTML and Link metrics missing from normalization
+        "code_to_html_ratio": page.get("code_to_html_ratio", 0),
+        "broken_links_count": page.get("broken_links_count", 0),
+        
+        # Include 404 analysis metrics missing from normalization
+        "is_404_page": page.get("is_404_page", False),
+        "custom_404_detected": page.get("custom_404_detected", False),
+        "has_navigation": page.get("has_navigation", False),
+        "has_home_link": page.get("has_home_link", False)
+    })
+    
+    return result
 
 
 
@@ -1143,11 +1169,11 @@ def send_crawl_summary(job_id, project_id, analysis_stats, analysis_duration_ms,
 
                     }),
 
-                    "issues_found": seo_page_issues.count_documents({
-
-                        "projectId": project_object_id
-
-                    }),
+                    "issues_found": next(iter(seo_page_issues.aggregate([
+                        {"$match": {"projectId": project_object_id}},
+                        {"$group": {"_id": {"issue_code": "$issue_code", "page_url": "$page_url"}}},
+                        {"$count": "total"}
+                    ])), {}).get("total", 0),
 
                     "failed_analyses": analysis_stats.get("failedAnalyses", 0)
 

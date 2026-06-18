@@ -288,87 +288,6 @@ class LowCodeToHtmlRatioRule(BaseSEORuleV2):
         return issues
 
 
-class KeywordDensityRule(BaseSEORuleV2):
-    rule_id = "keyword_density"
-    rule_no = 10
-    category = "Internal Pages"
-    severity = "medium"
-    description = "Over/under-optimized density weakens relevance or triggers stuffing penalty"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        issues = []
-        density = normalized.get("keyword_density", 0)
-        primary_keyword = normalized.get("primary_keyword", "")
-        
-        if density == 0:
-            # FAIL - no keyword density calculated
-            self.severity = "medium"
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                "No keyword density detected - insufficient content analysis",
-                "Density: 0% (unable to calculate)",
-                "Keyword density > 0%",
-                data_key="keyword_density",
-                data_path="keyword_density",
-                impact="No detectable keyword density indicates insufficient content or poor keyword targeting, making it difficult for search engines to understand page relevance.",
-                recommendation="Add substantial content with clear keyword focus. Ensure primary keywords appear naturally in headings, body text, and important HTML elements."
-            ))
-        elif density < 0.5:
-            # WARNING - low density
-            self.severity = "low"
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"Low keyword density ({density:.1f}%). Primary keyword '{primary_keyword}' may be underused.",
-                f"Density: {density:.1f}% (threshold: 0.5%)",
-                "Keyword density ≥ 0.5%",
-                data_key="keyword_density",
-                data_path="keyword_density",
-                impact="Low keyword density may result in weak topical relevance signals, making it harder for search engines to rank the page for target keywords.",
-                recommendation="Increase usage of primary keyword naturally in content. Aim for 1-2.5% density by adding keyword-rich content without stuffing."
-            ))
-        elif density > 3:
-            # WARNING - high density (potential stuffing)
-            self.severity = "medium"
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"High keyword density ({density:.1f}%). Risk of keyword stuffing with '{primary_keyword}'.",
-                f"Density: {density:.1f}% (threshold: 3%)",
-                "Keyword density ≤ 3%",
-                data_key="keyword_density",
-                data_path="keyword_density",
-                impact="High keyword density risks keyword stuffing penalties, reduces readability, and can trigger search engine spam filters that lower rankings.",
-                recommendation="Reduce keyword repetition and focus on natural language. Use variations, synonyms, and related terms instead of repeating the same keyword."
-            ))
-        
-        return issues
-
-
-class IframeWrappingRule(BaseSEORuleV2):
-    rule_id = "iframe_wrapping"
-    rule_no = 11
-    category = "Internal Pages"
-    severity = "high"
-    description = "iFrame-wrapped sites are invisible to crawlers — blocks all indexing"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        issues = []
-        iframe_detected = normalized.get("full_site_iframe_detected", False)
-        
-        if iframe_detected:
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                "Full site wrapped in iframe - severely impacts SEO and user experience",
-                "Full-site iframe wrapping detected",
-                "No iframe wrapping - serve content directly",
-                data_key="full_site_iframe_detected",
-                data_path="full_site_iframe_detected",
-                impact="iFrame wrapping prevents search engines from indexing content, blocks all SEO signals, and creates poor user experience with navigation and sharing issues.",
-                recommendation="Avoid full-page iframe usage. Serve content directly on your domain with proper HTML structure. If embedding is necessary, use server-side includes or API integration instead of iframes."
-            ))
-        
-        return issues
-
-
 class LongUrlsRule(BaseSEORuleV2):
     rule_id = "long_urls"
     rule_no = 12
@@ -408,7 +327,7 @@ class NavigationVisibilityRule(BaseSEORuleV2):
         # Check multiple sources for navigation detection
         has_navigation = normalized.get("has_navigation", False)
         
-        # Enhanced validation - check nested sources
+        # Enhanced validation - check nested sources including new detection data
         navigation_sources = [
             has_navigation,
             normalized.get("navigation_detection", {}).get("has_navigation", False),
@@ -419,11 +338,18 @@ class NavigationVisibilityRule(BaseSEORuleV2):
         
         # If any source detects navigation, check if it's properly structured for crawlers
         if any(navigation_sources):
+            # Get detailed detection info if available
+            nav_detection = normalized.get("navigation_detection", {})
+            detection_method = nav_detection.get("detection_method", "unknown")
+            nav_elements = nav_detection.get("nav_elements_found", [])
+            link_count = nav_detection.get("link_count", 0)
+            
             # Check if navigation is properly structured (semantic HTML)
-            content = normalized.get("content", "")
+            raw_html = normalized.get("raw_html", "")
             has_semantic_nav = False
             
-            if content:
+            if raw_html:
+                raw_lower = raw_html.lower()
                 semantic_indicators = [
                     '<nav',
                     'role="navigation"',
@@ -432,26 +358,27 @@ class NavigationVisibilityRule(BaseSEORuleV2):
                     'navigation',
                     'menu'
                 ]
-                has_semantic_nav = any(indicator in content.lower() for indicator in semantic_indicators)
+                has_semantic_nav = any(indicator in raw_lower for indicator in semantic_indicators)
             
             # Check for accessible navigation structure
             has_accessible_nav = False
-            if content:
+            if raw_html:
+                raw_lower = raw_html.lower()
                 accessible_indicators = [
-                    'ul',
-                    'li',
+                    '<ul',
+                    '<li',
                     'a href',
-                    '<a',
+                    '<a ',
                     'href='
                 ]
-                has_accessible_nav = any(indicator in content.lower() for indicator in accessible_indicators)
+                has_accessible_nav = any(indicator in raw_lower for indicator in accessible_indicators)
             
             # If navigation exists but lacks proper structure, flag it
             if not has_semantic_nav or not has_accessible_nav:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
                     "Navigation detected but may not be properly visible to crawlers",
-                    f"Navigation present but semantic: {has_semantic_nav}, Accessible: {has_accessible_nav}",
+                    f"Detection method: {detection_method} | Links: {link_count} | Semantic: {has_semantic_nav}, Accessible: {has_accessible_nav}",
                     "Semantic navigation structure with proper HTML elements",
                     data_key="has_navigation",
                     data_path="has_navigation",
@@ -459,16 +386,42 @@ class NavigationVisibilityRule(BaseSEORuleV2):
                     recommendation="Use semantic HTML5 navigation elements (<nav>) with proper ARIA labels and structured lists. Ensure navigation links are accessible and properly formatted for crawler detection."
                 ))
         else:
-            # No navigation detected at all
+            # No navigation detected at all - perform enhanced check
+            # Use raw_html because we are looking for actual HTML tags (e.g., <nav, <ul>, class=...)
+            raw_html = normalized.get("raw_html", "")
+            
+            # Fallback: Try to detect navigation directly from raw HTML
+            if raw_html:
+                raw_lower = raw_html.lower()
+                
+                # Check for semantic HTML indicators
+                has_nav_tag = '<nav' in raw_lower
+                has_role_nav = 'role="navigation"' in raw_lower
+                has_aria_nav = 'aria-label' in raw_lower and ('menu' in raw_lower or 'navigation' in raw_lower)
+                
+                # Check for structural patterns
+                has_ul_structure = '<ul>' in raw_lower and '<li>' in raw_lower and '<a href=' in raw_lower
+                
+                # Check for class-based indicators
+                nav_class_patterns = ['class="nav', 'class="menu', 'class="navigation', "class='nav", "class='menu", "class='navigation"]
+                has_nav_class = any(pattern in raw_lower for pattern in nav_class_patterns)
+                
+                # If any fallback detection succeeds, skip the issue
+                if any([has_nav_tag, has_role_nav, has_aria_nav, (has_ul_structure and has_nav_class)]):
+                    # Navigation exists but wasn't detected by the scraper
+                    # This is a data pipeline issue, not a website issue
+                    return issues
+            
+            # No navigation detected by any method
             issues.append(self.create_issue(
                 job_id, project_id, url,
                 "No navigation detected on page",
-                "No navigation elements found",
+                "No navigation elements found using semantic, structural, or class-based detection",
                 "Clear navigation structure for users and crawlers",
                 data_key="has_navigation",
                 data_path="has_navigation",
                 impact="Missing navigation eliminates internal linking opportunities and makes it difficult for users and crawlers to discover related content.",
-                recommendation="Add clear navigation structure using semantic HTML5 elements. Include links to important pages and ensure navigation is accessible to both users and search engine crawlers."
+                recommendation="Add clear navigation structure using semantic HTML5 elements (<nav>). Include links to important pages and ensure navigation is accessible to both users and search engine crawlers."
             ))
         
         return issues
@@ -483,39 +436,53 @@ class SchemaMarkupRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        
-        # Check multiple sources for structured data
+
+        # ── Collect structured_data from all known storage locations ────────────
         structured_data = normalized.get("structured_data", [])
-        json_ld_present = normalized.get("json_ld_present", False)
-        json_ld_count = normalized.get("json_ld_count", 0)
-        
-        # Enhanced validation - check nested sources
         if not structured_data:
             structured_data = (
                 normalized.get("schema_data", {}).get("structured_data", []) or
                 normalized.get("enhanced_extraction_v2", {}).get("schema_data", {}).get("structured_data", []) or
                 normalized.get("body_signals", {}).get("structured_data", [])
             )
-        
+
+        # ── Collect json_ld_present / json_ld_count from all known locations ────
+        json_ld_present = normalized.get("json_ld_present", False)
+        json_ld_count   = normalized.get("json_ld_count", 0)
+
         if not json_ld_present:
             json_ld_present = (
                 normalized.get("format_detection", {}).get("json_ld_present", False) or
-                normalized.get("schema_format_detection", {}).get("json_ld_present", False)
+                normalized.get("schema_format_signals", {}).get("json_ld_present", False)
             )
-        
+
         if json_ld_count == 0:
             json_ld_count = (
                 normalized.get("format_detection", {}).get("json_ld_count", 0) or
-                normalized.get("schema_format_detection", {}).get("json_ld_count", 0)
+                normalized.get("schema_format_signals", {}).get("json_ld_count", 0)
             )
-        
-        # Critical validation: Schema must be in JSON-LD format for crawlers
+
+        # ── Pipeline-gap inference ───────────────────────────────────────────────
+        # extract_structured_data() in schema.py reads EXCLUSIVELY from
+        # <script type="application/ld+json"> tags.  It never sets json_ld_present
+        # or json_ld_count in the normalised dict, so those fields always default
+        # to False/0 even when valid JSON-LD is present.
+        #
+        # Because structured_data can only be populated from JSON-LD scripts, a
+        # non-empty list is definitive proof that JSON-LD exists.  Infer the flag
+        # here so downstream logic does not misclassify the page.
+        if not json_ld_present and structured_data:
+            json_ld_present = True
+            json_ld_count   = len(structured_data)
+
+        # ── Decision ─────────────────────────────────────────────────────────────
         has_structured_data = bool(structured_data) or json_ld_present
-        has_valid_json_ld = json_ld_present and json_ld_count > 0
-        
+        has_valid_json_ld   = json_ld_present and json_ld_count > 0
+
         if not has_valid_json_ld:
             if has_structured_data and not json_ld_present:
-                # Schema detected but not in JSON-LD format
+                # Genuine non-JSON-LD format (Microdata/RDFa detected via a format
+                # detection path but no JSON-LD scripts found).
                 issues.append(self.create_issue(
                     job_id, project_id, url,
                     "Schema markup detected but not in JSON-LD format - crawlers may ignore it",
@@ -527,7 +494,7 @@ class SchemaMarkupRule(BaseSEORuleV2):
                     recommendation="Convert schema markup to JSON-LD format. JSON-LD is the preferred format for Google and provides better crawler support and easier maintenance."
                 ))
             elif not has_structured_data:
-                # No schema at all
+                # No schema detected at all.
                 issues.append(self.create_issue(
                     job_id, project_id, url,
                     "No schema markup found on page",
@@ -536,7 +503,7 @@ class SchemaMarkupRule(BaseSEORuleV2):
                     data_key="structured_data",
                     data_path="structured_data"
                 ))
-        
+
         return issues
 
 
@@ -547,72 +514,91 @@ class FaqSchemaRule(BaseSEORuleV2):
     severity = "medium"
     description = "FAQ schema unlocks expanded SERP results and powers AEO/AI panels"
 
+    # Heading text must contain one of these exact terms to count as an FAQ heading.
+    # Generic question words ("what", "how", "why") are explicitly excluded because
+    # marketing section headings ("What We Do", "Why Choose Us") are not FAQ content.
+    _FAQ_HEADING_KEYWORDS = frozenset([
+        "faq", "frequently asked", "frequently asked questions",
+        "common questions", "questions & answers", "q&a", "q & a",
+    ])
+
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        
-        # Check multiple sources for FAQ schema and content
+
+        # ── Schema detection ─────────────────────────────────────────────────
         structured_data = normalized.get("structured_data", [])
-        faq_schema_present = normalized.get("faq_schema_present", False)
-        
-        # Enhanced validation - check nested sources
         if not structured_data:
             structured_data = (
                 normalized.get("schema_data", {}).get("structured_data", []) or
                 normalized.get("enhanced_extraction_v2", {}).get("schema_data", {}).get("structured_data", []) or
                 normalized.get("body_signals", {}).get("structured_data", [])
             )
-        
-        if not faq_schema_present:
-            faq_schema_present = (
-                normalized.get("schema_analysis", {}).get("faq_schema_present", False) or
-                normalized.get("enhanced_seo_extraction", {}).get("faq_schema_present", False)
-            )
-        
-        # Check for FAQ schema in structured data
+
         has_faq_schema = False
-        if structured_data:
-            for schema in structured_data:
-                if isinstance(schema, dict):
-                    schema_type = schema.get("@type")
-                    if isinstance(schema_type, list):
-                        if "FAQPage" in schema_type:
-                            has_faq_schema = True
-                            break
-                    elif schema_type == "FAQPage":
-                        has_faq_schema = True
-                        break
-        
-        # Use the most comprehensive detection
-        faq_detected = has_faq_schema or faq_schema_present
-        
-        # Check for FAQ content in page text
-        content = normalized.get("content", "")
-        has_faq_content = False
-        if content:
-            faq_indicators = ["faq", "question", "answer", "frequently asked", "what is", "how to", "why do"]
-            has_faq_content = any(indicator in content.lower() for indicator in faq_indicators)
-        
-        # Also check headings for FAQ indicators
-        headings = normalized.get("headings", [])
-        if headings and not has_faq_content:
-            for heading in headings:
-                heading_text = heading.get("text", "").lower()
-                if any(indicator in heading_text for indicator in ["faq", "questions", "frequently asked"]):
-                    has_faq_content = True
+        for schema in structured_data:
+            if isinstance(schema, dict):
+                schema_type = schema.get("@type")
+                types = schema_type if isinstance(schema_type, list) else [schema_type]
+                if "FAQPage" in types:
+                    has_faq_schema = True
                     break
-        
-        if has_faq_content and not faq_detected:
+
+        # faq_howto_signals is stored under this key by the enhanced scraper
+        faq_howto = normalized.get("faq_howto_signals", {})
+        faq_schema_present = (
+            has_faq_schema
+            or normalized.get("faq_schema_present", False)
+            or faq_howto.get("faq_schema_present", False)
+            or normalized.get("schema_analysis", {}).get("faq_schema_present", False)
+        )
+
+        # Page already has FAQ schema — nothing to flag
+        if faq_schema_present:
+            return issues
+
+        # ── Content evidence — three high-precision signals only ─────────────
+        #
+        # Signal A: Scraper found an explicit FAQ section (a heading containing
+        #   "faq"/"frequently asked"/"common questions" followed by Q&A items).
+        #   This is computed by extract_faq_howto_signals() and is reliable.
+        faq_section_count = faq_howto.get("faq_section_count", 0)
+
+        # Signal B: Multiple confirmed question+answer pairs — heading ending
+        #   with '?' followed by an answer paragraph (>20 chars). Requires ≥3
+        #   pairs so isolated section openers don't trigger the rule.
+        qa_pattern_count = faq_howto.get("qa_pattern_count", 0)
+
+        # Signal C: A heading explicitly names the FAQ section (high-precision
+        #   keywords only). Generic question words are not checked here because
+        #   "What We Do" / "Why Choose Us" are marketing headings, not FAQ headings.
+        has_faq_heading = False
+        for heading in normalized.get("headings", []):
+            heading_text = heading.get("text", "").lower().strip()
+            if any(kw in heading_text for kw in self._FAQ_HEADING_KEYWORDS):
+                has_faq_heading = True
+                break
+
+        has_faq_content = (
+            faq_section_count > 0    # explicit FAQ section detected by scraper
+            or has_faq_heading       # heading says "FAQ" / "Frequently Asked Questions"
+            or qa_pattern_count >= 3 # 3+ real question(?) + answer pairs
+        )
+
+        if has_faq_content:
             issues.append(self.create_issue(
                 job_id, project_id, url,
                 "FAQ content found but no FAQ schema markup",
-                f"FAQ content detected but FAQ schema: {faq_detected}, Present: {faq_schema_present}",
+                (
+                    f"FAQ content detected | sections={faq_section_count} "
+                    f"| qa_pairs={qa_pattern_count} | faq_heading={has_faq_heading}"
+                ),
                 "FAQPage schema markup for FAQ content",
                 data_key="faq_schema_present",
                 data_path="faq_schema_present",
                 impact="Missing FAQ schema markup loses rich result opportunities in SERPs and AI-powered answer boxes, reducing visibility and click-through rates.",
                 recommendation="Add FAQPage schema markup to your FAQ content. Include question-answer pairs in proper JSON-LD format to enable rich snippets and improve AI search visibility."
             ))
-        
+
         return issues
 
 
@@ -630,8 +616,6 @@ def register_internal_rules(registry):
     registry.register(DoubleSlashUrlsRule())
     # DISABLED: Very low content ratio
     # registry.register(LowCodeToHtmlRatioRule())
-    registry.register(KeywordDensityRule())
-    registry.register(IframeWrappingRule())
     registry.register(LongUrlsRule())
     registry.register(NavigationVisibilityRule())
     registry.register(SchemaMarkupRule())

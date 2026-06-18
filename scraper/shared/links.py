@@ -112,13 +112,17 @@ def extract_internal_links_from_html(html: str, base_url: str) -> list[dict]:
     return extracted_links
 
 
-def extract_all_links_from_html(html: str, base_url: str, base_domain: str) -> tuple[list, list, list]:
+def extract_all_links_from_html(html: str, base_url: str, base_domain: str, soup=None) -> tuple[list, list, list]:
     """Extract all links (internal, external, social) from HTML content.
-    
+
     External link extraction disabled - returns empty list for external links.
     This improves data quality and reduces processing time.
+
+    Accepts an optional pre-parsed ``soup`` to avoid a redundant BeautifulSoup
+    parse when the caller already parsed the HTML (single-pass).
     """
-    soup = BeautifulSoup(html, "lxml")
+    if soup is None:
+        soup = BeautifulSoup(html, "lxml")
     external_links = []  # DISABLED: Always return empty list for external links
     social_links = []
     internal_links_found = []

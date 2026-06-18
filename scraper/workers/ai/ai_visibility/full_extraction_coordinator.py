@@ -172,7 +172,6 @@ class FullExtractionCoordinator:
                 enhanced_sections[section_name] = {
                     **section_data,
                     'enhanced_analysis': {
-                        'keyword_density': self._calculate_keyword_density(section_data.get('text', '')),
                         'readability_score': self._calculate_readability_score(section_data.get('text', '')),
                         'semantic_structure': self._analyze_semantic_structure(section_data.get('text', '')),
                         'content_quality_indicators': self._analyze_content_quality(section_data.get('text', ''))
@@ -343,33 +342,6 @@ class FullExtractionCoordinator:
         """Create overall page fingerprint."""
         combined = f"{title}:{entity_fingerprint}"
         return hash(combined)
-    
-    def _calculate_keyword_density(self, text: str) -> Dict[str, Any]:
-        """Calculate keyword density for content."""
-        if not text:
-            return {'word_count': 0, 'unique_words': 0, 'density_analysis': {}}
-        
-        words = text.lower().split()
-        word_count = len(words)
-        word_freq = {}
-        
-        for word in words:
-            # Remove punctuation and normalize
-            clean_word = ''.join(c for c in word if c.isalnum())
-            if clean_word:
-                word_freq[clean_word] = word_freq.get(clean_word, 0) + 1
-        
-        # Calculate density
-        density_analysis = {}
-        for word, freq in sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:10]:
-            density = (freq / word_count) * 100
-            density_analysis[word] = round(density, 2)
-        
-        return {
-            'word_count': word_count,
-            'unique_words': len(word_freq),
-            'density_analysis': density_analysis
-        }
     
     def _calculate_readability_score(self, text: str) -> float:
         """Calculate simple readability score."""

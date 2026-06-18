@@ -222,9 +222,9 @@ class SEORuleEngine:
             
             # Create deduplication key
             rule_id = issue.get('rule_id', '')
-            message = issue.get('message', '')
-            url = issue.get('url', '')
-            
+            message = issue.get('issue_message', '')
+            url = issue.get('page_url', '')
+
             dedupe_key = f"{rule_id}:{message}:{url}"
             
             if dedupe_key not in seen_keys:

@@ -11,8 +11,9 @@ class PageScrapingJob(BaseModel):
     jobId: str
     projectId: str
     userId: str
-    urls: list[str]  # Deterministic input from LINK_DISCOVERY
-    sourceJobId: str | None = None  # Reference to LINK_DISCOVERY job
+    urls: list[str] = []
+    canonical_urls: list[str] = []  # Canonical URL set from URL_QUALIFICATION (preferred)
+    sourceJobId: str | None = None
 
 @router.post("/jobs/page-scraping")
 def handle_page_scraping(job: PageScrapingJob):

@@ -18,7 +18,7 @@ class First60WordsDirectAnswerRule(BaseRule):
             "rule_id": "first_60_words_direct_answer",
             "category": "aeo_score",
             "description": "First 60 words contain direct answer",
-            "weight": 1.0,
+            "weight": 1.9,
             "max_score": 10,
             "applies_to": "page"
         }
@@ -61,7 +61,7 @@ class FAQSchemaMatchesContentRule(BaseRule):
             "rule_id": "faq_schema_matches_content",
             "category": "aeo_score",
             "description": "FAQ schema matches visible content",
-            "weight": 1.0,
+            "weight": 2.0,
             "max_score": 10,
             "applies_to": "page",
             "is_required": False  # FAQ is optional, not all pages need it
@@ -105,7 +105,7 @@ class FAQSection5To10QuestionsRule(BaseRule):
             "rule_id": "faq_section_5_to_10_questions",
             "category": "aeo_score",
             "description": "FAQ section 5–10 questions",
-            "weight": 1.0,
+            "weight": 1.6,
             "max_score": 10,
             "applies_to": "page",
             "is_required": False  # FAQ section is optional
@@ -141,7 +141,7 @@ class QuestionBasedH2HeadingsRule(BaseRule):
             "rule_id": "question_based_h2_headings",
             "category": "aeo_score",
             "description": "Question-based H2 headings",
-            "weight": 1.0,
+            "weight": 1.7,
             "max_score": 10,
             "applies_to": "page",
             "is_required": False  # Question headings are optional
@@ -149,33 +149,23 @@ class QuestionBasedH2HeadingsRule(BaseRule):
         super().__init__(config)
     
     def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for question-based H2 headings"""
         heading_metrics = data.get("heading_metrics", {})
-        
         score = 0
-        
-        # Check for question headings
+
+        # question_headings and h2_count are integers from HeadingSignals
         question_headings = heading_metrics.get("question_headings", 0)
-        question_headings = len(question_headings) if isinstance(question_headings, list) else question_headings
-        
-        if question_headings >= 3:
-            score += 6
-        elif question_headings >= 2:
-            score += 4
-        elif question_headings >= 1:
-            score += 2
-        
-        # Check H2 count for context
-        h2_count = heading_metrics.get("h2_count", 0)
-        h2_count = h2_count[0] if isinstance(h2_count, list) else h2_count
-        
+        h2_count          = heading_metrics.get("h2_count", 0)
+
+        if question_headings >= 3:   score += 6
+        elif question_headings >= 2: score += 4
+        elif question_headings >= 1: score += 2
+
         if h2_count >= 2:
             score += 2
-        
-        # Bonus for high question ratio
+
         if h2_count > 0 and question_headings / h2_count >= 0.5:
-            score += 2
-        
+            score = min(score + 2, self.max_score)
+
         return min(score, self.max_score)
 
 class DirectAnswerFormatRule(BaseRule):
@@ -186,7 +176,7 @@ class DirectAnswerFormatRule(BaseRule):
             "rule_id": "direct_answer_format",
             "category": "aeo_score",
             "description": "Direct answer format",
-            "weight": 1.0,
+            "weight": 1.9,
             "max_score": 10,
             "applies_to": "page"
         }
@@ -223,52 +213,58 @@ class DirectAnswerFormatRule(BaseRule):
         return min(score, self.max_score)
 
 class ContentCitesSourcesRule(BaseRule):
-    """Rule 61 — Content cites sources"""
-    
+    """Rule 61 — Content links to or references authoritative external sources.
+
+    Previously awarded 3 points for any Person or Organisation schema that had
+    both a name and a url — which is true for virtually every page with
+    Organisation schema, making this an almost-universal false positive.
+    Fixed to use real external link count as the primary signal and schema
+    citation types (Article with citation, Dataset, ScholarlyArticle) as
+    secondary.  Person/Org with name+url no longer qualifies as a citation.
+    """
+
+    _CITATION_SCHEMA_TYPES = {"Citation", "Dataset", "ScholarlyArticle", "ResearchProject"}
+    _CITABLE_CONTENT_TYPES = {"Article", "NewsArticle", "BlogPosting", "CreativeWork"}
+
     def __init__(self):
         config = {
             "rule_id": "content_cites_sources",
             "category": "aeo_score",
-            "description": "Content cites sources",
-            "weight": 1.0,
+            "description": "Content references or links to authoritative external sources",
+            "weight": 1.3,
             "max_score": 10,
-            "applies_to": "page"
+            "applies_to": "page",
         }
         super().__init__(config)
-    
+
     def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check if content cites sources"""
-        structured_data = data.get("structured_data", {})
-        if isinstance(structured_data, str):
-            try:
-                structured_data = json.loads(structured_data)
-            except (json.JSONDecodeError, TypeError):
-                structured_data = {}
-        
         score = 0
-        graph = structured_data.get("@graph", [])
-        
-        # Check for citation references
+
+        # Primary: real external link count (from link_signals after fix)
+        link_sig = data.get("link_signals", {})
+        external = link_sig.get("external", 0)
+        if external >= 5:   score += 6
+        elif external >= 3: score += 4
+        elif external >= 1: score += 2
+
+        # Secondary: schema citation evidence
+        graph = data.get("structured_data", {}).get("@graph", [])
         for item in graph:
-            if item.get("@type") in ["Citation", "CreativeWork", "Article"]:
-                if item.get("citation") or item.get("isPartOf") or item.get("sameAs"):
-                    score += 4
-                    break
-        
-        # Check for author attribution (source citation)
-        for item in graph:
-            if item.get("@type") in ["Person", "Organization"]:
-                if item.get("name") and item.get("url"):
-                    score += 3
-                    break
-        
-        # Check for dataset or research references
-        for item in graph:
-            if item.get("@type") in ["Dataset", "ResearchProject"]:
-                score += 3
+            raw_type = item.get("@type", "")
+            types = set(raw_type if isinstance(raw_type, list) else [raw_type])
+
+            # Dedicated citation schema types — strong signal
+            if types & self._CITATION_SCHEMA_TYPES:
+                score = min(score + 4, self.max_score)
                 break
-        
-        return min(score, self.max_score)
+
+            # Content schema with explicit citation relationship
+            if types & self._CITABLE_CONTENT_TYPES:
+                if item.get("citation") or item.get("isPartOf"):
+                    score = min(score + 3, self.max_score)
+                    break
+
+        return min(float(score), self.max_score)
 
 # Register all AEO Score rules (6 rules)
 def register_aeo_score_rules(registry):

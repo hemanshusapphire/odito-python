@@ -18,19 +18,6 @@ import json
 # Configure logging
 logger = logging.getLogger(__name__)
 
-def safe_len(value):
-    """Safe length helper for list/int comparisons"""
-    if isinstance(value, list):
-        return len(value)
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except:
-            return 0
-    return 0
-
 class ScoringEngine:
     """Main scoring engine for AI visibility v2"""
     
@@ -113,9 +100,19 @@ class ScoringEngine:
             
             # Apply final clamp to ensure 0-100 bounds
             overall_score = max(0.0, min(overall_score, 100.0))
-            
-            # No distribution expansion - pure weighted average only
-            
+
+            # Crawlability gate: a confirmed robots/noindex block caps the overall
+            # score at 30 regardless of content quality.
+            # Score 0 means confirmed-blocked (the rule returns 5.0 when data is
+            # absent, so 0.0 is never a false signal from missing extraction data).
+            robots_result = next(
+                (r for r in all_rule_results
+                 if r.get("rule_id") == "robots_txt_non_blocking"),
+                None,
+            )
+            if robots_result is not None and robots_result.get("score", 100.0) == 0.0:
+                overall_score = min(overall_score, 30.0)
+
             # Assemble final result
             page_score["page_ai_score"] = overall_score
             page_score["category_scores"] = category_scores

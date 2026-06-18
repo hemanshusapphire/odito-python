@@ -1,5 +1,6 @@
 """Orchestrator for coordinating SEO data extraction pipeline."""
 
+import json as _json
 from datetime import datetime
 
 # Third-party imports
@@ -17,7 +18,6 @@ from .schema import extract_structured_data
 from .utils import create_content_hash
 from .intelligence import extract_seo_intelligence
 from .enhanced_seo_extraction import extract_enhanced_seo_signals
-from .utils import normalize_url, get_registrable_domain
 
 
 def extract_comprehensive_seo_data(html: str, base_url: str, response_headers: dict = None) -> dict:
@@ -27,66 +27,84 @@ def extract_comprehensive_seo_data(html: str, base_url: str, response_headers: d
     """
     try:
         soup = BeautifulSoup(html, "lxml")
-        
+
         # Initialize result structure
         seo_data = {
             "url": base_url,
             "scraped_at": datetime.utcnow().isoformat(),
             "extraction_status": "SUCCESS"
         }
-        
+
         # 1. HEAD + SEO META DATA
         extract_head_and_meta_data(soup, seo_data)
-        
+
         # 2. SOCIAL MEDIA META (Open Graph, Twitter, etc.)
         extract_social_media_data(soup, seo_data)
-        
+
         # 3. INTERNATIONALIZATION
         extract_internationalization_data(soup, seo_data)
-        
+
         # 4. VISUAL/BRANDING
         extract_visual_branding_data(soup, seo_data)
-        
+
         # 5. STRUCTURED DATA
         extract_structured_data(soup, seo_data)
-        
+
         # 6. CONTENT ANALYSIS
         extract_content_analysis(soup, seo_data)
-        
+
         # 7. IMAGES
         extract_image_data(soup, base_url, seo_data)
-        
+
         # 8. TRACKING & ANALYTICS
         extract_tracking_data(soup, seo_data)
-        
+
         # 9. PAGE SIGNALS (review, analytics, doctype, theme-color, hreflang, facebook pixel)
         # Returns: (top_level_signals, tracking_updates)
         top_level_signals, tracking_updates = extract_page_signals(html, soup)
-        
+
         # Add top-level signals
         seo_data.update(top_level_signals)
-        
+
         # Merge tracking updates into tracking object (corrects old values with new accurate detections)
         if seo_data.get("tracking"):
             seo_data["tracking"].update(tracking_updates)
-        
-        # 10. SEO INTELLIGENCE (advanced analysis across 7 groups)
-        # Uses a fresh soup to avoid issues with decomposed elements from content analysis
-        intelligence_soup = BeautifulSoup(html, "lxml")
+
+        # 10. SEO INTELLIGENCE (schema_validation + security)
+        # Reads from already-extracted seo_data — no BeautifulSoup instantiation.
         seo_data["seo_intelligence"] = extract_seo_intelligence(
-            html, intelligence_soup, seo_data, response_headers or {}, base_url
+            seo_data, response_headers or {}, base_url
         )
-        
-        # 11. INTERNAL LINKS EXTRACTION (for SEO enrichment layer)
-        # Extract internal links for link status analysis
-        seo_data["internal_links"] = _extract_internal_links(soup, base_url)
-        
-        # 12. ENHANCED SEO SIGNALS (structured raw data extraction)
-        # Uses original soup to maintain DOM context for positioning analysis
-        seo_data["enhanced_signals"] = extract_enhanced_seo_signals(soup, html, base_url, response_headers or {})
-        
+
+        # 11. SINGLE JSON-LD PARSE — shared across all enhanced signal extractors.
+        # Each entry: (raw_content: str, schemas: list[dict], is_valid_json: bool)
+        json_ld_entries = []
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                content = script.string.strip() if script.string else ''
+                if not content:
+                    continue
+                parsed = _json.loads(content)
+                schemas = []
+                if isinstance(parsed, dict):
+                    if '@graph' in parsed:
+                        g = parsed['@graph']
+                        schemas = g if isinstance(g, list) else [g]
+                    else:
+                        schemas = [parsed]
+                elif isinstance(parsed, list):
+                    schemas = parsed
+                json_ld_entries.append((content, schemas, True))
+            except (_json.JSONDecodeError, TypeError):
+                if 'content' in dir():
+                    json_ld_entries.append((content, [], False))
+
+        # 12. ENHANCED SEO SIGNALS — stored at top level so rule-engine consumers
+        # can access them via normalized.get("signal_key", {}) without path changes.
+        seo_data.update(extract_enhanced_seo_signals(soup, html, base_url, json_ld_entries))
+
         return seo_data
-        
+
     except Exception as e:
         return {
             "url": base_url,
@@ -103,82 +121,21 @@ def scrape_page_data(url: str) -> dict:
     """
     try:
         # Use existing fetch_html function (includes JS detection and Selenium fallback)
-        html, status_code, response_time, response_headers = fetch_html(url, timeout=30)
-        
+        html, status_code, response_time, response_headers, _final_url = fetch_html(url, timeout=30)
+
         if status_code != 200 or not html:
             return None
-        
+
         # Extract SEO data (including intelligence layer)
         seo_data = extract_comprehensive_seo_data(html, url, response_headers)
         seo_data["http_status_code"] = status_code
         seo_data["response_time_ms"] = response_time
-        
+
         # Store raw HTML if size is acceptable
         if html and len(html.encode("utf-8")) < 15 * 1024 * 1024:
             seo_data["raw_html"] = html
-        
+
         return seo_data
-        
+
     except Exception as e:
         return None
-
-
-def _extract_internal_links(soup, page_url: str) -> list:
-    """
-    Extract normalized same-domain internal links from a BeautifulSoup object.
-    Lightweight — no HTTP calls, operates on already-parsed HTML.
-    
-    Args:
-        soup: BeautifulSoup object of the page
-        page_url: Base URL of the page
-        
-    Returns:
-        List of normalized internal link URLs
-    """
-    try:
-        from urllib.parse import urljoin, urlparse
-        
-        if not soup or not page_url:
-            return []
-        
-        # Get the domain for same-domain filtering
-        page_domain = get_registrable_domain(page_url)
-        if not page_domain:
-            return []
-        
-        seen = set()
-        results = []
-        
-        # Find all links with href attribute
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag.get("href", "").strip()
-            if not href:
-                continue
-            
-            # Skip excluded schemes
-            excluded_schemes = ["mailto:", "tel:", "javascript:", "ftp:", "file:"]
-            if any(href.startswith(scheme) for scheme in excluded_schemes):
-                continue
-            
-            # Convert relative URL to absolute
-            absolute_url = urljoin(page_url, href)
-            
-            # Remove fragment
-            parsed = urlparse(absolute_url)
-            if not parsed.netloc:
-                continue
-            
-            # Same-domain check
-            link_domain = get_registrable_domain(absolute_url)
-            if link_domain != page_domain:
-                continue
-            
-            # Normalize and deduplicate
-            normalized = normalize_url(absolute_url)
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                results.append(normalized)
-        
-        return results
-    except Exception:
-        return []

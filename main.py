@@ -49,9 +49,14 @@ from api.ai_visibility import router as ai_visibility_router
 from api.ai_visibility_scoring_v2 import router as ai_visibility_scoring_v2_router, AIVisibilityScoringV2Job
 from api.technical_domain import router as technical_domain_router
 from api.headless_accessibility import router as headless_accessibility_router
+from api.url_qualification import router as url_qualification_router
 from api.crawl_graph import router as crawl_graph_router
 from api.keyword_research import router as keyword_research_router
 from api.onboarding import router as onboarding_router
+from api.homepage_audit import router as homepage_audit_router
+from api.pagespeed import router as pagespeed_router
+from api.homepage_pagespeed import router as homepage_pagespeed_router
+from api.website_extraction import router as website_extraction_router
 from scraper.workers.ai.ai_visibility.ai_visibility import execute_ai_visibility, AIVisibilityJob
 
 # Configure logging to suppress third-party errors
@@ -84,13 +89,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[SHUTDOWN] Error closing HTTP client: {e}")
 
+    # Shutdown - close any persistent Playwright browsers in the pool
+    try:
+        from scraper.shared.browser_pool import shutdown_browser_pool
+        shutdown_browser_pool()
+        print("[SHUTDOWN] Browser pool closed")
+    except Exception as e:
+        print(f"[SHUTDOWN] Error closing browser pool: {e}")
+
 app = FastAPI(lifespan=lifespan)
 
 # Thread-safe tracking for parallel jobs
 running_parallel_jobs = set()
 running_jobs_lock = threading.Lock()
 
-PARALLEL_JOB_TYPES = {'PAGE_SCRAPING', 'HEADLESS_ACCESSIBILITY', 'CRAWL_GRAPH', 'AI_VISIBILITY'}
+PARALLEL_JOB_TYPES = {'PAGE_SCRAPING', 'HEADLESS_ACCESSIBILITY', 'CRAWL_GRAPH', 'AI_VISIBILITY', 'URL_QUALIFICATION'}
 
 def run_job_in_thread(job, job_type):
     """Run a job in a separate thread with thread-safe logging"""
@@ -128,8 +141,9 @@ async def poll_for_jobs():
     
     # List of job types to poll for (in priority order)
     job_types = [
+        'URL_QUALIFICATION',
         'PAGE_SCRAPING',
-        'HEADLESS_ACCESSIBILITY', 
+        'HEADLESS_ACCESSIBILITY',
         'PERFORMANCE_MOBILE',
         'PERFORMANCE_DESKTOP',
         'PAGE_ANALYSIS',
@@ -243,6 +257,14 @@ def normalize_job_to_model(job: dict, job_type: str):
             userId=str(user_id),
             domain=input_data.get('domain')
         )
+    elif job_type == 'URL_QUALIFICATION':
+        from scraper.workers.seo.url_qualification.worker import UrlQualificationJob
+        return UrlQualificationJob(
+            jobId=str(job_id),
+            projectId=str(project_id),
+            userId=str(user_id),
+            sourceJobId=input_data.get('source_job_id', ''),
+        )
     elif job_type == 'PAGE_SCRAPING':
         from api.scraping import PageScrapingJob
         return PageScrapingJob(
@@ -250,6 +272,7 @@ def normalize_job_to_model(job: dict, job_type: str):
             projectId=str(project_id),
             userId=str(user_id),
             urls=input_data.get('urls', []),
+            canonical_urls=input_data.get('canonical_urls', []),
             sourceJobId=input_data.get('source_job_id')
         )
     elif job_type == 'HEADLESS_ACCESSIBILITY':
@@ -259,7 +282,8 @@ def normalize_job_to_model(job: dict, job_type: str):
             projectId=str(project_id),
             userId=str(user_id),
             sourceJobId=input_data.get('source_job_id', ''),
-            urls=input_data.get('urls', [])
+            urls=input_data.get('urls', []),
+            canonical_urls=input_data.get('canonical_urls', []),
         )
     elif job_type == 'PAGE_ANALYSIS':
         from api.analysis import PageAnalysisJob
@@ -348,7 +372,11 @@ async def process_claimed_job(job):
         from api.crawl_graph import handle_crawl_graph
         
         # Map job types to existing handlers (call synchronously, not await)
-        if job_type == 'PAGE_SCRAPING':
+        if job_type == 'URL_QUALIFICATION':
+            print(f"[DEBUG] Executing URL_QUALIFICATION handler")
+            from scraper.workers.seo.url_qualification.worker import execute_url_qualification
+            await execute_url_qualification(job_model)
+        elif job_type == 'PAGE_SCRAPING':
             print(f"[DEBUG] Executing PAGE_SCRAPING handler")
             handle_page_scraping(job_model)
         elif job_type == 'PAGE_ANALYSIS':
@@ -409,9 +437,14 @@ app.include_router(ai_visibility_router, prefix="/api", tags=["ai_visibility"])
 app.include_router(ai_visibility_scoring_v2_router, prefix="/api", tags=["ai_visibility_scoring_v2"])
 app.include_router(technical_domain_router, prefix="/api", tags=["technical_domain"])
 app.include_router(headless_accessibility_router, prefix="/api", tags=["headless_accessibility"])
+app.include_router(url_qualification_router, prefix="/api", tags=["url_qualification"])
 app.include_router(crawl_graph_router, prefix="/api", tags=["crawl_graph"])
 app.include_router(keyword_research_router, prefix="/api", tags=["keyword_research"])
 app.include_router(onboarding_router, prefix="/api", tags=["onboarding"])
+app.include_router(homepage_audit_router, prefix="/api", tags=["homepage_audit"])
+app.include_router(pagespeed_router, prefix="/api", tags=["pagespeed"])
+app.include_router(homepage_pagespeed_router, prefix="/api", tags=["homepage_pagespeed"])
+app.include_router(website_extraction_router, tags=["website_extraction"])
 
 # Global set to track cancelled jobs
 cancelled_jobs = set()

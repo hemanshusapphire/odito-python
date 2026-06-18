@@ -17,6 +17,7 @@ import asyncio
 import requests
 import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 import time
 from bson.objectid import ObjectId
 
@@ -24,12 +25,80 @@ from bson.objectid import ObjectId
 from db import seo_page_data
 from scraper.shared.url_selector import get_top_urls
 from scraper.shared.http_client import get_http_client
+from scraper.shared.perf_tracker import PerformanceTracker, WorkerTimingContext
+from scraper.shared.dom_stability import (
+    wait_for_dom_stable,
+    wait_for_critical_hydration,
+    detect_tabbable_elements,
+    setup_resource_blocking,
+)
 
 
 # ---------------------------------------------------------------------------
-# axe-core injection script (minified CDN fallback)
+# axe-core — local bundled version (eliminates CDN dependency)
 # ---------------------------------------------------------------------------
-AXE_CDN_URL = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.9.1/axe.min.js"
+AXE_CDN_URL = "https://cdnjs.cloudflare.com/ajax/libs/axe-core/4.9.1/axe.min.js"  # Fallback only
+_AXE_LOCAL_PATH = Path(__file__).resolve().parent.parent.parent.parent / "shared" / "vendor" / "axe.min.js"
+_AXE_SCRIPT_CACHE = None
+ENABLE_RESOURCE_BLOCKING = os.environ.get("BLOCK_HEAVY_RESOURCES", "1") == "1"
+
+
+def _load_axe_script() -> str:
+    """Load axe-core script from local vendor bundle (cached after first load)."""
+    global _AXE_SCRIPT_CACHE
+    if _AXE_SCRIPT_CACHE is not None:
+        return _AXE_SCRIPT_CACHE
+    if _AXE_LOCAL_PATH.exists():
+        _AXE_SCRIPT_CACHE = _AXE_LOCAL_PATH.read_text(encoding="utf-8")
+        print(f"[HEADLESS_A11Y] axe-core loaded from local bundle ({len(_AXE_SCRIPT_CACHE)} bytes)")
+    else:
+        print(f"[HEADLESS_A11Y] WARNING: Local axe.min.js not found at {_AXE_LOCAL_PATH}, will use CDN fallback")
+        _AXE_SCRIPT_CACHE = ""
+    return _AXE_SCRIPT_CACHE
+
+
+# ---------------------------------------------------------------------------
+# Smart failure classification — prevents wasted retries
+# ---------------------------------------------------------------------------
+def _classify_error(error) -> dict:
+    """Classify an error and return retry strategy.
+
+    Returns dict with:
+        max_retries: int — how many retries are appropriate
+        delay_s: float — delay before retry
+        category: str — error classification
+    """
+    err_str = str(error).lower()
+
+    # DNS / connection failures — no retry
+    if any(s in err_str for s in ["dns", "name or service not known", "nodename nor servname",
+                                    "getaddrinfo", "err_name_not_resolved"]):
+        return {"max_retries": 0, "delay_s": 0, "category": "DNS_FAILURE"}
+
+    if any(s in err_str for s in ["connection refused", "err_connection_refused"]):
+        return {"max_retries": 0, "delay_s": 0, "category": "CONNECTION_REFUSED"}
+
+    # HTTP 403/429 — limited retry
+    if any(s in err_str for s in ["403", "forbidden"]):
+        return {"max_retries": 1, "delay_s": 2.0, "category": "HTTP_FORBIDDEN"}
+
+    if "429" in err_str or "rate limit" in err_str:
+        return {"max_retries": 1, "delay_s": 3.0, "category": "RATE_LIMITED"}
+
+    # SSL errors — no retry
+    if any(s in err_str for s in ["ssl", "certificate", "err_cert"]):
+        return {"max_retries": 0, "delay_s": 0, "category": "SSL_ERROR"}
+
+    # Timeout — one retry
+    if any(s in err_str for s in ["timeout", "timed out"]):
+        return {"max_retries": 1, "delay_s": 1.0, "category": "TIMEOUT"}
+
+    # Browser crash — retry
+    if any(s in err_str for s in ["browser", "crashed", "target closed", "context"]):
+        return {"max_retries": 2, "delay_s": 1.0, "category": "BROWSER_CRASH"}
+
+    # Default: transient — retry twice
+    return {"max_retries": 2, "delay_s": 0.5, "category": "TRANSIENT"}
 
 AXE_RUN_SCRIPT = """
 () => {
@@ -143,8 +212,11 @@ META_VIEWPORT_SCRIPT = """
 
 async def _simulate_keyboard_navigation(page) -> dict:
     """
-    Simulate 20 Tab presses using Playwright's native keyboard API
-    and collect focus metrics after each press.
+    HYBRID keyboard accessibility simulation.
+
+    Phase 1: Detect all focusable elements via JS (instant, no key presses).
+    Phase 2: Simulate min(detected_count, 10) Tab presses with Playwright's
+             native keyboard API for real focus behavior verification.
 
     Detects:
       - Focus traps (same element focused >= 3 consecutive times)
@@ -152,7 +224,16 @@ async def _simulate_keyboard_navigation(page) -> dict:
       - Missing focus outline (outline-style is 'none' or outline-width is '0px')
       - Unreachable elements (focus never moves from body)
     """
-    TAB_COUNT = 20
+    # Phase 1: JS-based tabbable element detection
+    try:
+        tabbable_info = await detect_tabbable_elements(page)
+        detected_count = tabbable_info.get("visible_focusable", 0)
+    except Exception:
+        tabbable_info = {"visible_focusable": 0, "elements": []}
+        detected_count = 0
+
+    # Phase 2: Strategic Tab simulation — min(detected, 10) presses
+    TAB_COUNT = min(max(detected_count, 5), 10)  # At least 5, at most 10
     focus_order = []
     small_click_targets = 0
     small_click_targets_list = []
@@ -162,8 +243,7 @@ async def _simulate_keyboard_navigation(page) -> dict:
 
     for i in range(TAB_COUNT):
         await page.keyboard.press("Tab")
-        # Brief pause for focus to settle
-        await page.wait_for_timeout(100)
+        await page.wait_for_timeout(50)  # 50ms focus settle (down from 100ms)
 
         try:
             focus_info = await page.evaluate(KEYBOARD_FOCUS_COLLECTOR)
@@ -215,6 +295,7 @@ async def _simulate_keyboard_navigation(page) -> dict:
         "small_click_targets_list": small_click_targets_list,
         "missing_focus_outline": missing_focus_outline,
         "total_tab_presses": TAB_COUNT,
+        "detected_focusable_elements": detected_count,
         "focus_order": [
             {"tag": f.get("tag"), "id": f.get("id", ""), "selector": f.get("selector", "")}
             for f in focus_order if f.get("focused", False)
@@ -222,12 +303,20 @@ async def _simulate_keyboard_navigation(page) -> dict:
     }
 
 
-async def _scan_single_url(browser, url, semaphore, timeout_ms=30000):
+async def _scan_single_url(browser, url, semaphore, perf_ctx=None, timeout_ms=30000):
     """
-    Scan a single URL in its own browser context with retry mechanism.
-    Returns structured result dict with comprehensive error handling.
+    Scan a single URL in its own browser context.
+
+    Optimizations vs original:
+      - Local axe-core injection (no CDN fetch)
+      - MutationObserver-based DOM stabilization (no hardcoded waits)
+      - Resource blocking for ads/trackers/analytics
+      - Smart failure classification (fewer wasted retries)
+      - Per-URL performance profiling
     """
     async with semaphore:
+        tracker = perf_ctx.url_tracker(url) if perf_ctx else PerformanceTracker("A11Y_URL", url=url)
+
         result = {
             "url": url,
             "render_status": "failed",
@@ -239,182 +328,160 @@ async def _scan_single_url(browser, url, semaphore, timeout_ms=30000):
             "statusCode": None
         }
 
-        # Retry up to 3 times for robustness
-        MAX_RETRIES = 3
-        NAVIGATION_TIMEOUT = 90000  # 90s
-        SELECTOR_TIMEOUT = 30000    # 30s
+        NAVIGATION_TIMEOUT = 60000  # 60s (down from 90s — smart waits compensate)
+        SELECTOR_TIMEOUT = 20000    # 20s (down from 30s)
+        max_retries = 2             # Default; overridden by error classification
+        first_error_classification = None
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, max_retries + 1):
             result["attempts"] = attempt
-            attempt_start_time = time.time()
             context = None
             page = None
 
-            print(f"  🔄 Attempt {attempt}/{MAX_RETRIES} for {url} | timestamp={datetime.now(timezone.utc).isoformat()}")
-
             try:
-                # Create browser context with realistic user agent and anti-bot settings
-                context = await browser.new_context(
-                    viewport={"width": 1366, "height": 768},
-                    ignore_https_errors=True,
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    locale="en-US",
-                    timezone_id="America/New_York"
-                )
-                page = await context.new_page()
-
-                # Set default timeout for all operations
-                page.set_default_timeout(SELECTOR_TIMEOUT)
-
-                # Navigate with domcontentloaded (more reliable than networkidle for SPAs)
-                try:
-                    response = await asyncio.wait_for(
-                        page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT),
-                        timeout=NAVIGATION_TIMEOUT / 1000 + 5  # Add buffer
+                # --- Context creation ---
+                with tracker.stage("context_creation"):
+                    context = await browser.new_context(
+                        viewport={"width": 1366, "height": 768},
+                        ignore_https_errors=True,
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        locale="en-US",
+                        timezone_id="America/New_York"
                     )
-                    status_code = response.status if response else 0
-                    result["statusCode"] = status_code
-                    load_time = time.time() - attempt_start_time
-                    print(f"  ✅ Navigation successful for {url} | status={status_code} | loadTime={load_time:.2f}s")
-                except asyncio.TimeoutError:
-                    load_time = time.time() - attempt_start_time
-                    print(f"  ⚠️ Navigation timeout for {url} | attempt={attempt} | loadTime={load_time:.2f}s")
-                    result["error"] = f"Navigation timeout (90s) on attempt {attempt}"
-                    if attempt < MAX_RETRIES:
-                        print(f"  🔄 Retrying {url} after timeout...")
-                        continue
-                    raise
-                except Exception as nav_err:
-                    load_time = time.time() - attempt_start_time
-                    print(f"  ⚠️ Navigation failed for {url} | attempt={attempt} | error={nav_err} | loadTime={load_time:.2f}s")
-                    result["error"] = f"Navigation failed on attempt {attempt}: {str(nav_err)}"
-                    if attempt < MAX_RETRIES:
-                        print(f"  🔄 Retrying {url} after navigation error...")
-                        continue
-                    raise
+                    page = await context.new_page()
+                    page.set_default_timeout(SELECTOR_TIMEOUT)
 
-                # Wait for SPA hydration (JS rendering)
-                await page.wait_for_timeout(5000)  # 5s for SPA hydration
+                # --- Resource blocking ---
+                if ENABLE_RESOURCE_BLOCKING:
+                    with tracker.stage("resource_blocking"):
+                        await setup_resource_blocking(page)
 
-                # Verify DOM is ready - check document.readyState and body content
-                try:
-                    dom_ready = await page.evaluate("""
-                        () => {
-                            return {
-                                readyState: document.readyState,
-                                hasBody: document.body !== null,
-                                bodyChildren: document.body ? document.body.children.length : 0
-                            };
-                        }
-                    """)
-                    print(f"  📊 DOM state for {url} | readyState={dom_ready['readyState']} | hasBody={dom_ready['hasBody']} | bodyChildren={dom_ready['bodyChildren']}")
-
-                    # If document is not complete or body is empty, wait longer
-                    if dom_ready['readyState'] != 'complete' or dom_ready['bodyChildren'] == 0:
-                        print(f"  ⏳ Waiting for full DOM load for {url}...")
-                        await page.wait_for_timeout(3000)  # Additional 3s wait
-
-                        # Try optional networkidle as fallback for SPAs
-                        try:
-                            await page.wait_for_load_state('networkidle', timeout=10000)
-                            print(f"  ✅ Networkidle achieved for {url}")
-                        except Exception:
-                            print(f"  ℹ️ Networkidle timeout (non-critical) for {url}")
-                except Exception as dom_check_err:
-                    print(f"  ⚠️ DOM check failed for {url}: {dom_check_err}")
-                    # Continue anyway, DOM might still be usable
-
-                # Inject axe-core with retry logic
-                axe_loaded = False
-                for axe_attempt in range(2):
+                # --- Navigation ---
+                with tracker.stage("navigation"):
                     try:
-                        http_client = get_http_client()
-                        axe_response = await http_client.get(AXE_CDN_URL, timeout=15)
-                        axe_script = axe_response.text
-                        await page.evaluate(axe_script)
-                        axe_loaded = True
-                        print(f"  ✅ axe-core loaded for {url} | attempt={axe_attempt + 1}")
-                        break
-                    except Exception as axe_load_err:
-                        print(f"  ⚠️ axe-core CDN load attempt {axe_attempt + 1} failed for {url}: {axe_load_err}")
-                        if axe_attempt == 1:
-                            result["error"] = f"axe-core load failed: {str(axe_load_err)}"
+                        response = await asyncio.wait_for(
+                            page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT),
+                            timeout=NAVIGATION_TIMEOUT / 1000 + 5
+                        )
+                        status_code = response.status if response else 0
+                        result["statusCode"] = status_code
+                    except asyncio.TimeoutError:
+                        result["error"] = f"Navigation timeout on attempt {attempt}"
+                        raise
+                    except Exception as nav_err:
+                        result["error"] = f"Navigation failed: {str(nav_err)}"
+                        raise
 
-                if not axe_loaded:
-                    print(f"  ❌ axe-core failed to load for {url} after retries")
-                    if attempt < MAX_RETRIES:
-                        print(f"  🔄 Retrying {url} after axe-core load failure...")
-                        continue
-                    raise Exception("axe-core failed to load after retries")
+                # --- Smart DOM stabilization (replaces hardcoded 5s + 3s waits) ---
+                with tracker.stage("dom_stabilization"):
+                    # First: wait for framework hydration
+                    hydration = await wait_for_critical_hydration(page, timeout_ms=4000)
 
-                # Run axe-core (only after DOM is confirmed ready)
-                try:
-                    axe_results = await page.evaluate(AXE_RUN_SCRIPT)
-                    result["axeViolations"] = axe_results.get("violations", [])
-                    result["axeViolationCount"] = axe_results.get("violationCount", 0)
-                    result["axePassedCount"] = axe_results.get("passedCount", 0)
-                    print(f"  ✅ axe-core executed for {url} | violations={result['axeViolationCount']}")
-                except Exception as axe_err:
-                    print(f"  ⚠️ axe-core run failed for {url}: {axe_err}")
-                    result["axeViolations"] = []
-                    if not result["error"]:
-                        result["error"] = f"axe-core run failed: {str(axe_err)}"
-                    if attempt < MAX_RETRIES:
-                        print(f"  🔄 Retrying {url} after axe-core run failure...")
-                        continue
-                    raise
+                    # Then: wait for DOM mutations to settle
+                    stability = await wait_for_dom_stable(page, timeout_ms=6000, stable_ms=300)
 
-                # Collect DOM metrics
-                try:
-                    dom_metrics = await page.evaluate(DOM_METRICS_SCRIPT)
-                    result["domMetrics"] = dom_metrics
-                    print(f"  ✅ DOM metrics collected for {url} | totalElements={dom_metrics.get('totalElements', 0)}")
-                except Exception as dom_err:
-                    print(f"  ⚠️ DOM metrics failed for {url}: {dom_err}")
-                    result["domMetrics"] = {}
+                # --- Inject axe-core (local bundle, no CDN) ---
+                with tracker.stage("axe_injection"):
+                    axe_script = _load_axe_script()
+                    axe_loaded = False
 
-                # Collect meta viewport
+                    if axe_script:
+                        # Local injection — fast path
+                        try:
+                            await page.evaluate(axe_script)
+                            axe_loaded = True
+                        except Exception as local_err:
+                            print(f"  ⚠️ Local axe injection failed for {url}: {local_err}")
+
+                    if not axe_loaded:
+                        # CDN fallback (preserves original behavior)
+                        try:
+                            http_client = get_http_client()
+                            axe_response = await http_client.get(AXE_CDN_URL, timeout=10)
+                            await page.evaluate(axe_response.text)
+                            axe_loaded = True
+                        except Exception as cdn_err:
+                            result["error"] = f"axe-core load failed: {str(cdn_err)}"
+                            raise Exception("axe-core failed to load (local + CDN)")
+
+                # --- Run axe-core ---
+                with tracker.stage("axe_execution"):
+                    try:
+                        axe_results = await page.evaluate(AXE_RUN_SCRIPT)
+                        result["axeViolations"] = axe_results.get("violations", [])
+                        result["axeViolationCount"] = axe_results.get("violationCount", 0)
+                        result["axePassedCount"] = axe_results.get("passedCount", 0)
+                    except Exception as axe_err:
+                        result["axeViolations"] = []
+                        if not result["error"]:
+                            result["error"] = f"axe-core run failed: {str(axe_err)}"
+                        raise
+
+                # --- Collect DOM metrics ---
+                with tracker.stage("dom_metrics"):
+                    try:
+                        dom_metrics = await page.evaluate(DOM_METRICS_SCRIPT)
+                        result["domMetrics"] = dom_metrics
+                    except Exception:
+                        result["domMetrics"] = {}
+
+                # --- Collect meta viewport ---
                 try:
                     viewport_data = await page.evaluate(META_VIEWPORT_SCRIPT)
                     result["viewportMeta"] = viewport_data
-                except Exception as viewport_err:
-                    print(f"  ⚠️ Viewport meta failed for {url}: {viewport_err}")
+                except Exception:
                     result["viewportMeta"] = {}
 
-                # Feature 4: Keyboard Accessibility Simulation
-                try:
-                    keyboard_result = await asyncio.wait_for(
-                        _simulate_keyboard_navigation(page),
-                        timeout=30
-                    )
-                    result["keyboard_analysis"] = keyboard_result
-                    print(f"  ✅ Keyboard navigation completed for {url}")
-                except asyncio.TimeoutError:
-                    print(f"  ⚠️ Keyboard navigation timeout for {url}")
-                    result["keyboard_analysis"] = {
-                        "keyboard_navigation_checked": False,
-                        "error": "Keyboard navigation timeout (30s)"
-                    }
-                except Exception as kb_err:
-                    print(f"  ⚠️ Keyboard navigation failed for {url}: {kb_err}")
-                    result["keyboard_analysis"] = {
-                        "keyboard_navigation_checked": False,
-                        "error": str(kb_err)
-                    }
+                # --- Keyboard accessibility (hybrid approach) ---
+                with tracker.stage("keyboard_navigation"):
+                    try:
+                        keyboard_result = await asyncio.wait_for(
+                            _simulate_keyboard_navigation(page),
+                            timeout=15  # Down from 30s — fewer tabs now
+                        )
+                        result["keyboard_analysis"] = keyboard_result
+                    except asyncio.TimeoutError:
+                        result["keyboard_analysis"] = {
+                            "keyboard_navigation_checked": False,
+                            "error": "Keyboard navigation timeout (15s)"
+                        }
+                    except Exception as kb_err:
+                        result["keyboard_analysis"] = {
+                            "keyboard_navigation_checked": False,
+                            "error": str(kb_err)
+                        }
 
-                # Success! Mark as successful and break retry loop
+                # --- Success ---
                 result["render_status"] = "success"
-                total_load_time = time.time() - attempt_start_time
-                result["loadTime"] = round(total_load_time, 2)
-                print(f"  ✅ Scan successful for {url} | attempt={attempt} | totalLoadTime={total_load_time:.2f}s | status={status_code}")
+                result["loadTime"] = round(tracker.get_total_ms() / 1000, 2)
+                tracker.log_summary(prefix="A11Y_URL")
+                if perf_ctx:
+                    perf_ctx.complete_url(tracker)
                 break
 
             except Exception as e:
-                total_load_time = time.time() - attempt_start_time
-                print(f"  ❌ Attempt {attempt} failed for {url} | error={e} | loadTime={total_load_time:.2f}s")
                 result["error"] = str(e)
 
-                # Clean up on failure
+                # Smart failure classification — decide retry strategy
+                if first_error_classification is None:
+                    first_error_classification = _classify_error(e)
+                    max_retries = first_error_classification["max_retries"] + 1  # +1 because attempt starts at 1
+                    delay = first_error_classification["delay_s"]
+                    category = first_error_classification["category"]
+                    print(f"  ⚠️ Error classified as {category} for {url} | maxRetries={max_retries-1}")
+
+                    if delay > 0 and attempt < max_retries:
+                        await asyncio.sleep(delay)
+
+                if attempt >= max_retries:
+                    result["render_status"] = "failed"
+                    result["loadTime"] = round(tracker.get_total_ms() / 1000, 2)
+                    result["error_category"] = first_error_classification["category"] if first_error_classification else "UNKNOWN"
+                    if perf_ctx:
+                        perf_ctx.complete_url(tracker)
+
+            finally:
+                # Always clean up browser resources
                 if page:
                     try:
                         await page.close()
@@ -426,34 +493,13 @@ async def _scan_single_url(browser, url, semaphore, timeout_ms=30000):
                     except Exception:
                         pass
 
-                # If this was the last attempt, mark as failed
-                if attempt == MAX_RETRIES:
-                    result["render_status"] = "failed"
-                    result["loadTime"] = round(total_load_time, 2)
-                    print(f"  ❌ All retries exhausted for {url} | finalStatus=failed | error={e}")
-                else:
-                    print(f"  🔄 Retrying {url} (attempt {attempt + 1}/{MAX_RETRIES})...")
-
-            finally:
-                # Clean up resources on success too
-                if result["render_status"] == "success":
-                    if page:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-                    if context:
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
-
         return result
 
 
 async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
     """
     Core async logic: launch browser, scan all URLs, store results.
+    Includes performance profiling and optimized browser configuration.
     """
     from playwright.async_api import async_playwright
 
@@ -461,55 +507,67 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
     all_results = []
     total = len(urls)
 
-    print(f"[HEADLESS_A11Y] Starting scan | jobId={job_id} | urls={total} | timestamp={datetime.now(timezone.utc).isoformat()}")
+    # Performance profiling context for the entire job
+    perf_ctx = WorkerTimingContext("HEADLESS_A11Y", job_id=job_id)
+    job_tracker = PerformanceTracker("HEADLESS_A11Y", job_id=job_id)
 
-    print(f"[HEADLESS_A11Y] Browser launching | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-site-isolation-trials",
-                "--window-size=1366,768"
-            ]
-        )
-        print(f"[HEADLESS_A11Y] Browser launched | jobId={job_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
+    # Pre-load axe-core script (cached for all URLs)
+    _load_axe_script()
 
-        try:
-            # Process URLs in batches with semaphore-limited concurrency
-            # Wrap each task with asyncio.wait_for to prevent indefinite hangs
-            # Increased timeout to 300s (5 min) to account for 3 retry attempts
-            tasks = [
-                asyncio.wait_for(_scan_single_url(browser, url, semaphore), timeout=300)
-                for url in urls
-            ]
-            all_results = await asyncio.gather(*tasks, return_exceptions=True)
+    print(f"[HEADLESS_A11Y] Starting scan | jobId={job_id} | urls={total}")
 
-            # Convert exceptions to error results
-            processed_results = []
-            for i, res in enumerate(all_results):
-                if isinstance(res, Exception):
-                    processed_results.append({
-                        "url": urls[i],
-                        "render_status": "failed",
-                        "axeViolations": [],
-                        "domMetrics": {},
-                        "error": str(res),
-                        "scannedAt": datetime.now(timezone.utc).isoformat()
-                    })
-                else:
-                    processed_results.append(res)
+    with job_tracker.stage("browser_launch"):
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-site-isolation-trials",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--js-flags=--max-old-space-size=256",
+                    "--window-size=1366,768"
+                ]
+            )
 
-            all_results = processed_results
+            try:
+                # Process URLs with semaphore-limited concurrency
+                # Reduced timeout: smart retries + no CDN = faster per-URL
+                with job_tracker.stage("url_scanning"):
+                    tasks = [
+                        asyncio.wait_for(
+                            _scan_single_url(browser, url, semaphore, perf_ctx=perf_ctx),
+                            timeout=180  # 3min (down from 5min — fewer retries now)
+                        )
+                        for url in urls
+                    ]
+                    all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        finally:
-            await browser.close()
+                # Convert exceptions to error results
+                processed_results = []
+                for i, res in enumerate(all_results):
+                    if isinstance(res, Exception):
+                        processed_results.append({
+                            "url": urls[i],
+                            "render_status": "failed",
+                            "axeViolations": [],
+                            "domMetrics": {},
+                            "error": str(res),
+                            "scannedAt": datetime.now(timezone.utc).isoformat()
+                        })
+                    else:
+                        processed_results.append(res)
+
+                all_results = processed_results
+
+            finally:
+                await browser.close()
 
     # Store results in MongoDB via Node.js API
     success_count = sum(1 for r in all_results if r["render_status"] == "success")
@@ -540,9 +598,12 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
             raise Exception(f"HTTP {store_response.status_code}: {store_response.text}")
             
     except Exception as store_err:
-        print(f"❌ [HEADLESS_A11Y] CRITICAL: Failed to store results | jobId={job_id} | error={store_err} | timestamp={datetime.now(timezone.utc).isoformat()}")
+        print(f"❌ [HEADLESS_A11Y] CRITICAL: Failed to store results | jobId={job_id} | error={store_err}")
         # CRITICAL: Raise exception to ensure completion API is called in execute_headless_accessibility
         raise Exception(f"Storage failed: {str(store_err)}")
+
+    # Log job-level performance summary
+    perf_ctx.log_job_summary()
 
     return {
         "totalUrls": total,
@@ -571,57 +632,24 @@ async def execute_headless_accessibility(job):
 
     print(f"[HEADLESS_A11Y] Starting | jobId={job_id} | projectId={project_id} | timestamp={datetime.now(timezone.utc).isoformat()}")
 
-    # STEP 2: Get URLs using deterministic type-based selection
+    # STEP 2: Resolve URL list.
+    # Priority: canonical_urls from URL_QUALIFICATION → legacy job.urls → DB fallback.
+    # canonical_urls guarantees the same URL set as PAGE_SCRAPING (parallel worker).
     urls = []
-    
-    # First try: Use deterministic type-based selection from seo_internal_links
-    try:
-        print(f"[HEADLESS_A11Y] Using deterministic type-based URL selection | projectId={project_id} | jobId={job_id}")
-        
-        # Use the shared URL selector for consistent results
-        urls = get_top_urls(project_id, limit=25)
-        
-        print(f"[HEADLESS_A11Y] Deterministic selection complete | totalUrls={len(urls)} | jobId={job_id}")
-        
-    except Exception as selection_error:
-        print(f"[HEADLESS_A11Y] Deterministic selection failed, falling back to scraped pages | jobId={job_id} | error={str(selection_error)}")
-        
-        # Fallback to original logic
-        project_id_obj = ObjectId(project_id)
-        print(f"[HEADLESS_A11Y] Fetching URLs from seo_page_data | projectId={project_id} | jobId={job_id}")
-        
-        # Query seo_page_data collection for successfully scraped pages
-        pages = list(seo_page_data.find({
-            "projectId": project_id_obj,
-            "extraction_status": "SUCCESS"  # Only process successfully scraped pages
-        }))
-        
-        # Extract URLs from page data
-        urls = [page["url"] for page in pages if page.get("url")]
-        
-        print(f"[HEADLESS_A11Y] seo_page_data fetch complete | totalUrls={len(urls)} | jobId={job_id} | pagesFound={len(pages)}")
-        
-        # If still no URLs, try seo_internal_links fallback
-        if not urls:
-            try:
-                print(f"[HEADLESS_A11Y] No scraped pages found, trying seo_internal_links | projectId={project_id} | jobId={job_id}")
-                
-                # Import internal links collection
-                from db import seo_internal_links
-                
-                # Query by projectId to get all discovered internal links for this project
-                internal_links = list(seo_internal_links.find({"projectId": project_id_obj}))
-                urls = [link["url"] for link in internal_links if link.get("url")]
-                
-                print(f"[HEADLESS_A11Y] seo_internal_links fallback complete | totalUrls={len(urls)} | jobId={job_id} | linksFound={len(internal_links)}")
-                
-            except Exception as fallback_error:
-                print(f"[HEADLESS_A11Y] seo_internal_links fallback failed | jobId={job_id} | error={str(fallback_error)}")
 
-    # Third try: Use URLs from job input if provided (legacy support)
-    if not urls and hasattr(job, 'urls') and job.urls:
-        urls = job.urls
-        print(f"[HEADLESS_A11Y] Using URLs from job input | totalUrls={len(urls)} | jobId={job_id}")
+    if getattr(job, 'canonical_urls', None):
+        urls = list(job.canonical_urls)
+        print(f"[HEADLESS_A11Y] Using canonical_urls from URL_QUALIFICATION | totalUrls={len(urls)} | jobId={job_id}")
+    elif getattr(job, 'urls', None):
+        urls = list(job.urls)
+        print(f"[HEADLESS_A11Y] Using urls from job input (legacy) | totalUrls={len(urls)} | jobId={job_id}")
+    else:
+        # DB fallback: deterministic type-based selection (pre-URL_QUALIFICATION deployments)
+        try:
+            urls = get_top_urls(project_id, limit=25)
+            print(f"[HEADLESS_A11Y] DB fallback URL selection | totalUrls={len(urls)} | jobId={job_id}")
+        except Exception as exc:
+            print(f"[HEADLESS_A11Y] DB fallback failed | jobId={job_id} | error={exc}")
 
     # STEP 3: Safety guard - graceful handling if no URLs found
     if not urls:
@@ -724,11 +752,6 @@ async def execute_headless_accessibility(job):
         except Exception as fail_error:
             print(f"⚠️ [HEADLESS_A11Y] Failed to report failure | error={str(fail_error)}")
 
-        return {
-            "status": "failed_gracefully",
-            "jobId": job_id,
-            "error": str(e)
-        }
         return {
             "status": "failed_gracefully",
             "jobId": job_id,

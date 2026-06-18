@@ -66,6 +66,9 @@ def fetch_llms_txt(domain: str) -> dict:
     result = {
         "status": None,
         "exists": False,
+        "valid": False,
+        "hasContent": False,
+        "contentLength": 0,
         "content": "",
         "hasAllow": False,
         "hasDisallow": False,
@@ -130,11 +133,19 @@ def fetch_llms_txt(domain: str) -> dict:
                 if response.status_code == 200:
                     content = response.text
                     parsed = parse_llms_txt_content(content)
-                    
+                    capped = content[:50000]
+                    content_length = len(content)
+                    has_content = content_length > 0
+                    # Valid = HTTP 200, non-empty, parseable text
+                    valid = has_content and bool(capped.strip())
+
                     result.update({
                         "status": response.status_code,
                         "exists": True,
-                        "content": content[:50000],  # Cap at 50KB to avoid huge files
+                        "valid": valid,
+                        "hasContent": has_content,
+                        "contentLength": content_length,
+                        "content": capped,
                         "hasAllow": parsed["hasAllow"],
                         "hasDisallow": parsed["hasDisallow"],
                         "mentionedBots": parsed["mentionedBots"]

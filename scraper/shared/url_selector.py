@@ -1,11 +1,70 @@
 """
-Shared URL selection utilities for deterministic, type-based URL selection
-Used by Page Scraping Worker and Headless Worker
+Shared URL selection utilities for deterministic, type-based URL selection.
+Used by Page Scraping, Headless Accessibility, and URL Qualification workers.
 """
 
-from typing import List
+from typing import List, Dict, Any
 from bson.objectid import ObjectId
 from db import seo_internal_links
+
+# Type rank used for deterministic ordering across all workers
+_TYPE_RANK: Dict[str, int] = {
+    "main": 0,
+    "service": 1,
+    "blog": 2,
+    "portfolio": 3,
+}
+
+
+def get_candidate_pool(project_id: str, max_size: int = 75) -> List[Dict[str, Any]]:
+    """
+    Return ALL discovered URLs for a project with type metadata, sorted
+    deterministically by (type_rank ASC, url_length ASC, url ASC).
+
+    Used by URL_QUALIFICATION to build the probe candidate pool.
+
+    Args:
+        project_id: Project ID (string or ObjectId)
+        max_size:   Upper bound on returned pool (default 75 covers typical 70-80 crawl)
+
+    Returns:
+        List of dicts: {url, type, type_rank}
+    """
+    if isinstance(project_id, str):
+        project_id = ObjectId(project_id)
+
+    print(f"[URL_SELECTOR] Building candidate pool | projectId={project_id} | maxSize={max_size}")
+
+    try:
+        docs = list(seo_internal_links.find(
+            {"projectId": project_id},
+            {"url": 1, "type": 1, "_id": 0}
+        ))
+
+        seen: set = set()
+        unique: List[Dict[str, Any]] = []
+        for doc in docs:
+            url = doc.get("url")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            page_type = (doc.get("type") or "other").strip().lower()
+            unique.append({
+                "url": url,
+                "type": page_type,
+                "type_rank": _TYPE_RANK.get(page_type, 99),
+            })
+
+        # Deterministic: type_rank ASC, URL length ASC, URL lexicographic ASC
+        unique.sort(key=lambda d: (d["type_rank"], len(d["url"]), d["url"]))
+
+        result = unique[:max_size]
+        print(f"[URL_SELECTOR] Candidate pool built | total={len(result)}")
+        return result
+
+    except Exception as exc:
+        print(f"[URL_SELECTOR] get_candidate_pool ERROR: {exc}")
+        return []
 
 
 def get_top_urls(project_id: str, limit: int = 25) -> List[str]:

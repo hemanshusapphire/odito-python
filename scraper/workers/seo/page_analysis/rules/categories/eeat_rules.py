@@ -533,6 +533,70 @@ class PrivacyTermsPagesRule(BaseSEORuleV2):
     severity = "high"
     description = "Missing policy pages are an instant E-E-A-T red flag for quality raters"
 
+    @staticmethod
+    def normalize_url(url):
+        """Normalize URL for comparison by removing trailing slashes and lowercasing"""
+        if not url:
+            return url
+        url = url.rstrip('/')
+        return url.lower()
+
+    @staticmethod
+    def extract_links_from_html(content):
+        """Extract all href values and anchor text from HTML content"""
+        links = []
+        
+        # Match all anchor tags with href attributes
+        import re
+        href_pattern = r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>([^<]*)</a>'
+        matches = re.findall(href_pattern, content, re.IGNORECASE)
+        
+        for href, text in matches:
+            links.append({
+                'href': href.strip(),
+                'text': text.strip()
+            })
+        
+        return links
+
+    @staticmethod
+    def check_privacy_terms_links(links, privacy_patterns, terms_patterns):
+        """Check if privacy or terms links exist in extracted links"""
+        has_privacy = False
+        has_terms = False
+        
+        for link in links:
+            href = PrivacyTermsPagesRule.normalize_url(link['href'])
+            text = link['text'].lower()
+            
+            # Check href against patterns
+            for pattern in privacy_patterns:
+                normalized_pattern = PrivacyTermsPagesRule.normalize_url(pattern)
+                if normalized_pattern in href or pattern.lower() in href:
+                    has_privacy = True
+                    break
+            
+            for pattern in terms_patterns:
+                normalized_pattern = PrivacyTermsPagesRule.normalize_url(pattern)
+                if normalized_pattern in href or pattern.lower() in href:
+                    has_terms = True
+                    break
+            
+            # Also check anchor text
+            if not has_privacy:
+                for pattern in privacy_patterns:
+                    if pattern.lower() in text:
+                        has_privacy = True
+                        break
+            
+            if not has_terms:
+                for pattern in terms_patterns:
+                    if pattern.lower() in text:
+                        has_terms = True
+                        break
+        
+        return has_privacy, has_terms
+
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
         
@@ -548,48 +612,50 @@ class PrivacyTermsPagesRule(BaseSEORuleV2):
         )
         
         if is_main_page:
-            # Check for privacy and terms links in content
-            content = normalized.get("content", "").lower()
+            content = normalized.get("content", "")
+            content_lower = content.lower()
             
-            # Look for privacy policy and terms links
-            privacy_indicators = [
-                "privacy policy", "privacy", "privacy.html", 
-                "/privacy", "privacy-policy"
+            # Enhanced privacy and terms patterns - include variations
+            privacy_patterns = [
+                "privacy-policy", "privacy_policy", "privacypolicy",
+                "privacy", "privacy.html",
+                "/privacy", "/privacy-policy", "/privacy_policy"
             ]
             
-            terms_indicators = [
-                "terms of service", "terms and conditions", "terms", 
-                "terms.html", "/terms", "terms-conditions"
+            terms_patterns = [
+                "terms-of-service", "terms_of_service", "termsofservice",
+                "terms-and-conditions", "terms_and_conditions", "termsandconditions",
+                "terms", "terms.html", "terms-conditions",
+                "/terms", "/terms-of-service", "/terms-and-conditions"
             ]
             
-            has_privacy_link = any(indicator in content for indicator in privacy_indicators)
-            has_terms_link = any(indicator in content for indicator in terms_indicators)
+            # Extract actual links from HTML
+            links = self.extract_links_from_html(content)
             
-            # Check footer specifically
-            footer_patterns = [
-                r'<footer[^>]*>.*?</footer>',
-                r'class="footer".*?</div>',
-                r'id="footer".*?</div>'
-            ]
+            # Check links using enhanced detection
+            has_privacy_link, has_terms_link = self.check_privacy_terms_links(
+                links, privacy_patterns, terms_patterns
+            )
             
-            footer_content = ""
-            import re
-            for pattern in footer_patterns:
-                match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
-                if match:
-                    footer_content = match.group(0).lower()
-                    break
+            # Fallback: also check content directly for indicators (for non-link references)
+            if not has_privacy_link:
+                for pattern in privacy_patterns:
+                    if pattern.lower() in content_lower:
+                        has_privacy_link = True
+                        break
             
-            # Check in footer specifically
-            privacy_in_footer = any(indicator in footer_content for indicator in privacy_indicators)
-            terms_in_footer = any(indicator in footer_content for indicator in terms_indicators)
+            if not has_terms_link:
+                for pattern in terms_patterns:
+                    if pattern.lower() in content_lower:
+                        has_terms_link = True
+                        break
             
             # Validation issues
-            if not has_privacy_link and not privacy_in_footer:
+            if not has_privacy_link:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
                     "Missing Privacy Policy link",
-                    "No privacy policy link found in page content or footer",
+                    "No privacy policy link found in page content",
                     "Privacy Policy link in footer or main navigation",
                     data_key="content",
                     data_path="content.privacy_link",
@@ -597,11 +663,11 @@ class PrivacyTermsPagesRule(BaseSEORuleV2):
                     recommendation="Add Privacy Policy link in footer or main navigation. Ensure the privacy policy page exists and has substantial content."
                 ))
             
-            if not has_terms_link and not terms_in_footer:
+            if not has_terms_link:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
                     "Missing Terms of Service link",
-                    "No terms of service link found in page content or footer",
+                    "No terms of service link found in page content",
                     "Terms of Service link in footer or main navigation",
                     data_key="content",
                     data_path="content.terms_link",

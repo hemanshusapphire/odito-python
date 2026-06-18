@@ -23,6 +23,16 @@ from contextlib import contextmanager
 
 # Local imports
 from scraper.shared.fetcher import fetch_html
+
+# Normalized extraction architecture (single source of truth, immutable DOM,
+# extract-once). Authoritative for scoring/issue metrics; legacy fields kept as
+# compatibility aliases during migration.
+try:
+    from scraper.workers.ai.ai_visibility.normalized import extract_normalized_signals
+    _NORMALIZED_AVAILABLE = True
+except Exception as _norm_err:  # never let import issues break the worker
+    _NORMALIZED_AVAILABLE = False
+    print(f"[NORMALIZED] import unavailable, falling back to legacy extraction: {_norm_err}")
 from db import seo_ai_visibility, seo_ai_visibility_project, seoprojects
 
 # ==================== PHASE 2: AI-READY EXTRACTION LAYER ====================
@@ -491,68 +501,6 @@ def detect_faq_content(soup, text) -> dict:
             'valid_qa_pairs': [], 'detection_method': 'error'
         }
 
-def detect_step_by_step(soup, text) -> dict:
-    """Detect step-by-step content"""
-    try:
-        # === PHASE 2: STEP-BY-STEP DETECTION ===
-        step_section_present = False
-        step_count = 0
-        
-        # Check for ordered lists
-        ordered_lists = soup.find_all('ol')
-        if ordered_lists:
-            step_section_present = True
-            for ol in ordered_lists:
-                step_count += len(ol.find_all('li'))
-        
-        # Check for HowTo schema
-        howto_schema = False
-        scripts = soup.find_all('script', type='application/ld+json')
-        for script in scripts:
-            try:
-                data = json.loads(script.string)
-                if isinstance(data, dict):
-                    if data.get('@type') == 'HowTo':
-                        howto_schema = True
-                        step_section_present = True
-                        break
-                    elif isinstance(data.get('@graph'), list):
-                        for item in data['@graph']:
-                            if item.get('@type') == 'HowTo':
-                                howto_schema = True
-                                step_section_present = True
-                                break
-            except:
-                continue
-        
-        # Detect step patterns in text
-        step_patterns = [
-            r'\bstep\s+\d+\b', r'\bfirst\b', r'\bsecond\b', r'\bthird\b',
-            r'\bnext\b', r'\bthen\b', r'\bafter\s+that\b', r'\bfinally\b'
-        ]
-        
-        step_matches = []
-        for pattern in step_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            step_matches.extend(matches)
-        
-        if step_matches and not step_section_present:
-            step_section_present = True
-            step_count = max(step_count, len(set(step_matches)))
-        
-        return {
-            'step_section_present': step_section_present,
-            'step_count': step_count,
-            'howto_schema_detected': howto_schema,
-            'ordered_lists_found': len(ordered_lists)
-        }
-        
-    except Exception as e:
-        print(f"[PHASE2] Step detection failed: {e}")
-        return {
-            'step_section_present': False, 'step_count': 0,
-            'howto_schema_detected': False, 'ordered_lists_found': 0
-        }
 
 def calculate_flesch_readability(text) -> dict:
     """Calculate Flesch Reading Ease score with acronym handling (production-level)"""
@@ -768,140 +716,6 @@ def calculate_entity_density(entity_graph, text, word_count, ai_signals=None) ->
             'entity_cap_reached': False
         }
 
-def classify_intent(text) -> dict:
-    """Rule-based intent classification with weighted scoring (production-level)"""
-    try:
-        # === PHASE 2: INTENT CLASSIFICATION - WEIGHTED SCORING ===
-        if not text:
-            return {
-                'intent_distribution': {
-                    'informational': 25, 'commercial': 25,
-                    'local': 25, 'navigational': 25
-                },
-                'confidence': 'low',
-                'total_keywords_found': 0
-            }
-        
-        text_lower = text.lower()
-        words = re.findall(r'\b\w+\b', text_lower)
-        total_words = len(words)
-        
-        # === CRITICAL FIX: Weighted keywords to prevent overfitting ===
-        # Informational keywords with weights
-        informational_keywords = {
-            'what': 3, 'how': 3, 'guide': 4, 'tutorial': 4, 'learn': 3, 'understand': 3,
-            'explain': 3, 'definition': 2, 'meaning': 2, 'example': 2, 'basics': 2,
-            'introduction': 3, 'overview': 2, 'steps': 2, 'process': 2, 'method': 2
-        }
-        
-        # Commercial keywords with weights
-        commercial_keywords = {
-            'best': 4, 'top': 4, 'pricing': 5, 'price': 4, 'cost': 4, 'service': 3,
-            'product': 3, 'buy': 5, 'purchase': 5, 'deal': 4, 'discount': 4, 'offer': 4,
-            'review': 3, 'compare': 4, 'vs': 3, 'versus': 3, 'cheap': 3, 'affordable': 3,
-            'premium': 3, 'professional': 2, 'enterprise': 3, 'business': 2
-        }
-        
-        # Local keywords with weights
-        local_keywords = {
-            'near me': 5, 'nearby': 4, 'location': 3, 'address': 3, 'phone': 3,
-            'hours': 3, 'directions': 4, 'map': 3, 'local': 3, 'store': 3,
-            'office': 3, 'branch': 2, 'in [city]': 2, 'area': 2, 'neighborhood': 2
-        }
-        
-        # Navigational keywords with weights
-        navigational_keywords = {
-            'login': 5, 'signin': 5, 'contact': 4, 'about': 3, 'homepage': 4, 'home': 4,
-            'dashboard': 3, 'account': 4, 'profile': 3, 'settings': 3, 'support': 3,
-            'help': 2, 'faq': 2, 'sitemap': 2, 'search': 2, 'navigate': 2
-        }
-        
-        # Calculate weighted scores
-        def calculate_weighted_score(keywords_dict):
-            score = 0
-            matches = []
-            for keyword, weight in keywords_dict.items():
-                if keyword in text_lower:
-                    # Count occurrences
-                    count = text_lower.count(keyword)
-                    score += weight * count
-                    matches.append(keyword)
-            return score, matches
-        
-        informational_score, info_matches = calculate_weighted_score(informational_keywords)
-        commercial_score, comm_matches = calculate_weighted_score(commercial_keywords)
-        local_score, local_matches = calculate_weighted_score(local_keywords)
-        navigational_score, nav_matches = calculate_weighted_score(navigational_keywords)
-        
-        total_score = informational_score + commercial_score + local_score + navigational_score
-        
-        if total_score == 0:
-            # === CRITICAL FIX: Default distribution if no keywords found ===
-            return {
-                'intent_distribution': {
-                    'informational': 40, 'commercial': 30,
-                    'local': 15, 'navigational': 15
-                },
-                'confidence': 'very_low',
-                'total_keywords_found': 0,
-                'word_count': total_words
-            }
-        
-        # === CRITICAL FIX: Normalize by total words to prevent keyword stuffing ===
-        # Adjust scores based on text length
-        length_factor = min(1.0, 1000 / total_words) if total_words > 0 else 1.0
-        adjusted_total_score = total_score * length_factor
-        
-        # Calculate percentages
-        informational_pct = (informational_score / adjusted_total_score) * 100
-        commercial_pct = (commercial_score / adjusted_total_score) * 100
-        local_pct = (local_score / adjusted_total_score) * 100
-        navigational_pct = (navigational_score / adjusted_total_score) * 100
-        
-        # === CRITICAL FIX: Confidence scoring ===
-        confidence = 'low'
-        if total_score >= 10:
-            confidence = 'high'
-        elif total_score >= 5:
-            confidence = 'medium'
-        
-        # Round percentages and ensure they sum to 100
-        percentages = {
-            'informational': round(informational_pct),
-            'commercial': round(commercial_pct),
-            'local': round(local_pct),
-            'navigational': round(navigational_pct)
-        }
-        
-        # Normalize to ensure sum is 100
-        total_pct = sum(percentages.values())
-        if total_pct != 100:
-            for key in percentages:
-                percentages[key] = round((percentages[key] / total_pct) * 100)
-        
-        return {
-            'intent_distribution': percentages,
-            'confidence': confidence,
-            'total_keywords_found': total_score,
-            'word_count': total_words,
-            'keyword_matches': {
-                'informational': info_matches[:5],
-                'commercial': comm_matches[:5],
-                'local': local_matches[:5],
-                'navigational': nav_matches[:5]
-            }
-        }
-        
-    except Exception as e:
-        print(f"[PHASE2] Intent classification failed: {e}")
-        return {
-            'intent_distribution': {
-                'informational': 25, 'commercial': 25,
-                'local': 25, 'navigational': 25
-            },
-            'confidence': 'error',
-            'total_keywords_found': 0
-        }
 
 def send_progress_update(job_id: str, percentage: int, step: str, message: str, subtext: str = None):
     """Send progress update to Node.js backend - SAFE VERSION"""
@@ -944,6 +758,8 @@ class AIVisibilityJob(BaseModel):
     jobId: str
     projectId: str
     userId: str
+    domain: Optional[str] = ""
+    sourceJobId: Optional[str] = ""
     input_data: Optional[dict] = None  # For source_job_id and other metadata
 
 # ==================== ENTITY GRAPH EXTRACTION ====================
@@ -1236,91 +1052,6 @@ def extract_full_json_ld_data(soup, url) -> dict:
         fixed_entities = None
         unified_graph = None
 
-def extract_complete_entity_properties(entity, all_entities, page_url, canonical_root) -> dict:
-    """Extract complete property map for a single entity with canonical ID normalization (real nodes only)"""
-    from urllib.parse import urlparse, urljoin
-    
-    entity_data = {
-        "@id": entity.get("@id"),
-        "@type": entity.get("@type"),
-        "properties": {},
-        "property_count": 0,
-        "nested_objects": {},
-        "references": {},
-        "data_types": {},
-        "normalized_id": None,
-        "id_format": "unknown"
-    }
-    
-    # Normalize entity ID using canonical root
-    original_id = entity.get("@id")
-    if original_id:
-        normalized_id = normalize_entity_id(original_id, canonical_root)
-        entity_data["normalized_id"] = normalized_id
-        
-        if normalized_id == original_id:
-            entity_data["id_format"] = "already_normalized"
-        elif original_id.startswith('#'):
-            entity_data["id_format"] = "hash_normalized"
-        else:
-            entity_data["id_format"] = "canonical_normalized"
-    
-    # Extract all properties and their details
-    for key, value in entity.items():
-        if key.startswith('@'):
-            continue
-            
-        entity_data["properties"][key] = value
-        entity_data["property_count"] += 1
-        
-        # Analyze data type
-        if isinstance(value, str):
-            entity_data["data_types"][key] = "string"
-            entity_data["data_types"][f"{key}_length"] = len(value)
-        elif isinstance(value, int):
-            entity_data["data_types"][key] = "integer"
-        elif isinstance(value, float):
-            entity_data["data_types"][key] = "float"
-        elif isinstance(value, bool):
-            entity_data["data_types"][key] = "boolean"
-        elif isinstance(value, list):
-            entity_data["data_types"][key] = "array"
-            entity_data["data_types"][f"{key}_length"] = len(value)
-            
-            # Extract nested object references in arrays (keep as nested, don't promote)
-            for i, item in enumerate(value):
-                if isinstance(item, dict) and '@id' in item:
-                    nested_id = item['@id']
-                    # Normalize nested ID using canonical root
-                    normalized_nested_id = normalize_entity_id(nested_id, canonical_root)
-                    entity_data["references"][f"{key}[{i}]"] = {
-                        "original_id": nested_id,
-                        "normalized_id": normalized_nested_id,
-                        "type": item.get('@type')
-                    }
-                        
-        elif isinstance(value, dict):
-            entity_data["data_types"][key] = "object"
-            entity_data["nested_objects"][key] = value
-            
-            # Check for @id references in nested objects (keep as nested)
-            if "@id" in value:
-                nested_id = value["@id"]
-                # Normalize nested ID using canonical root
-                normalized_nested_id = normalize_entity_id(nested_id, canonical_root)
-                entity_data["references"][key] = {
-                    "original_id": nested_id,
-                    "normalized_id": normalized_nested_id,
-                    "type": value.get('@type')
-                }
-            
-            # Extract ALL nested object references recursively (keep as nested)
-            entity_data["nested_object_references"] = extract_nested_object_references(value, canonical_root)
-    
-    # Find references to other entities
-    entity_data["referenced_entities"] = find_referenced_ids(entity)
-    
-    return entity_data
 
 def extract_nested_object_references(obj, canonical_root, depth=0, max_depth=3) -> dict:
     """Recursively extract all nested object references using canonical normalization (keep as nested)"""
@@ -1497,30 +1228,6 @@ def flatten_graph_entities(data) -> list:
     
     return entities
 
-def analyze_single_entity(entity, all_entities) -> dict:
-    """Analyze individual entity for completeness and relationships"""
-    entity_type = entity.get('@type', '')
-    entity_id = entity.get('@id', '')
-    
-    # Find referenced IDs within this entity
-    referenced_ids = find_referenced_ids(entity)
-    
-    # Count how many other entities reference this one
-    referenced_by_count = sum(1 for e in all_entities if entity_id in find_referenced_ids(e))
-    
-    # Check required fields based on type
-    required_fields = get_required_fields_for_type(entity_type)
-    has_required = all(field in entity for field in required_fields)
-    missing_required = [field for field in required_fields if field not in entity]
-    
-    return {
-        "@type": entity_type,
-        "@id": entity_id,
-        "referenced_ids": referenced_ids,
-        "referenced_by_count": referenced_by_count,
-        "has_required_minimum_fields": has_required,
-        "missing_required_fields": missing_required
-    }
 
 def find_referenced_ids(entity) -> list:
     """Find all @id references within an entity"""
@@ -1582,95 +1289,6 @@ def determine_primary_entity_type(entity_types, url) -> str:
     
     return None
 
-def analyze_id_format_quality(entity_ids, canonical_root) -> dict:
-    """Analyze ID format compliance for normalized entities only"""
-    if not entity_ids:
-        return {
-            "id_format_compliance_percentage": 100.0,  # No IDs = perfect compliance
-            "total_ids": 0,
-            "valid_ids": 0,
-            "normalizable_ids": 0,
-            "invalid_ids": 0,
-            "format_breakdown": {
-                "absolute_https": 0,
-                "canonical_normalized": 0,
-                "hash_normalized": 0,
-                "already_normalized": 0,
-                "relative": 0,
-                "http_insecure": 0,
-                "www_mismatch": 0,
-                "invalid_format": 0
-            },
-            "canonical_root_used": canonical_root,
-            "compliance_grade": "A"
-        }
-    
-    format_stats = {
-        "absolute_https": 0,      # Already proper HTTPS URLs
-        "canonical_normalized": 0, # Absolute URLs normalized to canonical
-        "hash_normalized": 0,     # Hash IDs normalized to canonical
-        "already_normalized": 0,  # Already in canonical format
-        "relative": 0,            # Relative paths (should be normalized)
-        "http_insecure": 0,       # HTTP URLs (should be normalized to HTTPS)
-        "www_mismatch": 0,        # WWW inconsistency (should be normalized)
-        "invalid_format": 0       # Completely invalid IDs
-    }
-    
-    # Parse canonical root for consistency checking
-    from urllib.parse import urlparse
-    canonical_parsed = urlparse(canonical_root)
-    canonical_scheme = canonical_parsed.scheme
-    canonical_netloc = canonical_parsed.netloc
-    
-    for entity_id in entity_ids:
-        try:
-            if not entity_id:
-                format_stats["invalid_format"] += 1
-                continue
-                
-            # All IDs should already be normalized by this point
-            if entity_id.startswith('https://'):
-                if entity_id.startswith(canonical_root.split('#')[0]):
-                    format_stats["already_normalized"] += 1
-                else:
-                    # HTTPS but different domain - check for www mismatch
-                    parsed_id = urlparse(entity_id)
-                    if parsed_id.netloc != canonical_netloc:
-                        format_stats["www_mismatch"] += 1
-                    else:
-                        format_stats["canonical_normalized"] += 1
-            elif entity_id.startswith('http://'):
-                format_stats["http_insecure"] += 1
-            elif entity_id.startswith('#'):
-                # Hash-only IDs should have been normalized already
-                format_stats["invalid_format"] += 1
-            else:
-                # Relative paths should have been normalized already
-                format_stats["relative"] += 1
-                
-        except Exception:
-            format_stats["invalid_format"] += 1
-    
-    # Calculate compliance percentage (normalized IDs only)
-    total_ids = len(entity_ids)
-    # Only count properly normalized IDs as valid
-    valid_ids = format_stats["already_normalized"] + format_stats["canonical_normalized"]
-    
-    # Since all IDs should be normalized by now, anything else is invalid
-    invalid_ids = total_ids - valid_ids
-    
-    compliance_percentage = round((valid_ids / total_ids) * 100, 2) if total_ids > 0 else 100.0
-    
-    return {
-        "id_format_compliance_percentage": compliance_percentage,
-        "total_ids": total_ids,
-        "valid_ids": valid_ids,
-        "normalizable_ids": 0,  # All should be normalized already
-        "invalid_ids": invalid_ids,
-        "format_breakdown": format_stats,
-        "canonical_root_used": canonical_root,
-        "compliance_grade": "A" if compliance_percentage >= 95 else "B" if compliance_percentage >= 85 else "C" if compliance_percentage >= 70 else "D"
-    }
 
 def get_required_fields_for_type(entity_type) -> list:
     """Get required fields for common entity types"""
@@ -1695,119 +1313,9 @@ def get_required_fields_for_type(entity_type) -> list:
 
 # ==================== ORGANIZATION SIGNALS ====================
 
-def extract_organization_signals(soup) -> dict:
-    """Extract organization-specific signals with improved name detection"""
-    json_ld_scripts = soup.find_all('script', type='application/ld+json')
-    
-    organization_data = {
-        "organization_present": False,
-        "organization_ids_found": [],
-        "organization_name": "",
-        "organization_legal_name": "",
-        "organization_url": "",
-        "organization_logo_present": False,
-        "organization_sameAs_count": 0,
-        "organization_contactPoint_present": False,
-        "organization_address_present": False,
-        "organization_telephone": "",
-        "organization_email": "",
-        "organization_address": {},
-        "organization_social_profiles": []
-    }
-    
-    try:
-        for script in json_ld_scripts:
-            try:
-                data = json.loads(script.string)
-                entities = flatten_graph_entities(data)
-                
-                for entity in entities:
-                    if entity.get('@type') == 'Organization':
-                        organization_data["organization_present"] = True
-                        
-                        # === CRITICAL FIX: Support both name AND legalName ===
-                        if entity.get('name'):
-                            organization_data["organization_name"] = entity['name']
-                        elif entity.get('legalName'):
-                            organization_data["organization_name"] = entity['legalName']
-                            organization_data["organization_legal_name"] = entity['legalName']
-                        
-                        if entity.get('legalName'):
-                            organization_data["organization_legal_name"] = entity['legalName']
-                        
-                        if entity.get('@id'):
-                            organization_data["organization_ids_found"].append(entity['@id'])
-                        
-                        if entity.get('url'):
-                            organization_data["organization_url"] = entity['url']
-                        
-                        if entity.get('logo'):
-                            organization_data["organization_logo_present"] = True
-                        
-                        if entity.get('sameAs'):
-                            organization_data["organization_sameAs_count"] = len(entity['sameAs'])
-                            organization_data["organization_social_profiles"] = entity['sameAs']
-                        
-                        if entity.get('contactPoint'):
-                            organization_data["organization_contactPoint_present"] = True
-                        
-                        if entity.get('address'):
-                            organization_data["organization_address_present"] = True
-                            organization_data["organization_address"] = entity['address']
-                        
-                        if entity.get('telephone'):
-                            organization_data["organization_telephone"] = entity['telephone']
-                        
-                        if entity.get('email'):
-                            organization_data["organization_email"] = entity['email']
-                        
-            except json.JSONDecodeError:
-                continue
-            except Exception:
-                continue
-                
-    except Exception as e:
-        print(f"[ORGANIZATION_SIGNALS] Extraction error: {e}")
-    
-    return organization_data
 
 # ==================== PAGE TYPE SIGNALS ====================
 
-def extract_page_type_signals(soup, url) -> dict:
-    """Extract page type specific signals with required property maps"""
-    json_ld_scripts = soup.find_all('script', type='application/ld+json')
-    
-    page_signals = {
-        "detected_primary_type": "",
-        "required_properties_present": {}
-    }
-    
-    # Collect all entity types
-    all_types = []
-    for script in json_ld_scripts:
-        try:
-            import json
-            data = json.loads(script.string)
-            entities = flatten_graph_entities(data)
-            
-            for entity in entities:
-                entity_type = entity.get('@type', '')
-                if isinstance(entity_type, list):
-                    all_types.extend(entity_type)
-                else:
-                    all_types.append(entity_type)
-        except:
-            pass
-    
-    # Determine primary type (now with URL parameter)
-    primary_type = determine_primary_entity_type(all_types, url)
-    page_signals["detected_primary_type"] = primary_type
-    
-    # Extract required properties for detected type
-    if primary_type:
-        page_signals["required_properties_present"] = extract_required_properties_map(soup, primary_type)
-    
-    return page_signals
 
 def extract_required_properties_map(soup, entity_type) -> dict:
     """Extract presence map for required properties of a specific type"""
@@ -2030,76 +1538,6 @@ def extract_entity_relationship_graph(soup, parsed_entities) -> dict:
         "unified_graph_structure": True
     }
 
-def extract_relationship_signals(soup) -> dict:
-    """Extract relationship graph signals"""
-    json_ld_scripts = soup.find_all('script', type='application/ld+json')
-    
-    relationship_signals = {
-        "provider_reference_exists": False,
-        "publisher_reference_exists": False,
-        "brand_reference_exists": False,
-        "mainEntityOfPage_exists": False,
-        "breadcrumb_present": False,
-        "imageObject_present": False,
-        "offer_present": False,
-        "orphan_entities_count": 0,
-        "unreferenced_entities_count": 0
-    }
-    
-    all_entities = []
-    all_ids = set()
-    
-    # Collect all entities and IDs
-    for script in json_ld_scripts:
-        try:
-            import json
-            data = json.loads(script.string)
-            entities = flatten_graph_entities(data)
-            all_entities.extend(entities)
-            
-            for entity in entities:
-                if entity.get('@id'):
-                    all_ids.add(entity['@id'])
-                    
-        except:
-            pass
-    
-    # Check for specific relationships
-    for entity in all_entities:
-        # Check for provider/publisher/brand references
-        if entity.get('provider'):
-            relationship_signals["provider_reference_exists"] = True
-        if entity.get('publisher'):
-            relationship_signals["publisher_reference_exists"] = True
-        if entity.get('brand'):
-            relationship_signals["brand_reference_exists"] = True
-        if entity.get('mainEntityOfPage'):
-            relationship_signals["mainEntityOfPage_exists"] = True
-        
-        # Check for specific entity types
-        entity_type = entity.get('@type', '')
-        if isinstance(entity_type, list):
-            entity_type = entity_type[0] if entity_type else ""
-        
-        if entity_type == "BreadcrumbList":
-            relationship_signals["breadcrumb_present"] = True
-        elif entity_type == "ImageObject":
-            relationship_signals["imageObject_present"] = True
-        elif entity_type == "Offer":
-            relationship_signals["offer_present"] = True
-    
-    # Calculate orphan and unreferenced entities
-    referenced_ids = set()
-    for entity in all_entities:
-        referenced_ids.update(find_referenced_ids(entity))
-    
-    orphan_entities = [e for e in all_entities if not e.get('@id')]
-    unreferenced_entities = [e for e in all_entities if e.get('@id') and e['@id'] not in referenced_ids]
-    
-    relationship_signals["orphan_entities_count"] = len(orphan_entities)
-    relationship_signals["unreferenced_entities_count"] = len(unreferenced_entities)
-    
-    return relationship_signals
 
 # ==================== METADATA SIGNALS ====================
 
@@ -2135,34 +1573,6 @@ def normalize_url(url) -> str:
         print(f"[DEBUG] URL parsing failed for '{url}': {e}")
         return url  # Return original, not lowercased
 
-def extract_metadata_signals(soup, url) -> dict:
-    """Extract page metadata signals"""
-    title_tag = soup.find('title')
-    title = title_tag.get_text().strip() if title_tag else ''
-    
-    meta_desc = soup.find('meta', attrs={'name': 'description'})
-    meta_description = meta_desc.get('content', '') if meta_desc else ''
-    
-    # Canonical handling with normalization
-    canonical_links = soup.find_all('link', rel='canonical')
-    canonical_urls = [link.get('href', '') for link in canonical_links if link.get('href')]
-    
-    # Normalize URLs for comparison
-    normalized_page_url = normalize_url(url)
-    normalized_canonical_urls = [normalize_url(canon) for canon in canonical_urls]
-    
-    return {
-        "title_present": bool(title),
-        "title_length": len(title),
-        "meta_description_present": bool(meta_description),
-        "meta_description_length": len(meta_description),
-        "canonical_present": len(canonical_urls) > 0,
-        "canonical_matches_url": any(normalized_canonical == normalized_page_url for normalized_canonical in normalized_canonical_urls),
-        "multiple_canonical_detected": len(canonical_urls) > 1,
-        "canonical_urls": canonical_urls,
-        "normalized_page_url": normalized_page_url,
-        "normalized_canonical_urls": normalized_canonical_urls
-    }
 
 # ==================== IMAGE SIGNALS ====================
 
@@ -2989,284 +2399,9 @@ def extract_complete_breadcrumb_data(soup) -> dict:
 
 # ==================== CONTENT STRUCTURE SIGNALS ====================
 
-def extract_complete_faq_data(soup) -> dict:
-    """Extract complete FAQ dataset with JSON-LD and HTML accordion detection"""
-    faq_data = {
-        "faq_schema_data": [],
-        "html_faq_sections": [],
-        "accordion_faqs": [],
-        "faq_comparison": {}
-    }
-    
-    # Extract FAQ schema data
-    json_ld_scripts = soup.find_all('script', type='application/ld+json')
-    
-    for script in json_ld_scripts:
-        try:
-            import json
-            data = json.loads(script.string)
-            entities = flatten_graph_entities(data)
-            
-            for entity in entities:
-                if entity.get('@type') == 'FAQPage':
-                    main_entity = entity.get('mainEntity', [])
-                    
-                    if isinstance(main_entity, dict):
-                        main_entity = [main_entity]
-                    
-                    for faq_item in main_entity:
-                        if faq_item.get('@type') == 'Question':
-                            question_text = faq_item.get('name', '')
-                            accepted_answer = faq_item.get('acceptedAnswer', {})
-                            
-                            # Handle both single answer and multiple answers
-                            answers = []
-                            if isinstance(accepted_answer, dict):
-                                answer_text = accepted_answer.get('text', '')
-                                answers.append(answer_text)
-                            elif isinstance(accepted_answer, list):
-                                for answer in accepted_answer:
-                                    if isinstance(answer, dict):
-                                        answers.append(answer.get('text', ''))
-                            
-                            # Use the first answer as primary
-                            primary_answer = answers[0] if answers else ''
-                            
-                            faq_data["faq_schema_data"].append({
-                                "question": question_text,
-                                "answer": primary_answer,
-                                "all_answers": answers,
-                                "question_word_count": len(question_text.split()) if question_text else 0,
-                                "answer_word_count": len(primary_answer.split()) if primary_answer else 0,
-                                "has_answer": bool(primary_answer),
-                                "question_length": len(question_text),
-                                "answer_length": len(primary_answer),
-                                "multiple_answers": len(answers) > 1,
-                                "answer_count": len(answers)
-                            })
-        except:
-            continue
-    
-    # Extract HTML accordion FAQs (common pattern)
-    accordion_patterns = [
-        # Common accordion selectors
-        '[data-toggle="collapse"]',
-        '[data-bs-toggle="collapse"]',
-        '.accordion-item',
-        '.faq-item',
-        '.question-answer',
-        '.q-and-a'
-    ]
-    
-    for pattern in accordion_patterns:
-        try:
-            accordion_elements = soup.select(pattern)
-            
-            for accordion in accordion_elements:
-                # Try to find question/answer structure
-                question_elem = accordion.find(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'button'])
-                answer_elem = accordion.find(['div', 'p', 'section'], class_=lambda x: x and ('answer' in str(x).lower() or 'content' in str(x).lower()))
-                
-                if question_elem and not answer_elem:
-                    # Look for next sibling as answer
-                    answer_elem = question_elem.find_next_sibling(['div', 'p', 'section'])
-                
-                if question_elem and answer_elem:
-                    question_text = question_elem.get_text().strip()
-                    answer_text = answer_elem.get_text().strip()
-                    
-                    # Only include if it looks like a Q&A
-                    if ('?' in question_text or 
-                        'what' in question_text.lower() or 
-                        'how' in question_text.lower() or 
-                        'why' in question_text.lower() or
-                        len(question_text.split()) <= 10):  # Short questions are typical
-                        
-                        faq_data["accordion_faqs"].append({
-                            "question": question_text,
-                            "answer": answer_text,
-                            "question_word_count": len(question_text.split()),
-                            "answer_word_count": len(answer_text.split()),
-                            "question_length": len(question_text),
-                            "answer_length": len(answer_text),
-                            "source": "html_accordion",
-                            "selector_pattern": pattern
-                        })
-        except:
-            continue
-    
-    # Extract heading-based FAQ sections (enhanced)
-    faq_headings = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], 
-                                 string=lambda text: text and any(keyword in text.lower() for keyword in ['faq', 'question', 'frequently asked']))
-    
-    for heading in faq_headings:
-        faq_section = {
-            "heading_text": heading.get_text().strip(),
-            "heading_tag": heading.name,
-            "following_content": []
-        }
-        
-        # Get following elements until next heading
-        next_element = heading.find_next_sibling()
-        question_count = 0
-        
-        while next_element and next_element.name not in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-            if next_element.get_text().strip():
-                text = next_element.get_text().strip()
-                
-                # Detect if this is a question-answer pair
-                is_question = ('?' in text or 
-                              any(q in text.lower() for q in ['what', 'how', 'why', 'when', 'where', 'which']) or
-                              (len(text.split()) <= 12 and text.endswith('?')))
-                
-                faq_section["following_content"].append({
-                    "tag": next_element.name,
-                    "text": text,
-                    "word_count": len(text.split()),
-                    "is_question": is_question,
-                    "element_class": next_element.get('class', [])
-                })
-                
-                if is_question:
-                    question_count += 1
-            
-            next_element = next_element.find_next_sibling()
-        
-        if question_count > 0:  # Only include if we found questions
-            faq_section["question_count"] = question_count
-            faq_data["html_faq_sections"].append(faq_section)
-    
-    # Enhanced comparison between schema and HTML FAQs
-    schema_questions = [faq["question"].lower().strip() for faq in faq_data["faq_schema_data"]]
-    accordion_questions = [faq["question"].lower().strip() for faq in faq_data["accordion_faqs"]]
-    html_section_questions = []
-    
-    for section in faq_data["html_faq_sections"]:
-        for content in section["following_content"]:
-            if content.get("is_question"):
-                html_section_questions.append(content["text"].lower().strip())
-    
-    all_html_questions = accordion_questions + html_section_questions
-    
-    # More sophisticated matching (partial matches)
-    def calculate_similarity(str1, str2):
-        """Simple similarity calculation"""
-        words1 = set(str1.split())
-        words2 = set(str2.split())
-        intersection = words1.intersection(words2)
-        union = words1.union(words2)
-        return len(intersection) / len(union) if union else 0
-    
-    exact_matches = set(schema_questions) & set(all_html_questions)
-    partial_matches = []
-    
-    for schema_q in schema_questions:
-        for html_q in all_html_questions:
-            if schema_q not in exact_matches and html_q not in exact_matches:
-                similarity = calculate_similarity(schema_q, html_q)
-                if similarity > 0.7:  # 70% similarity threshold
-                    partial_matches.append((schema_q, html_q, similarity))
-    
-    faq_data["faq_comparison"] = {
-        "schema_question_count": len(faq_data["faq_schema_data"]),
-        "accordion_question_count": len(faq_data["accordion_faqs"]),
-        "html_section_count": len(faq_data["html_faq_sections"]),
-        "total_html_questions": len(all_html_questions),
-        "schema_questions": schema_questions,
-        "accordion_questions": accordion_questions,
-        "html_section_questions": html_section_questions,
-        "exact_matches": len(exact_matches),
-        "partial_matches": len(partial_matches),
-        "partial_match_details": partial_matches[:5],  # Top 5 partial matches
-        "schema_only_questions": len(set(schema_questions) - set(all_html_questions)),
-        "html_only_questions": len(set(all_html_questions) - set(schema_questions)),
-        "total_questions_found": len(schema_questions) + len(all_html_questions),
-        "faq_completeness_score": min(100, (len(exact_matches) + len(partial_matches)) / max(len(schema_questions), 1) * 100)
-    }
-    
-    return faq_data
 
 # ==================== TECHNICAL SIGNALS ====================
 
-def extract_technical_signals(soup) -> dict:
-    """Extract technical validation signals"""
-    json_ld_scripts = soup.find_all('script', type='application/ld+json')
-    
-    technical_signals = {
-        "json_parse_errors_count": 0,
-        "invalid_types_detected": [],
-        "deprecated_properties_detected": [],
-        "multiple_contexts_detected": False
-    }
-    
-    contexts = set()
-    
-    # Verified list of actually deprecated schema.org properties (minimal, conservative)
-    deprecated_properties = {
-        "additionalProperty",  # Deprecated in favor of hasPart
-        "additionalType",     # Deprecated 
-        "album",              # Deprecated in favor of partOfSeries
-        "albumRelease",       # Deprecated
-        "associatedReview",   # Deprecated in favor of review
-        "blogPosts",          # Deprecated in favor of blogPost
-        "bookFormat",         # Deprecated
-        "colleague",          # Deprecated
-        "contentLocation",    # Deprecated in favor of locationCreated
-        "contentReferenceTime", # Deprecated
-        "copyrightYear",      # Deprecated in favor of copyrightYear
-        "dataset",            # Deprecated in favor of datasets
-        "department",         # Deprecated
-        "employee",           # Deprecated in favor of employees
-        "encoding",           # Deprecated in favor of encodingFormat
-        "episodes",           # Deprecated in favor of episode
-        "event",              # Deprecated in favor of events
-        "exifData",           # Deprecated in favor of exifData
-        "followee",           # Deprecated
-        "follows",            # Deprecated
-        "genre",              # Deprecated in favor of about
-        "interactionCount",   # Deprecated
-        "isBasedOnUrl",       # Deprecated in favor of isBasedOn
-        "member",             # Deprecated in favor of members
-        "musicBy",            # Deprecated in favor of musicBy
-        "parent",             # Deprecated
-        "photo",              # Deprecated in favor of image
-        "subEvent",           # Deprecated in favor of subEvent
-        "tracks",             # Deprecated in favor of track
-        "workExample",        # Deprecated
-        "worksFor",           # Deprecated
-    }
-    
-    for script in json_ld_scripts:
-        try:
-            import json
-            data = json.loads(script.string)
-            
-            # Check for multiple contexts (with normalization)
-            if isinstance(data, dict) and '@context' in data:
-                if isinstance(data['@context'], list):
-                    for ctx in data['@context']:
-                        contexts.add(normalize_context(ctx))
-                else:
-                    contexts.add(normalize_context(data['@context']))
-            
-            # Validate entity structure
-            entities = flatten_graph_entities(data)
-            for entity in entities:
-                if not isinstance(entity, dict):
-                    technical_signals["invalid_types_detected"].append("non_dict_entity")
-                
-                # Only flag actually deprecated properties
-                for prop in entity.keys():
-                    if prop in deprecated_properties:
-                        if prop not in technical_signals["deprecated_properties_detected"]:
-                            technical_signals["deprecated_properties_detected"].append(prop)
-                        
-        except Exception as e:
-            technical_signals["json_parse_errors_count"] += 1
-    
-    technical_signals["multiple_contexts_detected"] = len(contexts) > 1
-    
-    return technical_signals
 
 def extract_comprehensive_signals(html: str, url: str) -> dict:
     """Production-grade semantic extraction engine - isolated and stabilized"""
@@ -3613,418 +2748,6 @@ def extract_real_word_count(ai_signals: dict, html: str) -> int:
         print(f"[WORD_COUNT] Error extracting word count: {e}")
         return 1  # Safe fallback
 
-def analyze_single_url(url: str, job: AIVisibilityJob) -> dict:
-    """Analyze a single URL for AI visibility using HTML from database (no HTTP requests)"""
-    try:
-        # Check cancellation before processing each URL
-        if is_job_cancelled(job.jobId):
-            return None
-        
-        # Use projectId from job
-        projectId = job.projectId
-        
-        print(f"[AI_VISIBILITY] Analyzing URL from database: {url}")
-        
-        # === ARCHITECTURE FIX: Read HTML from database instead of HTTP requests ===
-        # Import seo_page_data collection
-        from db import seo_page_data
-        
-        # Find the page in seo_page_data collection using projectId
-        page_data = None
-        if job.projectId and job.projectId != 'null':
-            try:
-                page_data = seo_page_data.find_one({
-                    "projectId": ObjectId(job.projectId),
-                    "url": url,
-                    "extraction_status": "SUCCESS"
-                })
-                print(f"[AI_VISIBILITY] Found page data for {url}: {page_data is not None}")
-            except Exception as db_error:
-                print(f"[AI_VISIBILITY] Database query failed for {url}: {db_error}")
-        
-        if not page_data:
-            return {
-                'projectId': ObjectId(projectId),
-                'ai_jobId': ObjectId(job.jobId),
-                'url': url,
-                'http_status_code': 0,
-                'response_time_ms': 0,
-                'error': 'Page not found in seo_page_data collection',
-                'skipped': True
-            }
-        
-        # Get HTML from database instead of HTTP request
-        html = page_data.get('raw_html', '')
-        if not html:
-            return {
-                'projectId': ObjectId(projectId),
-                'ai_jobId': ObjectId(job.jobId),
-                'url': url,
-                'http_status_code': 0,
-                'response_time_ms': 0,
-                'error': 'No HTML found in database for this URL',
-                'skipped': True
-            }
-        
-        # Check if content is actually HTML (basic check)
-        if not html or ('<!DOCTYPE' not in html and '<html' not in html.lower()):
-            return {
-                'projectId': ObjectId(projectId),
-                'ai_jobId': ObjectId(job.jobId),
-                'url': url,
-                'http_status_code': 200,  # Page exists but content is not HTML
-                'response_time_ms': 0,
-                'error': 'Content is not HTML',
-                'skipped': True
-            }
-        
-        print(f"[AI_VISIBILITY] Using database HTML for {url} ({len(html)} chars)")
-        
-        # Set status_code and response_time based on database data
-        status_code = page_data.get('status_code', 200)
-        response_time_ms = page_data.get('response_time_ms', 0)
-        
-        # === PART 3: PERFORMANCE GUARDS ===
-        # Check HTML size (already exists in fetcher, but double-check)
-        html_size = len(html.encode('utf-8'))
-        MAX_HTML_SIZE = 5 * 1024 * 1024  # 5MB
-        
-        if html_size > MAX_HTML_SIZE:
-            print(f"[PERFORMANCE_GUARD] HTML too large: {html_size} bytes > {MAX_HTML_SIZE} bytes")
-            return {
-                'projectId': ObjectId(projectId),
-                'ai_jobId': ObjectId(job.jobId),
-                'url': url,
-                'http_status_code': status_code,
-                'response_time_ms': response_time_ms,
-                'error': f'HTML too large: {html_size} bytes',
-                'performance_guard_triggered': 'html_size'
-            }
-        
-        # === CRITICAL FIX: Parse HTML to create soup object ===
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # DOM node cap guard
-        MAX_DOM_NODES = 15000
-        dom_nodes = len(soup.find_all())
-        
-        if dom_nodes > MAX_DOM_NODES:
-            print(f"[PERFORMANCE_GUARD] Too many DOM nodes: {dom_nodes} > {MAX_DOM_NODES}")
-            soup.decompose()
-            return {
-                'projectId': ObjectId(projectId),
-                'ai_jobId': ObjectId(job.jobId),
-                'url': url,
-                'http_status_code': status_code,
-                'response_time_ms': response_time_ms,
-                'error': f'Too many DOM nodes: {dom_nodes}',
-                'performance_guard_triggered': 'dom_nodes'
-            }
-        
-        print(f"[PERFORMANCE_GUARD] DOM nodes: {dom_nodes} (within limit {MAX_DOM_NODES})")
-        
-        # Extract comprehensive AI visibility signals
-        ai_signals = extract_comprehensive_signals(html, url)
-        
-        # Calculate entity density and mentions AFTER parsed_entities is populated
-        # Use parsed_entities from ai_signals for accurate entity counting
-        parsed_entities = ai_signals.get('parsed_entities', [])
-        entity_graph = ai_signals.get('unified_entity_graph', {})
-        
-        # Get title and meta description for broader entity search
-        page_title = soup.title.string if soup.title else ""
-        meta_desc_tag = soup.find('meta', attrs={'name': 'description'})
-        meta_desc = meta_desc_tag.get('content', '') if meta_desc_tag else ""
-        
-        # Use main_text for entity density calculation (will be available later)
-        main_text = ""  # Placeholder, will be updated after main_content extraction
-        expanded_text = f"{page_title} {meta_desc} {main_text}"
-        entity_metrics = calculate_entity_density(entity_graph, expanded_text, 0, ai_signals)  # word_count will be updated later
-        
-        print(f"[ENTITY_METRICS_FIX] Calculated entity_metrics with {len(parsed_entities)} parsed_entities")
-        print(f"[ENTITY_METRICS_FIX] Entity count: {entity_metrics.get('entity_count', 0)}")
-        print(f"[ENTITY_METRICS_FIX] Entity mentions: {entity_metrics.get('primary_entity_mentions_in_text', 0)}")
-        
-        # === PHASE 2: AI-READY EXTRACTION LAYER ===
-        # Extract main content for accurate analysis
-        main_content = extract_main_content(soup, url)
-        
-        # === CRITICAL FIX: Handle None main_content gracefully ===
-        if not main_content:
-            print("[PHASE2] Main content extraction returned None - using fallback")
-            main_content = {
-                'main_content_text': '',
-                'content_extraction_method': 'failed',
-                'nav_keyword_counts': {},
-                'isolation_warnings': ['Main content extraction failed']
-            }
-        
-        main_text = main_content.get('main_content_text', '')
-        
-        # Extract heading hierarchy
-        heading_metrics = extract_heading_hierarchy(soup)
-        
-        # Extract paragraph structure metrics
-        paragraph_metrics = extract_paragraph_metrics(main_text)
-        
-        # Extract readability metrics
-        readability_metrics = calculate_flesch_readability(main_text)
-        
-        # Detect FAQ content
-        faq_metrics = detect_faq_content(soup, main_text)
-        
-        # Calculate real word count early to use in metrics
-        word_count = extract_real_word_count(ai_signals, html)
-        
-        # Recalculate entity_metrics with actual main_text and word_count
-        # FIX: Use full visible text for entity mention counting, not just main_content
-        
-        # Remove script, style, and other non-content elements (same as word count)
-        for element in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
-            element.decompose()
-        
-        # Get visible text (same as word count)
-        visible_text = soup.get_text(separator=' ', strip=True)
-        
-        # Clean up text (same as word count)
-        import re
-        cleaned_text = re.sub(r'\s+', ' ', visible_text)
-        
-        expanded_text = f"{page_title} {meta_desc} {cleaned_text}"
-        print(f"[ENTITY_FIX] Using full visible text for mention counting: {len(cleaned_text)} chars")
-        
-        entity_metrics = calculate_entity_density(entity_graph, expanded_text, word_count, ai_signals)
-        
-        print(f"[ENTITY_METRICS_RECALC] Recalculated entity_metrics with word_count={word_count}")
-        print(f"[ENTITY_METRICS_RECALC] Final entity count: {entity_metrics.get('entity_count', 0)}")
-        print(f"[ENTITY_METRICS_RECALC] Final entity mentions: {entity_metrics.get('primary_entity_mentions_in_text', 0)}")
-        
-        # Extract readability metrics
-        readability_metrics = calculate_flesch_readability(main_text)
-        
-        # SURGICAL FIX: Calculate paragraph count from full DOM for consistency
-        # Get all paragraph elements from the entire page, not just main_content
-        all_paragraphs = soup.find_all('p')
-        shared_paragraph_count = len(all_paragraphs)
-        
-        print("=== PARAGRAPH COUNT DEBUG - PIPELINE B ===")
-        print(f"method used: soup.find_all('p') - full DOM <p> tags")
-        print(f"raw paragraph elements found: {len(all_paragraphs)}")
-        print(f"paragraph_count assigned: {shared_paragraph_count}")
-        print("=== END PIPELINE B ===")
-        print(f"[PARAGRAPH_FIX] Using full DOM paragraph count: {shared_paragraph_count}")
-        
-        # Create content metrics with correct word count as single source of truth
-        content_metrics = {
-            'word_count': word_count,  # BUG FIX 2: Single source of truth
-            'readability_score': readability_metrics.get('flesch_score', 0),
-            'paragraph_count': shared_paragraph_count,  # Use shared DOM-based count
-            'avg_paragraph_length': paragraph_metrics.get('avg_paragraph_length', 0)
-        }
-        
-        # Detect FAQ content
-        faq_metrics = detect_faq_content(soup, main_text)
-        
-        # Detect step-by-step content
-        step_metrics = detect_step_by_step(soup, main_text)
-        
-        # Calculate readability score
-        readability_metrics = calculate_flesch_readability(main_text)
-        
-        # Classify intent
-        intent_metrics = classify_intent(main_text)
-        
-        # === PHASE 2 FINAL OUTPUT ===
-        # Combine all Phase 2 metrics
-        ai_signals.update({
-            'content_metrics': {
-                'word_count': word_count,
-                'paragraph_count': shared_paragraph_count,  # Use shared DOM-based count
-                'avg_sentence_length': paragraph_metrics.get('avg_sentence_length', 0),
-                'readability_score': readability_metrics.get('flesch_score', 0),
-                'short_paragraph_ratio': paragraph_metrics.get('short_paragraph_ratio', 0),
-                'long_paragraph_ratio': paragraph_metrics.get('long_paragraph_ratio', 0),
-                'avg_paragraph_length': paragraph_metrics.get('avg_paragraph_length', 0)
-            },
-            'heading_metrics': heading_metrics,
-            'faq_metrics': faq_metrics,
-            'faq_data': faq_metrics.get('faq_data', []),  # === CRITICAL FIX: Add FAQ data to output ===
-            'step_metrics': step_metrics,
-            'entity_metrics': entity_metrics,
-            'intent_metrics': intent_metrics,
-            'main_content': {
-                'extraction_method': main_content.get('content_extraction_method', 'unknown'),
-                # SURGICAL FIX: Remove content_word_count field entirely
-                # 'content_word_count': main_word_count
-            },
-            # === CRITICAL FIX: Quality flags for debugging ===
-            'quality_flags': {
-                'low_word_count': word_count < 300,  # BUG FIX 2: placeholder, recalculated after top-level word_count is set
-                'weak_heading_structure': heading_metrics.get('heading_structure_score_input', 0) < 50,
-                'no_main_content_detected': main_content.get('content_extraction_method') == 'failed' or content_metrics['word_count'] < 100,
-                'malformed_structure': not heading_metrics.get('heading_sequence_valid', False),
-                'insufficient_text_for_readability': readability_metrics.get('word_count', 0) < 100,
-                'low_entity_density': entity_metrics.get('entity_per_1000_words', 0) < 2,  # === CRITICAL FIX: Correct threshold (was 5, too aggressive) ===
-                'no_faq_detected': not faq_metrics.get('faq_detected', False),
-                'no_step_content': not step_metrics.get('step_section_present', False),
-                'low_intent_confidence': intent_metrics.get('confidence') == 'low'
-            }
-        })
-        
-        # === CRITICAL FIX: Ensure deterministic output ===
-        # Round all floating point numbers consistently
-        def round_nested_floats(obj):
-            if isinstance(obj, dict):
-                return {k: round_nested_floats(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [round_nested_floats(item) for item in obj]
-            elif isinstance(obj, float):
-                return round(obj, 3)  # Consistent 3 decimal places
-            else:
-                return obj
-        
-        ai_signals = round_nested_floats(ai_signals)
-        
-        # 🔥 PHASE 1: REAL WORD COUNT EXTRACTION
-        ai_signals["word_count"] = word_count
-        
-        # === PHASE 1 SAFETY ADDITION ===
-        # Safe progress update - don't let progress failures break job
-        try:
-            send_progress_update(
-                job.jobId, 
-                50, 
-                "ANALYZING", 
-                f"Processed {url}", 
-                f"Found {word_count} words"
-            )
-        except Exception as progress_error:
-            print(f"[SAFETY] Progress update failed | jobId={job.jobId} | error={progress_error}")
-            # Continue with job - don't fail due to progress issues
-        
-        # === PIPELINE IMPROVEMENT: Explicit field mapping to prevent conflicts ===
-        # Extract technical signals to top-level fields for backward compatibility
-        enhanced_technical = ai_signals.get('enhanced_technical_signals', {})
-        if enhanced_technical:
-            navigation_detection = enhanced_technical.get('navigation_detection', {})
-            page_speed_indicators = enhanced_technical.get('page_speed_indicators', {})
-            
-            # BUG FIX 2: Map nested fields to top-level output fields
-            ai_signals.update({
-                'has_navigation': bool(navigation_detection.get('has_navigation', False)),
-                'has_header': bool(navigation_detection.get('has_header', False)),
-                'has_footer': bool(navigation_detection.get('has_footer', False)),
-                'lazy_loading_detected': bool(page_speed_indicators.get('lazy_loading', False))
-            })
-            
-            print(f"[MAPPED_FIELD] has_navigation: {navigation_detection.get('has_navigation', False)}")
-            print(f"[MAPPED_FIELD] has_header: {navigation_detection.get('has_header', False)}")
-            print(f"[MAPPED_FIELD] has_footer: {navigation_detection.get('has_footer', False)}")
-            print(f"[MAPPED_FIELD] lazy_loading_detected: {page_speed_indicators.get('lazy_loading', False)}")
-        
-        # Extract content metrics to ensure correct field usage
-        content_metrics = ai_signals.get('content_metrics', {})
-        if content_metrics:
-            # SURGICAL FIX: Remove content_word_count mapping - this field is being removed entirely
-            # ai_signals['content_word_count'] = content_metrics.get('word_count', 0)
-            print(f"[MAPPED_FIELD] content_word_count: REMOVED (using word_count instead)")
-        
-        # Extract entity metrics
-        entity_metrics = ai_signals.get('entity_metrics', {})
-        if entity_metrics:
-            # Ensure entity mentions are properly mapped
-            ai_signals['primary_entity_mentions_in_text'] = entity_metrics.get('primary_entity_mentions_in_text', 0)
-            print(f"[MAPPED_FIELD] primary_entity_mentions_in_text: {entity_metrics.get('primary_entity_mentions_in_text', 0)}")
-        
-        # Extract author signals
-        author_signals = ai_signals.get('author_signals', {})
-        if author_signals:
-            # BUG FIX 5: Ensure author detection is properly mapped
-            ai_signals['author_detected'] = bool(author_signals.get('author_detected', False))
-            print(f"[MAPPED_FIELD] author_detected: {author_signals.get('author_detected', False)}")
-        
-        # Extract quality flags — BUG FIX 2: Use top-level word_count as single source of truth
-        quality_flags = ai_signals.get('quality_flags', {})
-        if quality_flags:
-            quality_flags['low_word_count'] = word_count < 300
-            ai_signals['quality_flags'] = quality_flags
-            ai_signals['low_word_count'] = bool(quality_flags['low_word_count'])
-            print(f"[MAPPED_FIELD] low_word_count: {quality_flags['low_word_count']} (word_count={word_count})")
-        
-        print(f"[FINAL_OUTPUT] Preparing final result with explicit field mapping")
-        
-        # === SURGICAL FIX: Paragraph Count Conflict ===
-        # Overwrite content_metrics.paragraph_count with enhanced_extraction_v2 value
-        correct_paragraph_count = ai_signals.get("enhanced_extraction_v2", {}) \
-            .get("page_metadata", {}) \
-            .get("content_metrics", {}) \
-            .get("paragraph_count", None)
-        
-        if correct_paragraph_count is not None:
-            # Update content_metrics.paragraph_count with the correct value
-            content_metrics = ai_signals.get('content_metrics', {})
-            if content_metrics:
-                content_metrics['paragraph_count'] = correct_paragraph_count
-                ai_signals['content_metrics'] = content_metrics
-                print(f"[PARAGRAPH_FIX] Overwrote content_metrics.paragraph_count with correct value: {correct_paragraph_count}")
-        
-        # === FINAL VALIDATION: Ensure all boolean fields are properly set ===
-        boolean_fields = [
-            'has_navigation', 'has_header', 'has_footer', 'lazy_loading_detected',
-            'author_detected', 'low_word_count'
-        ]
-        
-        for field in boolean_fields:
-            if field in ai_signals:
-                ai_signals[field] = bool(ai_signals[field])
-                print(f"[FINAL_OUTPUT] {field}: {ai_signals[field]}")
-        
-        # === CANONICAL SIGNAL REGISTRY ===
-        # The single source of truth for the JSON output.
-        # Ensure no nested spread logic overwrites these fields.
-        CANONICAL_SIGNALS = [
-            "word_count",
-            "author_detected",
-            "has_navigation",
-            "has_header",
-            "has_footer",
-            "lazy_loading_detected",
-            "primary_entity_mentions_in_text"
-        ]
-        
-        final_output = {
-            'projectId': ObjectId(projectId),  # 🧠 Always use AI project ID for output
-            'ai_jobId': ObjectId(job.jobId),
-            'url': url,
-            'http_status_code': status_code,
-            'response_time_ms': response_time_ms,
-            'extraction_timestamp': datetime.utcnow()
-        }
-        
-        # Spread base signals to ensure all nested structures are still preserved 
-        # (as expected by DB schema, like quality_flags, content_metrics, etc)
-        for key, value in ai_signals.items():
-            if key not in CANONICAL_SIGNALS:
-               final_output[key] = value
-        
-        # Explicitly map CANONICAL_SIGNALS to guarantee they are the single source of truth
-        for signal in CANONICAL_SIGNALS:
-            if signal in ai_signals:
-                final_output[signal] = ai_signals[signal]
-        
-        return final_output
-        
-    except Exception as e:
-        print(f"Error analyzing {url}: {e}")
-        return {
-            'projectId': ObjectId(projectId),  # 🧠 Always use AI project ID for output
-            'ai_jobId': ObjectId(job.jobId),
-            'url': url,
-            'http_status_code': 0,
-            'response_time_ms': 0,
-            'error': str(e)
-        }
-
 def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob) -> dict:
     """Optimized version: Analyze a single URL using provided HTML (no database fetch)"""
     try:
@@ -4118,16 +2841,11 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob) 
         page_title = soup.title.string if soup.title else ""
         meta_desc_tag = soup.find('meta', attrs={'name': 'description'})
         meta_desc = meta_desc_tag.get('content', '') if meta_desc_tag else ""
-        
-        # Use main_text for entity density calculation (will be available later)
-        main_text = ""  # Placeholder, will be updated after main_content extraction
-        expanded_text = f"{page_title} {meta_desc} {main_text}"
-        entity_metrics = calculate_entity_density(entity_graph, expanded_text, 0, ai_signals)  # word_count will be updated later
-        
-        print(f"[ENTITY_METRICS_FIX] Calculated entity_metrics with {len(parsed_entities)} parsed_entities")
-        print(f"[ENTITY_METRICS_FIX] Entity count: {entity_metrics.get('entity_count', 0)}")
-        print(f"[ENTITY_METRICS_FIX] Entity mentions: {entity_metrics.get('primary_entity_mentions_in_text', 0)}")
-        
+
+        # NOTE: entity_metrics is computed ONCE below (after word_count is known).
+        # The previous placeholder pass (word_count=0, immediately overwritten) was
+        # removed as part of the extract-once cleanup.
+
         # === PHASE 2: AI-READY EXTRACTION LAYER ===
         # Extract main content for accurate analysis
         main_content = extract_main_content(soup, url)
@@ -4161,42 +2879,38 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob) 
         
         # Recalculate entity_metrics with actual main_text and word_count
         # FIX: Use full visible text for entity mention counting, not just main_content
-        
-        # Remove script, style, and other non-content elements (same as word count)
-        for element in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
+        #
+        # ROOT-CAUSE FIX: operate on a CLONE so the shared `soup` is never mutated.
+        # The previous code decomposed nav/footer/header/aside on the shared tree,
+        # corrupting every downstream extractor (fake nav/footer/link issues,
+        # paragraph mismatches). The master `soup` must stay immutable.
+        import copy as _copy
+        work_soup = _copy.copy(soup)
+        for element in work_soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
             element.decompose()
-        
-        # Get visible text (same as word count)
-        visible_text = soup.get_text(separator=' ', strip=True)
-        
+
+        # Get visible text (same as word count) from the CLONE
+        visible_text = work_soup.get_text(separator=' ', strip=True)
+
         # Clean up text (same as word count)
         import re
         cleaned_text = re.sub(r'\s+', ' ', visible_text)
-        
+
         expanded_text = f"{page_title} {meta_desc} {cleaned_text}"
         print(f"[ENTITY_FIX] Using full visible text for mention counting: {len(cleaned_text)} chars")
-        
+
         entity_metrics = calculate_entity_density(entity_graph, expanded_text, word_count, ai_signals)
-        
-        print(f"[ENTITY_METRICS_RECALC] Recalculated entity_metrics with word_count={word_count}")
-        print(f"[ENTITY_METRICS_RECALC] Final entity count: {entity_metrics.get('entity_count', 0)}")
-        print(f"[ENTITY_METRICS_RECALC] Final entity mentions: {entity_metrics.get('primary_entity_mentions_in_text', 0)}")
-        
-        # Extract readability metrics
-        readability_metrics = calculate_flesch_readability(main_text)
-        
-        # SURGICAL FIX: Calculate paragraph count from full DOM for consistency
-        # Get all paragraph elements from the entire page, not just main_content
+
+        print(f"[ENTITY_METRICS_RECALC] entity_metrics with word_count={word_count} | count={entity_metrics.get('entity_count', 0)} | mentions={entity_metrics.get('primary_entity_mentions_in_text', 0)}")
+
+        # readability_metrics already computed once above (extract-once); no recompute.
+
+        # Paragraph count from the immutable master tree (nav/footer still intact;
+        # the normalized layer below is the authoritative paragraph source).
         all_paragraphs = soup.find_all('p')
         shared_paragraph_count = len(all_paragraphs)
-        
-        print("=== PARAGRAPH COUNT DEBUG - PIPELINE B ===")
-        print(f"method used: soup.find_all('p') - full DOM <p> tags")
-        print(f"raw paragraph elements found: {len(all_paragraphs)}")
-        print(f"paragraph_count assigned: {shared_paragraph_count}")
-        print("=== END PIPELINE B ===")
-        print(f"[PARAGRAPH_FIX] Using full DOM paragraph count: {shared_paragraph_count}")
-        
+        print(f"[PARAGRAPH] Master-DOM <p> count: {shared_paragraph_count}")
+
         # === CRITICAL FIX: Update ai_signals with recalculated metrics ===
         # This ensures the final output has consistent values
         ai_signals.update({
@@ -4270,9 +2984,29 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob) 
         for signal in CANONICAL_SIGNALS:
             if signal in ai_signals:
                 final_output[signal] = ai_signals[signal]
-        
+
+        # === NORMALIZED EXTRACTION (single source of truth) ===
+        # Authoritative layer: parsed once on an immutable DOM with semantic
+        # validators. Its legacy aliases OVERRIDE the buggy legacy metrics so the
+        # score engine and issue engine consume correct values. The canonical
+        # nested signals are persisted under `normalized_signals`.
+        if _NORMALIZED_AVAILABLE:
+            try:
+                norm = extract_normalized_signals(raw_html, url, status_code, response_time_ms)
+                norm_doc = norm.to_dict()
+                final_output["normalized_signals"] = norm_doc["normalized_signals"]
+                final_output["extraction_version"] = norm_doc["extraction_version"]
+                if norm_doc.get("extraction_warnings"):
+                    final_output["extraction_warnings"] = norm_doc["extraction_warnings"]
+                # Override rule-consumed metrics with the correct normalized values.
+                for alias_key, alias_val in norm.to_legacy_aliases().items():
+                    final_output[alias_key] = alias_val
+                print(f"[NORMALIZED] Applied normalized signals (v{norm_doc['extraction_version']}) for {url}")
+            except Exception as norm_exc:
+                print(f"[NORMALIZED] extraction failed, keeping legacy values for {url}: {norm_exc}")
+
         return final_output
-        
+
     except Exception as e:
         print(f"Error analyzing {url}: {e}")
         return {
@@ -4289,13 +3023,6 @@ def analyze_single_url_with_html(url: str, raw_html: str, job: AIVisibilityJob) 
 # Use time-based timeout instead of signal.alarm for cross-platform compatibility
 JOB_TIMEOUT_SECONDS = 60
 
-def check_job_timeout(start_time: datetime, job_id: str) -> bool:
-    """Check if job has exceeded timeout using time comparison"""
-    elapsed = (datetime.utcnow() - start_time).total_seconds()
-    if elapsed > JOB_TIMEOUT_SECONDS:
-        print(f"[SAFETY] Job timeout exceeded | jobId={job_id} | elapsed={elapsed}s")
-        return True
-    return False
 
 def execute_ai_visibility(job: AIVisibilityJob):
     """Execute AI visibility analysis - SAFE VERSION"""
@@ -4373,6 +3100,25 @@ def execute_ai_visibility(job: AIVisibilityJob):
             # Safety check
             if not pages:
                 print(f"[AI] No scraped pages found in seo_page_data - aborting AI visibility")
+                # Notify Node.js of completion with 0 pages to prevent pipeline hanging
+                try:
+                    node_backend_url = os.environ.get("NODE_BACKEND_URL")
+                    if node_backend_url:
+                        node_url = f"{node_backend_url}/api/jobs/{job.jobId}/complete"
+                        callback_payload = {
+                            "stats": {
+                                "pages_processed": 0,
+                                "successful_pages": 0,
+                                "failed_pages": 0,
+                                "duration_ms": 0
+                            },
+                            "result_data": {"pages_processed": 0}
+                        }
+                        requests.post(node_url, json=callback_payload, timeout=10)
+                        print(f"✅ Notified Node.js of early abort completion due to 0 pages")
+                except Exception as notify_error:
+                    print(f"⚠️ Failed to notify Node.js of early abort: {notify_error}")
+                
                 return {
                     "status": "no_pages",
                     "jobId": job.jobId,
@@ -4386,15 +3132,49 @@ def execute_ai_visibility(job: AIVisibilityJob):
             print(f"[AI_VISIBILITY] Analyzing pages: {len(pages)}")
             print(f"[AI_VISIBILITY] Using HTML from Page Scraper data - NO HTTP REQUESTS")
             print(f"[AI_VISIBILITY] Pages loaded from seo_page_data: {len(pages)}")
-            
+
+            # ── V2 PIPELINE (parallel thread) ─────────────────────────────────
+            _v2_thread = None
+            try:
+                import threading
+                from scraper.workers.ai_v2.pipeline import run_v2_pipeline
+                from scraper.workers.ai_v2.domain_report_adapter import build_v2_domain_report
+
+                _v2_pages = list(pages)  # copy the list; dicts inside are safe (enriched as copies)
+
+                def _run_v2_pipeline(_pages=_v2_pages, _project_id=job.projectId, _job_id=job.jobId):
+                    try:
+                        _domain_report = build_v2_domain_report(_project_id)
+                        run_v2_pipeline(
+                            project_id=_project_id,
+                            job_id=_job_id,
+                            page_docs=_pages,
+                            domain_report=_domain_report,
+                        )
+                    except Exception as _exc:
+                        import traceback
+                        print(f"[V2] Pipeline error (non-fatal): {_exc}")
+                        traceback.print_exc()
+
+                _v2_thread = threading.Thread(
+                    target=_run_v2_pipeline,
+                    name=f"v2-pipeline-{job.jobId}",
+                    daemon=False,
+                )
+                _v2_thread.start()
+                print(f"[V2] Pipeline thread started | jobId={job.jobId} | pages={len(_v2_pages)}")
+            except Exception as _v2_start_exc:
+                print(f"[V2] Could not start pipeline thread (non-fatal): {_v2_start_exc}")
+            # ── end V2 PIPELINE ───────────────────────────────────────────────
+
             all_results = []
             successful_pages = 0
             failed_pages = 0
-            
+
             # === FIX: Use deterministic progress calculation ===
             total_pages = len(pages)
             print(f"[AI_VISIBILITY] Total pages to analyze: {total_pages}")
-            
+
             with ThreadPoolExecutor(max_workers=4) as executor:
                 # Submit analysis tasks for each page from seo_page_data
                 futures = []
@@ -4465,7 +3245,14 @@ def execute_ai_visibility(job: AIVisibilityJob):
                 print(f"[WORKER] AI visibility upsert completed | total={len(all_results)} | new={upserted_count} | updated={len(all_results) - upserted_count}")
             else:
                 print("[WORKER] No AI visibility results to store")
-            
+
+            # Wait for V2 pipeline — it runs concurrently with V1's ThreadPoolExecutor
+            # above and should finish around the same time. Cap wait at 5 minutes.
+            if _v2_thread is not None:
+                _v2_thread.join(timeout=300)
+                if _v2_thread.is_alive():
+                    print(f"[V2] Thread still running after 5min timeout — proceeding")
+
             # Calculate duration
             end_time = datetime.utcnow()
             duration_ms = int((end_time - start_time).total_seconds() * 1000)
@@ -5354,7 +4141,7 @@ def check_ai_crawler_access(url: str) -> Dict[str, Any]:
             return {"accessible": False, "blocked_crawlers": []}
         
         content = response.text
-        ai_crawlers = ['GPTBot', 'PerplexityBot', 'ChatGPTUser', 'Google-Extended', 'Claude-Web']
+        ai_crawlers = ['GPTBot', 'PerplexityBot', 'ChatGPTUser', 'Google-Extended', 'Claude-Web', 'ClaudeBot', 'anthropic-ai']
         blocked_crawlers = []
         
         lines = content.split('\n')
@@ -5491,54 +4278,8 @@ def extract_enhanced_technical_signals(soup, url) -> dict:
 
 # ==================== PERFORMANCE OPTIMIZATION ====================
 
-def safe_extract_text(element, max_length: int = 500) -> str:
-    """Safely extract text with length limits"""
-    if not element:
-        return ""
-    
-    try:
-        text = element.get_text(strip=True)
-        return text[:max_length] if text else ""
-    except Exception:
-        return ""
 
-def safe_extract_attr(element, attr: str, default: str = "") -> str:
-    """Safely extract attribute with fallback"""
-    if not element:
-        return default
-    
-    try:
-        return element.get(attr, default) or default
-    except Exception:
-        return default
 
-def optimized_extraction_pipeline(html: str, url: str) -> dict:
-    """Memory-optimized extraction with early termination"""
-    
-    # Limit HTML size to prevent memory issues
-    max_html_size = 500_000  # 500KB limit
-    if len(html) > max_html_size:
-        html = html[:max_html_size]
-        print(f"[PERFORMANCE] HTML truncated to {max_html_size} characters")
-    
-    # Single soup creation with lxml parser
-    soup = BeautifulSoup(html, 'lxml')
-    
-    # Batch extraction to minimize DOM traversals
-    extraction_results = {}
-    
-    # Extract all JSON-LD in one pass
-    json_ld_scripts = soup.find_all('script', type='application/ld+json')
-    extraction_results['structured_data'] = process_json_ld_batch(json_ld_scripts)
-    
-    # Extract metadata in one pass
-    extraction_results['metadata'] = extract_metadata_batch(soup, url)
-    
-    # Content analysis with text reuse
-    main_text = soup.get_text()
-    extraction_results['content_analysis'] = analyze_content_batch(soup, main_text)
-    
-    return extraction_results
 
 def process_json_ld_batch(json_ld_scripts) -> dict:
     """Process all JSON-LD scripts in batch"""

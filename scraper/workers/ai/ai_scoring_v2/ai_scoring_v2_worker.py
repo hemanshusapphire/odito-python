@@ -20,15 +20,15 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 # Import database connections
 try:
-    from db import seo_ai_visibility, seo_ai_page_scores, seo_ai_visibility_project, seo_ai_visibility_issues, seoprojects
+    from db import seo_ai_visibility, seo_ai_page_scores, seo_ai_visibility_project, seo_ai_visibility_issues, seoprojects, domain_technical_reports
 except ImportError as e:
     logging.warning(f"Database import failed: {e}")
-    # Fallback for testing
     seo_ai_visibility = None
     seo_ai_page_scores = None
     seo_ai_visibility_project = None
     seo_ai_visibility_issues = None
     seoprojects = None
+    domain_technical_reports = None
 
 # Import utilities
 try:
@@ -76,6 +76,8 @@ from scraper.workers.ai.ai_scoring_v2.categories.llm_readiness import register_l
 from scraper.workers.ai.ai_scoring_v2.categories.aeo_score import register_aeo_score_rules
 from scraper.workers.ai.ai_scoring_v2.categories.topical_authority import register_topical_authority_rules
 from scraper.workers.ai.ai_scoring_v2.categories.voice_intent import register_voice_intent_rules
+from scraper.workers.ai.ai_scoring_v2.categories.ai_accessibility import register_ai_accessibility_rules
+from scraper.workers.ai.ai_scoring_v2.issue_engine import build_issues, store_issues_bulk
 
 # Global registry reference for issue validation
 _global_rule_registry = None
@@ -123,7 +125,8 @@ def initialize_scoring_engine() -> ScoringEngine:
             ("llm_readiness", register_llm_readiness_rules),
             ("aeo_score", register_aeo_score_rules),
             ("topical_authority", register_topical_authority_rules),
-            ("voice_intent", register_voice_intent_rules)
+            ("voice_intent", register_voice_intent_rules),
+            ("ai_accessibility", register_ai_accessibility_rules),
         ]
         
         for category_name, register_fn in category_registrations:
@@ -282,6 +285,51 @@ def fetch_pages_for_scoring(project_id: str, project_field: str) -> List[Dict[st
         logger.error(f"[FETCH] Error fetching pages for scoring: {e}")
         raise
 
+def fetch_domain_signals(project_id: str) -> Dict[str, Any]:
+    """
+    Fetch aiCrawlerSignals, llmsTxt, and robotsExists from domain_technical_reports.
+
+    Returns an empty dict when the Technical Domain Worker has not yet run for
+    this project (domain signals are optional — scoring proceeds with 30/100
+    on all ai_accessibility rules when absent).
+    """
+    try:
+        if domain_technical_reports is None:
+            return {}
+        doc = domain_technical_reports.find_one(
+            {"projectId": ObjectId(project_id)},
+            {"aiCrawlerSignals": 1, "llmsTxt": 1, "robotsExists": 1, "_id": 0},
+        )
+        if not doc:
+            return {}
+        return {
+            "aiCrawlerSignals": doc.get("aiCrawlerSignals") or {},
+            "llmsTxt":          doc.get("llmsTxt") or {},
+            "robotsExists":     doc.get("robotsExists"),  # None when field absent
+        }
+    except Exception as e:
+        logger.warning(f"[WORKER] Failed to fetch domain signals for {project_id}: {e}")
+        return {}
+
+
+def apply_llms_bonus(category_scores: Dict[str, float], domain_signals: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Apply llms.txt bonus to the ai_accessibility category score.
+
+    llms.txt is an experimental signal — treated as a bonus only (0 penalty
+    when absent, +5 when present/invalid, +10 when present and valid).
+    """
+    if "ai_accessibility" not in category_scores:
+        return category_scores
+    llms = domain_signals.get("llmsTxt", {})
+    if not llms.get("exists"):
+        return category_scores
+    bonus = 10.0 if llms.get("valid") else 5.0
+    scores = dict(category_scores)
+    scores["ai_accessibility"] = min(100.0, scores["ai_accessibility"] + bonus)
+    return scores
+
+
 def execute_ai_visibility_scoring_v2(job_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Execute AI visibility scoring v2
@@ -396,11 +444,21 @@ def execute_ai_visibility_scoring_v2(job_data: Dict[str, Any]) -> Dict[str, Any]
             logger.info(f"[WORKER] Job cancelled during data collection | jobId={job.jobId}")
             return {"status": "cancelled", "jobId": job.jobId}
         
+        # Fetch domain-level signals once for the entire project
+        # (same signals apply to every page — injected into page_data before scoring)
+        send_progress_update(job.jobId, 35, "Domain Signals", "Fetching AI crawler accessibility data")
+        domain_signals = fetch_domain_signals(job.projectId)
+        if domain_signals:
+            print(f"[WORKER] Domain signals loaded | robotsExists={domain_signals.get('robotsExists')} | bots={list(domain_signals.get('aiCrawlerSignals', {}).keys())}")
+        else:
+            print(f"[WORKER] No domain signals found — ai_accessibility rules will score neutral (30)")
+
         # Score all pages
         send_progress_update(job.jobId, 40, "Scoring", "Evaluating page content")
         page_scores = []
         processed_count = 0
-        
+        issues_by_page = {}  # accumulate rich issues for one cross-page bulk write
+
         for i, page_data in enumerate(pages_data):
             try:
                 # Check for cancellation before each page
@@ -408,23 +466,46 @@ def execute_ai_visibility_scoring_v2(job_data: Dict[str, Any]) -> Dict[str, Any]
                     logger.info(f"[WORKER] Job cancelled during scoring | jobId={job.jobId} | processed={processed_count}")
                     return {"status": "cancelled", "jobId": job.jobId}
                 
+                # Inject domain-level signals into page data so ai_accessibility
+                # rules can read them without re-fetching on every page
+                if domain_signals:
+                    page_data["domain_signals"] = domain_signals
+
                 # Score the page
                 page_score = scoring_engine.score_page(page_data)
+
+                # Apply llms.txt bonus to ai_accessibility (bonus only, 0 penalty)
+                if domain_signals and "category_scores" in page_score:
+                    page_score["category_scores"] = apply_llms_bonus(
+                        page_score["category_scores"], domain_signals
+                    )
+                    # Recompute the overall page score to reflect the bonus
+                    from scraper.workers.ai.ai_scoring_v2.normalization import CategoryWeights, ScoreNormalizer
+                    _weights = CategoryWeights.get_default_weights()
+                    page_score["page_ai_score"] = ScoreNormalizer.calculate_overall_score(
+                        page_score["category_scores"], _weights
+                    )
+
                 page_scores.append(page_score)
                 processed_count += 1
                 
-                # Derive and store issues from rule_breakdown
-                # Issues are informational only and do NOT influence scoring
+                # Build rich, context-aware issues (failed/warning rules only).
+                # Issues are informational only and do NOT influence scoring.
+                # Accumulated here; written once after the loop (bulk).
                 try:
-                    issues = derive_issues_from_rule_breakdown(
+                    page_url_val = page_score.get("page_url", "")
+                    page_issues = build_issues(
                         page_score.get("rule_breakdown", []),
+                        page_data,                       # seo_ai_visibility doc (page_type + detected_value)
                         job.projectId,
-                        page_score.get("page_url", "")
+                        page_url_val,
+                        get_rule_instance,               # rule_lookup
+                        lambda pid: ObjectId(pid),       # object_id_factory
                     )
-                    store_page_issues(issues, job.projectId, page_score.get("page_url", ""))
+                    # Always set the key (even empty) so resolved issues get cleared.
+                    issues_by_page[page_url_val] = page_issues
                 except Exception as issue_error:
-                    # Log but do not fail scoring if issue storage fails
-                    logger.warning(f"[WORKER] Issue storage failed but continuing scoring | url={page_score.get('page_url', '')} | error={issue_error}")
+                    logger.warning(f"[WORKER] Issue build failed but continuing scoring | url={page_score.get('page_url', '')} | error={issue_error}")
                 
                 # Calculate and store dashboard metrics in seo_ai_visibility collection
                 try:
@@ -456,9 +537,21 @@ def execute_ai_visibility_scoring_v2(job_data: Dict[str, Any]) -> Dict[str, Any]
         # Store page scores
         send_progress_update(job.jobId, 90, "Storage", "Saving scoring results")
         store_page_scores(page_scores, job.projectId, url_field)
-        
-        # Calculate and store website score
-        website_result = scoring_engine.score_website(pages_data)
+
+        # Store all rich issues in a single bulk pass (replaces per-page delete/insert).
+        try:
+            if seo_ai_visibility_issues is not None and issues_by_page:
+                bulk_stats = store_issues_bulk(
+                    seo_ai_visibility_issues, issues_by_page, job.projectId, lambda pid: ObjectId(pid)
+                )
+                logger.info(f"[WORKER] Issues bulk-stored | deleted={bulk_stats['deleted']} | inserted={bulk_stats['inserted']}")
+        except Exception as bulk_err:
+            logger.warning(f"[WORKER] Bulk issue storage failed but continuing | error={bulk_err}")
+
+        # Aggregate website score from per-page results (already include llms bonus)
+        # Do NOT call scoring_engine.score_website() which would re-score from
+        # raw page_data without the domain signal injection and llms bonus.
+        website_result = aggregate_website_score_from_pages(page_scores)
         store_website_score(website_result, job.projectId)
         
         # Create validation summary
@@ -501,74 +594,6 @@ def execute_ai_visibility_scoring_v2(job_data: Dict[str, Any]) -> Dict[str, Any]
             "error": str(e)
         }
 
-def derive_issues_from_rule_breakdown(rule_breakdown: List[Dict[str, Any]], project_id: str, page_url: str) -> List[Dict[str, Any]]:
-    """
-    Derive issues from rule breakdown scores using data-based validation.
-    
-    NEW LOGIC:
-    - Create issues for REQUIRED features that are actually missing
-    - Create issues for IMPORTANT features with low scores
-    - Skip truly optional features with reasonable scores
-    - Validate against actual data, not expectations
-    
-    Severity mapping:
-    - rule_score < 40 AND (feature required OR important) → "high"
-    - 40 ≤ rule_score < 70 AND (feature required OR important) → "medium"
-    - rule_score ≥ 70 AND feature not required → no issue
-    """
-    issues = []
-    
-    print(f"[DEBUG] Processing {len(rule_breakdown)} rules for issues | url={page_url}")
-    
-    for rule in rule_breakdown:
-        rule_score = rule.get("score", 100)
-        rule_id = rule.get("rule_id", "unknown")
-        
-        # Get rule requirements from registry
-        rule_instance = get_rule_instance(rule_id)
-        is_required = getattr(rule_instance, 'is_required', False) if rule_instance else False
-        
-        print(f"[DEBUG] Rule {rule_id} | score={rule_score} | required={is_required}")
-        
-        # FIXED: Include important features (not just required ones)
-        # Create issues for required features with low scores
-        # OR important features with very low scores
-        should_create_issue = False
-        
-        if is_required and rule_score < 70:
-            should_create_issue = True
-            print(f"[DEBUG] → Creating issue (required feature with low score)")
-        elif not is_required and rule_score < 40:
-            # Only create issues for optional features with very low scores
-            should_create_issue = True
-            print(f"[DEBUG] → Creating issue (optional feature with very low score)")
-        else:
-            print(f"[DEBUG] → Skipping issue (score too high or feature not important)")
-        
-        if should_create_issue:
-            # Determine severity based on score
-            if rule_score < 40:
-                severity = "high"
-            else:
-                severity = "medium"
-            
-            # Create issue document with validation status
-            issue = {
-                "projectId": ObjectId(project_id),
-                "page_url": page_url,
-                "rule_id": rule_id,
-                "category": rule.get("category", "unknown"),
-                "rule_score": rule_score,
-                "severity": severity,
-                "validation_status": "VALID",  # Only VALID issues pass through
-                "message": rule.get("rule_name", f"Rule {rule_id} scored {rule_score:.1f}"),
-                "created_at": datetime.utcnow()
-            }
-            issues.append(issue)
-    
-    print(f"[DEBUG] Generated {len(issues)} issues from {len(rule_breakdown)} rules")
-    return issues
-
 def create_validation_summary(page_scores: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Create validation summary for all pages
@@ -604,62 +629,6 @@ def create_validation_summary(page_scores: List[Dict[str, Any]]) -> Dict[str, An
         "false_positive_reduction_rate": (false_positives / total_issues * 100) if total_issues > 0 else 0,
         "validation_system": "data_based_v2"
     }
-
-def store_page_issues(issues: List[Dict[str, Any]], project_id: str, page_url: str):
-    """
-    Store page issues in database with validation status.
-    
-    NEW LOGIC:
-    - Stores VALID issues (features that actually need improvement)
-    - Provides summary of issue validation
-    
-    Safeguards:
-    - Deletes existing issues for the page before inserting new ones
-    - Only inserts if issues exist
-    """
-    try:
-        print(f"[DEBUG] Storing issues for {page_url} | total_issues={len(issues)}")
-        
-        # TEMPORARY BYPASS FOR TESTING: Comment out validation to test DB insert
-        # valid_issues = [issue for issue in issues if issue.get("validation_status") == "VALID"]
-        valid_issues = issues  # BYPASS: Use all issues for testing
-        
-        false_positives = len(issues) - len(valid_issues)
-        
-        print(f"[DEBUG] Issue validation | valid={len(valid_issues)} | false_positives={false_positives}")
-        
-        if false_positives > 0:
-            logger.info(f"[VALIDATION] Filtered out {false_positives} false positives for {page_url}")
-        
-        if not valid_issues:
-            # No valid issues to store - delete any existing issues for this page
-            print(f"[DEBUG] No valid issues to store, clearing existing issues for {page_url}")
-            result = seo_ai_visibility_issues.delete_many({
-                "projectId": ObjectId(project_id),
-                "page_url": page_url
-            })
-            if result.deleted_count > 0:
-                logger.info(f"[VALIDATION] Cleared {result.deleted_count} existing issues for page | url={page_url}")
-            return
-        
-        # Delete existing issues for this page
-        delete_result = seo_ai_visibility_issues.delete_many({
-            "projectId": ObjectId(project_id),
-            "page_url": page_url
-        })
-        
-        if delete_result.deleted_count > 0:
-            logger.info(f"[VALIDATION] Deleted {delete_result.deleted_count} existing issues before storing new issues | url={page_url}")
-        
-        # Insert new VALID issues only
-        insert_result = seo_ai_visibility_issues.insert_many(valid_issues)
-        
-        print(f"[DEBUG] Successfully inserted {len(insert_result.inserted_ids)} issues into DB")
-        logger.info(f"[VALIDATION] Stored VALID page issues | url={page_url} | valid={len(valid_issues)} | false_positives={false_positives} | inserted={len(insert_result.inserted_ids)}")
-        
-    except Exception as e:
-        logger.error(f"[VALIDATION] Error storing page issues | url={page_url} | error={e}")
-        # Do not raise - issues are informational only and should not break scoring
 
 def update_page_ai_visibility(page_score: Dict[str, Any], dashboard_metrics: Dict[str, float], project_id: str):
     """
@@ -717,24 +686,29 @@ def store_page_scores(page_scores: List[Dict[str, Any]], project_id: str, url_fi
         # Prepare bulk operations
         bulk_ops = []
         for page_score in page_scores:
-            # Create pure scoring document with only required fields
+            # SCORE ENGINE: persist ONLY derived scores. Per-rule logs
+            # (rule_breakdown/raw_score/max_score) are no longer stored — they
+            # were rule-evaluation logs, not product data. Issues (derived from
+            # the in-memory rule_breakdown) carry the actionable intelligence.
             pure_page_score = {
                 "page_url": page_score["page_url"],
                 "projectId": ObjectId(project_id),
                 "final_score": page_score["page_ai_score"],
                 "category_scores": page_score["category_scores"],
-                "rule_breakdown": page_score["rule_breakdown"],
                 "updated_at": datetime.utcnow()
             }
-            
-            # Create upsert operation
+
             filter_doc = {
                 "projectId": ObjectId(project_id),
                 "page_url": page_score["page_url"]
             }
-            
-            update_doc = {"$set": pure_page_score}
-            
+
+            # $unset clears legacy per-rule logs from historical docs on re-score.
+            update_doc = {
+                "$set": pure_page_score,
+                "$unset": {"rule_breakdown": "", "raw_score": "", "max_score": "", "validation_status": ""},
+            }
+
             bulk_ops.append(
                 UpdateOne(filter_doc, update_doc, upsert=True)
             )
@@ -747,6 +721,39 @@ def store_page_scores(page_scores: List[Dict[str, Any]], project_id: str, url_fi
     except Exception as e:
         logger.error(f"Error storing page scores: {e}")
         raise
+
+def aggregate_website_score_from_pages(page_scores: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Compute website-level scores by averaging the already-scored page results.
+
+    Using pre-scored pages preserves the domain signal injection and llms.txt
+    bonus that were applied during the per-page scoring loop.  This replaces
+    scoring_engine.score_website() which would re-score from raw page_data.
+    """
+    if not page_scores:
+        return {"website_ai_score": 0.0, "pages_scored": 0, "category_averages": {}, "scoring_version": "v2"}
+
+    overall_scores = [ps.get("page_ai_score", 0.0) for ps in page_scores]
+    website_score = round(sum(overall_scores) / len(overall_scores), 3)
+
+    # Collect all category keys across all pages
+    all_cats: set = set()
+    for ps in page_scores:
+        all_cats.update(ps.get("category_scores", {}).keys())
+
+    category_averages: Dict[str, float] = {}
+    for cat in all_cats:
+        values = [ps["category_scores"][cat] for ps in page_scores if cat in ps.get("category_scores", {})]
+        if values:
+            category_averages[cat] = round(sum(values) / len(values), 3)
+
+    return {
+        "website_ai_score": website_score,
+        "pages_scored": len(page_scores),
+        "category_averages": category_averages,
+        "scoring_version": "v2",
+    }
+
 
 def store_website_score(website_result: Dict[str, Any], project_id: str):
     """Store website-level score in BOTH project collections"""

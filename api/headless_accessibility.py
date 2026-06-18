@@ -12,8 +12,9 @@ class HeadlessAccessibilityJob(BaseModel):
     jobId: str
     projectId: str
     userId: str
-    sourceJobId: str  # Reference to TECHNICAL_DOMAIN job
+    sourceJobId: str
     urls: Optional[List[str]] = []
+    canonical_urls: Optional[List[str]] = []  # Canonical URL set from URL_QUALIFICATION (preferred)
 
 
 @router.post("/jobs/headless-accessibility")

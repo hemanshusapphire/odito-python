@@ -85,6 +85,8 @@ def extract_domain_from_url(url: str) -> str:
 class GenerateKeywordsRequest(BaseModel):
     sub_type: str                         # e.g. "IT services"
     location: Optional[str] = None        # e.g. "New York"  (for local)
+    lat: Optional[float] = None           # latitude from Google Places (local SEO)
+    lng: Optional[float] = None           # longitude from Google Places (local SEO)
     country: str = "US"
     language: str = "en"
 
@@ -99,46 +101,34 @@ KEYWORD_SUGGESTIONS_URL = (
 
 
 def _clean_query(sub_type: str, location: Optional[str] = None) -> str:
-    """Clean and normalize query for DataForSEO API.
-    
-    Extracts only essential parts:
-    - sub_type: e.g. "IT services"
-    - location city: e.g. "New York"
-    
-    Removes:
-    - Street addresses
-    - Floor numbers
-    - ZIP codes
-    - Extra noise
+    """Clean and normalise query for DataForSEO API.
+
+    Strips noise from the location, extracts the city name, and appends it to
+    the sub_type — but only when the city name is not already present in the
+    sub_type string (prevents "Nashik IT Agency Nashik" duplication).
     """
-    import re
-    
-    # Clean sub_type
     sub_type = sub_type.strip()
-    
-    # Extract city from location if provided
+
     city = ""
     if location:
-        # Remove street numbers, floor info, zip codes
-        location_clean = re.sub(r'\d+.*?(st|ave|avenue|street|blvd|boulevard|floor|fl|#)\s*', '', location, flags=re.IGNORECASE)
-        location_clean = re.sub(r'\b\d{5}\b', '', location_clean)  # Remove ZIP codes
+        location_clean = re.sub(
+            r'\d+.*?(st|ave|avenue|street|blvd|boulevard|floor|fl|#)\s*',
+            '', location, flags=re.IGNORECASE
+        )
+        # Remove 5- and 6-digit postal codes (US ZIP and Indian PIN)
+        location_clean = re.sub(r'\b\d{5,6}\b', '', location_clean)
         location_clean = re.sub(r',\s*USA$', '', location_clean, flags=re.IGNORECASE)
         location_clean = re.sub(r'\bSuite\s+\d+\b', '', location_clean, flags=re.IGNORECASE)
-        
-        # Extract first city name (before commas)
-        parts = location_clean.split(',')
+
+        parts = [p.strip() for p in location_clean.split(',') if p.strip()]
         if parts:
-            city = parts[0].strip()
-        
-        # If city is empty after cleaning, try to extract from remaining parts
-        if not city and len(parts) > 1:
-            city = parts[1].strip()
-    
-    # Build clean query
+            city = parts[0]
+
+    # Only append city if it is not already contained in the sub_type (case-insensitive)
     query = sub_type
-    if city:
+    if city and city.lower() not in sub_type.lower():
         query = f"{sub_type} {city}"
-    
+
     print(f"[ONBOARDING] Cleaned query | original=\"{sub_type} {location or ''}\" | clean=\"{query}\"")
     return query
 
@@ -263,21 +253,77 @@ def _get_fallback_keywords(sub_type: str) -> List[str]:
     ]
 
 
+def _resolve_location_code(lat: Optional[float], lng: Optional[float],
+                            address: Optional[str], country: str) -> int:
+    """Resolve the best DataForSEO location_code.
+
+    Uses the DataForSEO Locations API + Haversine distance to find the nearest
+    city-level code when coordinates are available.  Falls back to the
+    country-level code from the static map when they are not.
+    """
+    if lat is not None and lng is not None:
+        try:
+            locations_url = "https://api.dataforseo.com/v3/serp/google/locations"
+            headers = {"Authorization": _auth_header(), "Content-Type": "application/json"}
+            resp = requests.get(locations_url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            locations = data.get("tasks", [{}])[0].get("result", []) or []
+
+            # Filter to same country when possible
+            country_upper = country.upper()
+            candidates = [
+                loc for loc in locations
+                if loc.get("location_lat") and loc.get("location_lng")
+                and (not country_upper or loc.get("country_iso_code", "").upper() == country_upper
+                     or not any(
+                         loc.get("country_iso_code", "").upper() == c
+                         for c in list(COUNTRY_TO_LOCATION_CODE.keys())
+                     ))
+            ]
+            if not candidates:
+                candidates = [loc for loc in locations if loc.get("location_lat") and loc.get("location_lng")]
+
+            best = None
+            min_dist = float("inf")
+            for loc in candidates:
+                lat2, lng2 = loc["location_lat"], loc["location_lng"]
+                # Haversine
+                from math import radians, sin, cos, sqrt, atan2
+                R = 6371
+                dlat = radians(lat2 - lat)
+                dlng = radians(lng2 - lng)
+                a = sin(dlat / 2) ** 2 + cos(radians(lat)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+                dist = R * 2 * atan2(sqrt(a), sqrt(1 - a))
+                if dist < min_dist:
+                    min_dist = dist
+                    best = loc
+
+            if best:
+                print(f"[ONBOARDING] City-level location resolved | code={best['location_code']} name={best.get('location_name')} dist={min_dist:.1f}km")
+                return int(best["location_code"])
+        except Exception as e:
+            print(f"[ONBOARDING] City-level lookup failed, using country fallback | error={e}")
+
+    return COUNTRY_TO_LOCATION_CODE.get(country.upper(), 2840)
+
+
 @router.post("/onboarding/generate-keywords", response_model=GenerateKeywordsResponse)
 def generate_keywords(req: GenerateKeywordsRequest):
     """Return top-5 keyword suggestions for a given business sub-type."""
 
     # STEP 1: Clean the query
     clean_query = _clean_query(req.sub_type, req.location)
-    
-    location_code = COUNTRY_TO_LOCATION_CODE.get(req.country.upper(), 2840)
+
+    # STEP 2: Resolve location code — city-level when lat/lng are provided
+    location_code = _resolve_location_code(req.lat, req.lng, req.location, req.country)
     language_code = req.language.lower() or "en"
 
     payload = [{
         "keyword": clean_query,
         "location_code": location_code,
         "language_code": language_code,
-        "limit": 10,          # Fetch extra, pick top 5 by volume
+        "limit": 10,
         "include_seed_keyword": True,
         "include_serp_info": False,
     }]
@@ -364,9 +410,17 @@ class CheckRankingRequest(BaseModel):
     language_code: str = "en"
 
 
+class RankingUrl(BaseModel):
+    rank: int
+    url: str
+    type: str                             # "homepage" | "internal_page"
+
+
 class KeywordRank(BaseModel):
     keyword: str
-    rank: Optional[int] = None            # None = not in top 100
+    rank: Optional[int] = None            # best_rank — kept for backward compat
+    best_rank: Optional[int] = None       # lowest (best) position found
+    ranking_urls: List[RankingUrl] = []   # all domain occurrences in the SERP
 
 
 class CheckRankingResponse(BaseModel):
@@ -376,6 +430,16 @@ class CheckRankingResponse(BaseModel):
 SERP_API_URL = (
     "https://api.dataforseo.com/v3/serp/google/organic/live/regular"
 )
+
+
+def _classify_url_type(url: str) -> str:
+    """Return 'homepage' if URL path is empty/root, else 'internal_page'."""
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path.rstrip('/')
+        return "homepage" if path == "" else "internal_page"
+    except Exception:
+        return "internal_page"
 
 
 @router.post("/onboarding/check-ranking", response_model=CheckRankingResponse)
@@ -499,98 +563,88 @@ def check_ranking(req: CheckRankingRequest):
 
             serp_results_found = 0
             domains_checked = []
-            rank = None  # 🚨 CRITICAL FIX: Initialize rank for each keyword
-            
+            ranking_urls_for_kw: List[RankingUrl] = []
+            seen_urls: set = set()
+
             print(f"[ONBOARDING] 🔍 SEARCHING FOR DOMAIN: \"{clean_domain}\" in keyword \"{kw}\"")
-            print(f"[ONBOARDING] 📋 ALL SERP RESULTS FOR \"{kw}\":")
-            
+
             for result_item in first_task["result"]:
                 items = result_item.get("items", [])
                 if not items:
                     continue
-                    
+
                 for serp_item in items:
                     if serp_item.get("type") != "organic":
                         continue
-                    
+
                     serp_results_found += 1
-                    
-                    # Try multiple URL fields that DataForSEO might return
-                    serp_url = ""
-                    if "url" in serp_item:
-                        serp_url = serp_item["url"]
-                    elif "snippet_url" in serp_item:
-                        serp_url = serp_item["snippet_url"]
-                    elif "link" in serp_item:
-                        serp_url = serp_item["link"]
-                    
-                    # Also try domain field directly
+
+                    # Resolve URL — try all fields DataForSEO may use
+                    serp_url = (
+                        serp_item.get("url")
+                        or serp_item.get("snippet_url")
+                        or serp_item.get("link")
+                        or ""
+                    )
+
                     serp_domain = serp_item.get("domain", "")
-                    
-                    # Extract domain from URL if we have one
                     if serp_url:
-                        extracted_domain = extract_domain_from_url(serp_url)
-                        if extracted_domain:
-                            serp_domain = extracted_domain
-                    
-                    # Normalize SERP domain for comparison
+                        extracted = extract_domain_from_url(serp_url)
+                        if extracted:
+                            serp_domain = extracted
+
                     serp_domain_clean = normalize_domain(serp_domain)
-                    
-                    # Get rank info
                     rank_group = serp_item.get("rank_group")
                     rank_absolute = serp_item.get("rank_absolute")
-                    
-                    # Debug logging - Show ALL results
-                    print(f"[ONBOARDING]   #{serp_results_found}: domain=\"{serp_domain_clean}\" | rank_group={rank_group} | rank_absolute={rank_absolute} | url=\"{serp_url[:60] if serp_url else 'N/A'}\"")
-                    
-                    # Store for domain checking
+                    item_rank = rank_group or rank_absolute
+
                     if serp_domain_clean:
                         domains_checked.append(serp_domain_clean)
 
-                    # Multiple matching strategies
-                    is_match = False
-                    
-                    # Strategy 1: Exact domain match
-                    if serp_domain_clean == clean_domain:
-                        is_match = True
-                        print(f"[ONBOARDING] ✅ Exact match: \"{serp_domain_clean}\" == \"{clean_domain}\"")
-                    
-                    # Strategy 2: Domain contains match (for subdomains)
-                    elif clean_domain and serp_domain_clean and clean_domain in serp_domain_clean:
-                        is_match = True
-                        print(f"[ONBOARDING] ✅ Contains match: \"{clean_domain}\" in \"{serp_domain_clean}\"")
-                    
-                    # Strategy 3: SERP domain contains target domain
-                    elif serp_domain_clean and clean_domain and serp_domain_clean in clean_domain:
-                        is_match = True
-                        print(f"[ONBOARDING] ✅ Reverse contains match: \"{serp_domain_clean}\" in \"{clean_domain}\"")
+                    # Domain matching — three strategies
+                    is_match = (
+                        serp_domain_clean == clean_domain
+                        or (clean_domain and serp_domain_clean and clean_domain in serp_domain_clean)
+                        or (serp_domain_clean and clean_domain and serp_domain_clean in clean_domain)
+                    )
 
-                    if is_match:
-                        rank = serp_item.get("rank_group") or serp_item.get("rank_absolute")
-                        print(f"[ONBOARDING] 🎯 FOUND MATCH! \"{kw}\" → rank {rank} | domain=\"{serp_domain_clean}\" | url=\"{serp_url[:80] if serp_url else 'N/A'}\"")
-                        break
-                
-                if rank is not None:
-                    break
+                    if is_match and item_rank and serp_url not in seen_urls:
+                        seen_urls.add(serp_url)
+                        url_type = _classify_url_type(serp_url)
+                        ranking_urls_for_kw.append(RankingUrl(
+                            rank=item_rank,
+                            url=serp_url,
+                            type=url_type
+                        ))
+                        print(f"[ONBOARDING] 🎯 MATCH rank={item_rank} type={url_type} url=\"{serp_url[:80]}\"")
+                        # No break — scan all 100 results for every domain occurrence
 
-            print(f"[ONBOARDING] 📊 SUMMARY FOR \"{kw}\": Checked {len(domains_checked)} domains, found {len(set(domains_checked))} unique domains")
+            # Sort by rank ascending so index-0 is always the best position
+            ranking_urls_for_kw.sort(key=lambda u: u.rank)
 
-            if rank is None:
-                print(f"[ONBOARDING] ❌ NO MATCH for \"{kw}\" | checked {len(domains_checked)} domains: {domains_checked[:10]}")
-                if len(domains_checked) > 10:
-                    print(f"[ONBOARDING] ... and {len(domains_checked) - 10} more domains")
-                print(f"[ONBOARDING] 📊 FINAL RESULT for \"{kw}\": NOT FOUND (rank=None)")
+            if ranking_urls_for_kw:
+                best_rank = ranking_urls_for_kw[0].rank
+                rank = best_rank
+                print(f"[ONBOARDING] 📊 \"{kw}\": best_rank={best_rank} | {len(ranking_urls_for_kw)} ranking URL(s)")
             else:
-                print(f"[ONBOARDING] 📊 FINAL RESULT for \"{kw}\": RANK {rank}")
+                best_rank = None
+                rank = None
+                print(f"[ONBOARDING] ❌ NO MATCH for \"{kw}\" | checked {len(domains_checked)} domains")
 
         except Exception as e:
             print(f"[ONBOARDING] SERP check failed for \"{kw}\" | error=\"{e}\"")
             import traceback
             print(f"[ONBOARDING] Traceback: {traceback.format_exc()}")
-            rank = None  # 🚨 CRITICAL FIX: Ensure rank is None on exception
+            rank = None
+            best_rank = None
+            ranking_urls_for_kw = []
 
-        print(f"[ONBOARDING] 🎯 KEYWORD COMPLETE: \"{kw}\" → rank {rank}")
-        results.append(KeywordRank(keyword=kw, rank=rank))
+        results.append(KeywordRank(
+            keyword=kw,
+            rank=rank,
+            best_rank=best_rank,
+            ranking_urls=ranking_urls_for_kw
+        ))
 
     # 🚨 STEP 5: FINAL TRACE - WHAT WAS ACTUALLY PROCESSED
     print("🚨 FINAL TRACE COMPLETE:", {

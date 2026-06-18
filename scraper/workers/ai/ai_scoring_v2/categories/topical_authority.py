@@ -17,7 +17,7 @@ class OnlyOnePrimaryEntityRule(BaseRule):
             "rule_id": "only_one_primary_entity",
             "category": "topical_authority",
             "description": "Only ONE primary entity site-wide",
-            "weight": 1.0,
+            "weight": 1.4,
             "max_score": 10,
             "applies_to": "page"
         }
@@ -52,7 +52,7 @@ class ConsistentIDAcrossPagesRule(BaseRule):
             "rule_id": "consistent_id_across_pages",
             "category": "topical_authority",
             "description": "Consistent @id across pages",
-            "weight": 1.0,
+            "weight": 1.6,
             "max_score": 10,
             "applies_to": "page"
         }
@@ -91,7 +91,7 @@ class ChildSchemasReferenceMainIDRule(BaseRule):
             "rule_id": "child_schemas_reference_main_id",
             "category": "topical_authority",
             "description": "Child schemas reference main @id",
-            "weight": 1.0,
+            "weight": 1.8,
             "max_score": 10,
             "applies_to": "page"
         }
@@ -134,60 +134,6 @@ class ChildSchemasReferenceMainIDRule(BaseRule):
         
         return min(score, self.max_score)
 
-class OpeningHoursSpecificationRule(BaseRule):
-    """Rule 63 — openingHoursSpecification"""
-    
-    def __init__(self):
-        config = {
-            "rule_id": "opening_hours_specification",
-            "category": "topical_authority",
-            "description": "openingHoursSpecification",
-            "weight": 1.0,
-            "max_score": 10,
-            "applies_to": "page"
-        }
-        super().__init__(config)
-    
-    def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for openingHoursSpecification"""
-        structured_data = data.get("structured_data", {})
-        if isinstance(structured_data, str):
-            try:
-                structured_data = json.loads(structured_data)
-            except (json.JSONDecodeError, TypeError):
-                structured_data = {}
-        
-        score = 0
-        graph = structured_data.get("@graph", [])
-        
-        # Only relevant for local business types
-        business_types = {"LocalBusiness", "Restaurant", "Store", "Hotel", "ProfessionalService"}
-        has_business_type = False
-        
-        for item in graph:
-            item_type = item.get("@type", "")
-            if isinstance(item_type, list):
-                if any(bt in item_type for bt in business_types):
-                    has_business_type = True
-                    break
-            elif item_type in business_types:
-                has_business_type = True
-                break
-        
-        if not has_business_type:
-            return 0.0
-        
-        # Check for openingHoursSpecification
-        for item in graph:
-            if item.get("openingHoursSpecification"):
-                score += 10
-                break
-            elif item.get("@type") == "OpeningHoursSpecification":
-                score += 10
-                break
-        
-        return min(score, self.max_score)
-
 class EventSchemaRule(BaseRule):
     """Rule 65 — Event schema"""
     
@@ -196,7 +142,7 @@ class EventSchemaRule(BaseRule):
             "rule_id": "event_schema",
             "category": "topical_authority",
             "description": "Event schema",
-            "weight": 1.0,
+            "weight": 0.5,
             "max_score": 10,
             "applies_to": "page"
         }
@@ -222,88 +168,10 @@ class EventSchemaRule(BaseRule):
         
         return min(score, self.max_score)
 
-class AggregateRatingSchemaRule(BaseRule):
-    """Rule 66 — AggregateRating schema"""
-    
-    def __init__(self):
-        config = {
-            "rule_id": "aggregate_rating_schema",
-            "category": "topical_authority",
-            "description": "AggregateRating schema",
-            "weight": 1.0,
-            "max_score": 10,
-            "applies_to": "page"
-        }
-        super().__init__(config)
-    
-    def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for AggregateRating schema"""
-        structured_data = data.get("structured_data", {})
-        if isinstance(structured_data, str):
-            try:
-                structured_data = json.loads(structured_data)
-            except (json.JSONDecodeError, TypeError):
-                structured_data = {}
-        
-        score = 0
-        graph = structured_data.get("@graph", [])
-        
-        # Check for AggregateRating
-        for item in graph:
-            if item.get("@type") == "AggregateRating":
-                score += 10
-                break
-            elif item.get("aggregateRating"):
-                score += 10
-                break
-        
-        return min(score, self.max_score)
-
-class ServiceProductSchemaWithOffersRule(BaseRule):
-    """Rule 67 — Service/Product schema with offers"""
-    
-    def __init__(self):
-        config = {
-            "rule_id": "service_product_schema_with_offers",
-            "category": "topical_authority",
-            "description": "Service/Product schema with offers",
-            "weight": 1.0,
-            "max_score": 10,
-            "applies_to": "page"
-        }
-        super().__init__(config)
-    
-    def evaluate(self, data: Dict[str, Any]) -> float:
-        """Check for Service/Product schema with offers"""
-        structured_data = data.get("structured_data", {})
-        if isinstance(structured_data, str):
-            try:
-                structured_data = json.loads(structured_data)
-            except (json.JSONDecodeError, TypeError):
-                structured_data = {}
-        
-        score = 0
-        graph = structured_data.get("@graph", [])
-        
-        # Check for Service or Product with offers
-        for item in graph:
-            if item.get("@type") in ["Service", "Product"]:
-                if item.get("offers"):
-                    score += 10
-                    break
-                else:
-                    score += 5  # Has Service/Product but no offers
-                    break
-        
-        return min(score, self.max_score)
-
-# Register all Topical Authority rules (7 rules)
+# Register Topical Authority rules (4 pure AI visibility rules)
 def register_topical_authority_rules(registry):
     """Register all Topical Authority category rules"""
     registry.register(OnlyOnePrimaryEntityRule())
     registry.register(ConsistentIDAcrossPagesRule())
     registry.register(ChildSchemasReferenceMainIDRule())
-    registry.register(OpeningHoursSpecificationRule())
     registry.register(EventSchemaRule())
-    registry.register(AggregateRatingSchemaRule())
-    registry.register(ServiceProductSchemaWithOffersRule())

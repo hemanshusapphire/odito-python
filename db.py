@@ -146,6 +146,20 @@ except Exception as e:
     else:
         print(f"⚠️ Failed to create index on seo_page_data: {e}")
 
+# Index for page_type filtering — enables direct queries like
+#   seo_page_data.find({ projectId, page_type: "Service" })
+try:
+    seo_page_data.create_index(
+        [("projectId", 1), ("page_type", 1)],
+        name="project_page_type"
+    )
+    print("✅ Created index on seo_page_data (projectId, page_type)")
+except Exception as e:
+    if "already exists" in str(e):
+        print("✅ Index on seo_page_data (page_type) already exists")
+    else:
+        print(f"⚠️ Failed to create index on seo_page_data (page_type): {e}")
+
 try:
     seo_page_issues.create_index([("projectId", 1)])
     print("✅ Created index on seo_page_issues (projectId)")
@@ -305,4 +319,80 @@ except Exception as e:
         print("✅ Index on seo_page_summary already exists")
     else:
         print(f"⚠️ Failed to create index on seo_page_summary: {e}")
+
+# ── URL Qualification audit trail ─────────────────────────────────────────────
+# Stores one probe record per URL per job run. Used for diagnostics and to
+# understand qualification decisions (qualified / low_priority / rejected).
+# Retention: TTL 30 days — audit trail only, not needed long-term.
+# Storage estimate @ 100k audits/month × avg 50 URLs/audit = 5M docs/month;
+# each doc ~300 B → ~1.5 GB/month raw, ~50 MB after 30-day TTL expiry.
+seo_audit_url_pool = db["seo_audit_url_pool"]
+
+try:
+    # Lookup: find all probe results for a specific job
+    seo_audit_url_pool.create_index(
+        [("job_id", 1)],
+        name="job_id_lookup"
+    )
+    # Lookup: find all audits that probed a specific URL for a project
+    seo_audit_url_pool.create_index(
+        [("project_id", 1), ("url", 1)],
+        name="project_url_lookup"
+    )
+    # TTL: automatically delete records older than 30 days
+    seo_audit_url_pool.create_index(
+        [("probed_at", 1)],
+        expireAfterSeconds=30 * 24 * 60 * 60,  # 30 days
+        name="ttl_30d"
+    )
+    print("✅ Created indexes on seo_audit_url_pool")
+except Exception as e:
+    if "already exists" in str(e):
+        print("✅ Indexes on seo_audit_url_pool already exist")
+    else:
+        print(f"⚠️ Failed to create indexes on seo_audit_url_pool: {e}")
+
+# ── AI Intelligence V2 collections ──────────────────────────────────────────
+ai_pages     = db["ai_pages"]
+ai_scores    = db["ai_scores"]
+ai_issues    = db["ai_issues"]
+ai_projects  = db["ai_projects"]
+
+try:
+    # ai_pages: one extraction doc per (project, job, url)
+    ai_pages.create_index([("project_id", 1), ("job_id", 1), ("url", 1)], unique=True, name="v2_unique_page")
+    ai_pages.create_index([("project_id", 1)], name="v2_pages_by_project")
+    ai_pages.create_index([("job_id", 1)],     name="v2_pages_by_job")
+    print("✅ Created indexes on ai_pages")
+except Exception as e:
+    print("✅ ai_pages indexes exist" if "already exists" in str(e) else f"⚠️ ai_pages index error: {e}")
+
+try:
+    # ai_scores: one score doc per (project, job, url)
+    ai_scores.create_index([("project_id", 1), ("job_id", 1), ("url", 1)], unique=True, name="v2_unique_score")
+    ai_scores.create_index([("page_id", 1)],   name="v2_score_by_page")
+    ai_scores.create_index([("job_id", 1)],    name="v2_scores_by_job")
+    print("✅ Created indexes on ai_scores")
+except Exception as e:
+    print("✅ ai_scores indexes exist" if "already exists" in str(e) else f"⚠️ ai_scores index error: {e}")
+
+try:
+    # ai_issues: one doc per failed rule per page — supports severity + hub/card drill-down
+    ai_issues.create_index([("project_id", 1), ("severity", 1)],        name="v2_issues_by_severity")
+    ai_issues.create_index([("project_id", 1), ("url", 1)],             name="v2_issues_by_url")
+    ai_issues.create_index([("project_id", 1), ("hub", 1), ("card", 1)], name="v2_issues_by_card")
+    ai_issues.create_index([("score_id", 1)],                            name="v2_issues_by_score")
+    ai_issues.create_index([("job_id", 1)],                              name="v2_issues_by_job")
+    ai_issues.create_index([("created_at", 1)], expireAfterSeconds=90 * 24 * 60 * 60, name="v2_issues_ttl_90d")
+    print("✅ Created indexes on ai_issues")
+except Exception as e:
+    print("✅ ai_issues indexes exist" if "already exists" in str(e) else f"⚠️ ai_issues index error: {e}")
+
+try:
+    # ai_projects: one aggregate per (project, job)
+    ai_projects.create_index([("project_id", 1), ("job_id", 1)],     unique=True, name="v2_unique_project_job")
+    ai_projects.create_index([("project_id", 1), ("computed_at", -1)], name="v2_project_latest")
+    print("✅ Created indexes on ai_projects")
+except Exception as e:
+    print("✅ ai_projects indexes exist" if "already exists" in str(e) else f"⚠️ ai_projects index error: {e}")
 

@@ -115,17 +115,23 @@ class TitleTooShortRule(BaseSEORuleV2):
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
         title = normalized.get("title", "")
-        
+
         if title and len(title.strip()) < 30:
+            title_len = len(title.strip())
             issues.append(self.create_issue(
                 job_id, project_id, url,
-                f"Title too short: {len(title)} characters",
-                f"Title length: {len(title)} characters",
+                f"Title too short: {title_len} characters (minimum: 30)",
+                f"Title length: {title_len} characters (minimum: 30)",
                 "Title between 30-60 characters",
                 data_key="title",
-                data_path="title"
+                data_path="title",
+                context={
+                    "detected_length": title_len,
+                    "target_min": 30,
+                    "target_max": 60,
+                }
             ))
-        
+
         return issues
 
 
@@ -139,17 +145,23 @@ class TitleTooLongRule(BaseSEORuleV2):
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
         title = normalized.get("title", "")
-        
+
         if title and len(title.strip()) > 60:
+            title_len = len(title.strip())
             issues.append(self.create_issue(
                 job_id, project_id, url,
-                f"Title too long: {len(title)} characters",
-                f"Title length: {len(title)} characters",
+                f"Title too long: {title_len} characters (maximum: 60)",
+                f"Title length: {title_len} characters (maximum: 60)",
                 "Title ≤ 60 characters",
                 data_key="title",
-                data_path="title"
+                data_path="title",
+                context={
+                    "detected_length": title_len,
+                    "target_min": 30,
+                    "target_max": 60,
+                }
             ))
-        
+
         return issues
 
 
@@ -184,16 +196,24 @@ class MetaDescriptionTooShortRule(BaseSEORuleV2):
             
             # Length-based validation
             if desc_length < 120:
-                # Clear FAIL - too short
+                # Store a lightweight diagnostic string in detected_value.
+                # The actual description text lives in seo_page_data.meta_tags.description
+                # and is resolved at recommendation time via the data_path pointer.
+                # context carries pre-computed metrics so the UI never needs to re-parse.
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Meta description too short: {desc_length} characters",
+                    f"Meta description too short: {desc_length} characters (minimum: 120)",
                     f"Description length: {desc_length} characters (minimum: 120)",
-                    "Description between 120-158 characters",
+                    "Description between 120-160 characters",
                     data_key="meta_tags",
                     data_path="meta_tags.description",
                     impact="Short meta descriptions fail to communicate value proposition and waste SERP real estate, reducing click-through rates.",
-                    recommendation="Expand meta description to 120-158 characters. Include value proposition, keywords, and compelling reasons to click."
+                    recommendation="Expand meta description to 120-160 characters. Include value proposition, keywords, and compelling reasons to click.",
+                    context={
+                        "detected_length": desc_length,
+                        "target_min": 120,
+                        "target_max": 160,
+                    }
                 ))
             # DISABLED: Meta description quality issues check (CTR, power words, CTA)
             # elif desc_length >= 120 and desc_length <= 158 and quality_issues:
@@ -227,16 +247,21 @@ class MetaDescriptionTooLongRule(BaseSEORuleV2):
         descriptions = meta_tags.get("description", [])
         if descriptions and descriptions[0]:
             desc_length = len(descriptions[0].strip())
-            if desc_length > 158:
+            if desc_length > 160:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Meta description too long: {desc_length} characters",
-                    f"Description length: {desc_length} characters",
-                    "Description ≤ 158 characters",
+                    f"Meta description too long: {desc_length} characters (maximum: 160)",
+                    f"Description length: {desc_length} characters (maximum: 160)",
+                    "Description ≤ 160 characters",
                     data_key="meta_tags",
-                    data_path="meta_tags.description"
+                    data_path="meta_tags.description",
+                    context={
+                        "detected_length": desc_length,
+                        "target_min": 120,
+                        "target_max": 160,
+                    }
                 ))
-        
+
         return issues
 
 
@@ -280,13 +305,16 @@ class MultipleH1TagsRule(BaseSEORuleV2):
         # Count non-empty H1 tags
         non_empty_h1 = [h1 for h1 in h1_tags if h1.get("text", "").strip()]
         if len(non_empty_h1) > 1:
+            # detected_value is a count-based diagnostic; actual H1 texts are resolved
+            # at recommendation time from seo_page_data via data_path="headings.h1".
             issues.append(self.create_issue(
                 job_id, project_id, url,
                 f"Multiple H1 tags found: {len(non_empty_h1)}",
-                f"H1 tags: {[h.get('text') for h in non_empty_h1]}",
+                f"H1 count: {len(non_empty_h1)}",
                 "Exactly one H1 tag",
                 data_key="headings",
-                data_path="headings.h1"
+                data_path="headings.h1",
+                context={"h1_count": len(non_empty_h1)}
             ))
         
         return issues
@@ -364,11 +392,12 @@ class ThinContentRule(BaseSEORuleV2):
             if word_count < threshold:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Thin content: {word_count} words",
-                    f"Word count: {word_count} (minimum: {threshold})",
+                    f"Thin content: {word_count} words (minimum: {threshold})",
+                    word_count,         # ← actual numeric count, not a diagnostic string
                     f"Content with ≥ {threshold} words",
                     data_key="content",
-                    data_path="content.word_count"
+                    data_path="content.word_count",
+                    context={"word_count": word_count, "threshold": threshold}
                 ))
         
         return issues

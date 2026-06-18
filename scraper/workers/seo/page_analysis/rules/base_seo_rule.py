@@ -48,11 +48,23 @@ class BaseSEORuleV2(ABC):
 
     def create_issue(self, job_id, project_id, url,
                      issue_message, detected_value, expected_value,
-                     data_key=None, data_path=None, impact=None, recommendation=None):
+                     data_key=None, data_path=None, impact=None, recommendation=None,
+                     context=None):
         """Create a standardized issue document with SEO insights.
-        
-        Enhanced to include impact and recommendation for actionable SEO intelligence.
-        Maintains backward compatibility with existing DB storage format.
+
+        detected_value must be the RAW detected content (actual text, actual URL,
+        actual number) — NEVER a diagnostic message string like
+        "Description length: 112 characters".  Store diagnostic info in context={}.
+
+        context: optional dict for pre-computed values that the recommendation
+                 engine and UI can consume directly, e.g.:
+                 {
+                   "detected_length": 112,
+                   "target_min": 120,
+                   "target_max": 160,
+                   "page_title": "...",
+                   "h1_text": "..."
+                 }
         """
         issue = {
             "projectId": ObjectId(project_id),
@@ -70,13 +82,14 @@ class BaseSEORuleV2(ABC):
             "data_path": data_path,
             "created_at": datetime.utcnow()
         }
-        
-        # Add SEO intelligence fields if provided
+
         if impact:
             issue["impact"] = impact
         if recommendation:
             issue["recommendation"] = recommendation
-            
+        if context:
+            issue["context"] = context
+
         return issue
 
     def get_excluded_page_types(self) -> List[str]:

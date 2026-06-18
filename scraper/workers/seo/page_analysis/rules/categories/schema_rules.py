@@ -9,6 +9,7 @@ import os
 from urllib.parse import urlparse
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from .eeat_rules import ContextValidator
+from shared.page_type_detector import page_type_detector
 
 
 class OrganizationSchemaRule(BaseSEORuleV2):
@@ -62,15 +63,15 @@ class OrganizationSchemaRule(BaseSEORuleV2):
             recommended_fields = ["logo", "sameAs", "address"]
             missing_fields = []
             missing_recommended = []
-            
+
             for field in required_fields:
                 if not org_schema.get(field):
                     missing_fields.append(field)
-            
+
             for field in recommended_fields:
                 if not org_schema.get(field):
                     missing_recommended.append(field)
-            
+
             if missing_fields:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
@@ -82,17 +83,24 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                     impact="Incomplete Organization schema reduces entity recognition and Knowledge Graph building effectiveness.",
                     recommendation="Add missing required fields to Organization schema for proper entity identification."
                 ))
-            
-            if missing_recommended:
+
+            # sameAs is intentionally excluded from the "incomplete recommended fields" issue.
+            # SameAsArrayRule (rule_id: sameas_array) owns that specific check and produces a
+            # more explicit, actionable finding.  Emitting sameAs here as well would create a
+            # duplicate issue for the same root cause when sameAs is the only missing field.
+            # When other recommended fields (logo, address) are also absent we still report
+            # those — but never sameAs, regardless of what else is missing.
+            non_sameas_missing = [f for f in missing_recommended if f != "sameAs"]
+            if non_sameas_missing:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Organization schema incomplete - missing recommended fields: {', '.join(missing_recommended)}",
-                    f"Missing recommended: {missing_recommended}",
+                    f"Organization schema incomplete - missing recommended fields: {', '.join(non_sameas_missing)}",
+                    f"Missing recommended: {non_sameas_missing}",
                     f"Enhanced schema with: {', '.join(recommended_fields)}",
                     data_key="structured_data",
                     data_path="structured_data.organization.incomplete",
-                    impact="Missing sameAs and address fields weakens AI entity recognition and Knowledge Graph completeness.",
-                    recommendation="Add sameAs array with social media URLs and address information for comprehensive entity representation."
+                    impact="Missing recommended fields weakens AI entity recognition and Knowledge Graph completeness.",
+                    recommendation="Add logo and address information for comprehensive entity representation."
                 ))
         
         return issues
@@ -117,27 +125,30 @@ class ArticleSchemaRule(BaseSEORuleV2):
         page_type = ContextValidator.detect_page_type(url, content, headings)
         
         # Validation layers
+        # NOTE: is_user_visible (date visibility in page content) is intentionally absent.
+        # ContentFreshnessRule (rule_id: content_freshness) owns that check for all page
+        # types and produces a more actionable finding.  Including it here caused a duplicate
+        # issue on blog pages that have schema dates but no visible date in the content.
         validation_results = {
             'exists': False,
             'is_contextually_valid': False,
             'is_complete': False,
-            'is_user_visible': False,
             'is_semantically_correct': False
         }
-        
+
         failure_reasons = []
-        
+
         # 1. SEMANTIC VALIDATION: Article schema should NOT be on service/product pages
         schema_correct, schema_reason = ContextValidator.validate_schema_correctness(page_type, structured_data)
         if schema_correct:
             validation_results['is_semantically_correct'] = True
         else:
             failure_reasons.append(schema_reason)
-        
+
         # 2. EXISTENCE: Check for Article schema on appropriate pages
         has_article_schema = False
         article_schema = None
-        
+
         for schema in structured_data:
             schema_type = schema.get("@type")
             if isinstance(schema_type, list):
@@ -149,52 +160,58 @@ class ArticleSchemaRule(BaseSEORuleV2):
                 has_article_schema = True
                 article_schema = schema
                 break
-        
+
         if has_article_schema:
             validation_results['exists'] = True
         else:
             failure_reasons.append("No Article schema found")
-        
+
         # 3. CONTEXT VALIDATION: Article schema should be on content pages
         if page_type in ['blog', 'general']:
             validation_results['is_contextually_valid'] = True
         else:
             failure_reasons.append(f"Article schema on {page_type} page is inappropriate")
-        
+
         # 4. COMPLETENESS: Check required fields
         if article_schema:
             required_fields = ["datePublished", "dateModified", "headline"]
             missing_fields = []
-            
+
             for field in required_fields:
                 if not article_schema.get(field):
                     missing_fields.append(field)
-            
+
             if not missing_fields:
                 validation_results['is_complete'] = True
             else:
                 failure_reasons.append(f"Missing required fields: {', '.join(missing_fields)}")
         else:
             failure_reasons.append("No article schema to validate completeness")
-        
-        # 5. UI VISIBILITY: Dates should be visible in content, not just schema
-        date_indicators = ["published", "updated", "date:", "posted on", "last updated"]
-        if ContextValidator.is_ui_visible(content, date_indicators):
-            validation_results['is_user_visible'] = True
-        else:
-            failure_reasons.append("Publication dates not visible in page content")
-        
+
         # Calculate confidence score
         passed_checks = sum(validation_results.values())
         total_checks = len(validation_results)
         confidence_score = ContextValidator.calculate_confidence(passed_checks, total_checks)
-        
-        # FAIL if any critical validation fails
-        if not all([
+
+        # FAIL if:
+        # (a) This is a content page (blog/general) but Article schema is missing or incomplete, OR
+        # (b) An Article schema IS present but on the wrong page type or missing required fields.
+        #
+        # Non-content pages (service, product, etc.) without Article schema are NOT flagged —
+        # the absence of Article schema there is correct and expected behaviour.
+        #
+        # Date visibility in page content is NOT checked here — ContentFreshnessRule owns it.
+        is_content_page = page_type in ['blog', 'general']
+        missing_on_content_page = is_content_page and not all([
             validation_results['exists'],
+            validation_results['is_complete'],
+        ])
+        schema_has_structural_issues = has_article_schema and not all([
             validation_results['is_semantically_correct'],
-            validation_results['is_complete']
-        ]) or (page_type in ['blog', 'general'] and not validation_results['is_user_visible']):
+            validation_results['is_complete'],
+        ])
+
+        if missing_on_content_page or schema_has_structural_issues:
             issues.append(self.create_issue(
                 job_id, project_id, url,
                 f"Article schema validation failed: {', '.join(failure_reasons)}",
@@ -349,21 +366,19 @@ class ProductSchemaRule(BaseSEORuleV2):
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
         structured_data = normalized.get("structured_data", [])
-        
-        # Check if this looks like a product page
-        content = normalized.get("content", "").lower()
-        is_product_page = any(indicator in content for indicator in ["price", "buy", "cart", "product", "shop"])
-        
+
+        is_product_page = self._is_product_page(normalized, url, structured_data)
+
         if is_product_page:
             has_product_schema = False
             product_schema = None
-            
+
             for schema in structured_data:
                 if schema.get("@type") == "Product":
                     has_product_schema = True
                     product_schema = schema
                     break
-            
+
             if not has_product_schema:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
@@ -385,8 +400,45 @@ class ProductSchemaRule(BaseSEORuleV2):
                         data_key="structured_data",
                         data_path="structured_data.product.offers"
                     ))
-        
+
         return issues
+
+    @staticmethod
+    def _is_product_page(normalized, url, structured_data):
+        """
+        Determine whether a page is a genuine product page using a confidence-ranked
+        signal hierarchy. Raw content keywords are NOT a valid signal — they fire on
+        service, about, blog, and home pages that merely mention "price" or "product".
+
+        Priority (highest → lowest):
+          1. page_context stored by the scraper (PageTypeDetector ran at crawl time)
+          2. Schema.org @type = Product / ProductGroup on the page
+          3. URL path segments that unambiguously indicate a product detail page
+        """
+        # 1. Scraper-set page_context (most authoritative)
+        page_context = normalized.get("page_context", {})
+        if page_context:
+            ctx_name = page_context.get("name", "").lower()
+            ctx_confidence = page_context.get("confidence", 0)
+            if ctx_name == "product" and ctx_confidence >= 60:
+                return True
+            # Explicit non-product type with sufficient confidence → reject early
+            if ctx_confidence >= 70 and ctx_name and ctx_name != "generic":
+                return False
+
+        # 2. Schema.org @type on this page signals it is a product
+        for schema in structured_data:
+            schema_type = schema.get("@type")
+            types = schema_type if isinstance(schema_type, list) else [schema_type]
+            if any(t in ("Product", "ProductGroup") for t in types if t):
+                return True
+
+        # 3. URL path — only patterns that unambiguously point to product detail pages
+        detected = page_type_detector.detect_structured(url=url)
+        if detected.get("name", "").lower() == "product" and detected.get("confidence", 0) >= 75:
+            return True
+
+        return False
 
 
 class AggregateRatingSchemaRule(BaseSEORuleV2):
@@ -504,7 +556,15 @@ class SameAsArrayRule(BaseSEORuleV2):
                     continue
             elif schema_type not in ["Organization", "LocalBusiness"]:
                 continue
-            
+
+            # Guard: only validate sameAs when required fields (name, url) are present.
+            # If name or url are missing, OrganizationSchemaRule already reports the broader
+            # incompleteness.  Firing a sameAs-specific issue on top of that is misleading —
+            # the root problem is not sameAs, it is the schema being fundamentally incomplete.
+            # Fix required fields first; sameAs can be addressed afterwards.
+            if not schema.get("name") or not schema.get("url"):
+                continue
+
             same_as = schema.get("sameAs", [])
             if isinstance(same_as, str):
                 same_as = [same_as]

@@ -16,6 +16,8 @@ from scraper.workers.seo.technical_domain.sitemap_fetcher import fetch_sitemap
 from scraper.workers.seo.technical_domain.llms_fetcher import fetch_llms_txt
 from scraper.workers.seo.technical_domain.ssl_checker import check_ssl_certificate
 from scraper.workers.seo.technical_domain.https_redirect_checker import check_https_redirect
+from scraper.workers.seo.technical_domain.ai_crawler_parser import parse_ai_crawler_signals
+from shared.framework_detector import framework_detector
 
 
 
@@ -112,7 +114,18 @@ def execute_technical_domain(job):
         llms_result = fetch_llms_txt(domain_with_protocol)
         print(f"[STEP 3] ✅ llms.txt fetch complete | status={llms_result['status']} | exists={llms_result['exists']} | hasAllow={llms_result['hasAllow']} | hasDisallow={llms_result['hasDisallow']}")
         print(f"[STEP 3] ═══════════════════════════════════════════════════════════")
-        
+
+        # Step 3.5: Parse AI crawler signals from robots.txt (extraction only — no scoring)
+        print(f"[STEP 3.5] ══════════════════════════════════════════════════════════")
+        print(f"[STEP 3.5] Parsing AI crawler signals from robots.txt")
+        ai_crawler_signals = parse_ai_crawler_signals(
+            robots_result.get("content", ""),
+            robots_result.get("exists", False),
+        )
+        accessible_bots = [k for k, v in ai_crawler_signals.items() if v.get("accessible")]
+        print(f"[STEP 3.5] ✅ aiCrawlerSignals parsed | accessible={accessible_bots}")
+        print(f"[STEP 3.5] ══════════════════════════════════════════════════════════")
+
         # Step 4: Check HTTPS redirect first (using base domain)
         print(f"[STEP 4] ═══════════════════════════════════════════════════════════")
         print(f"[STEP 4] Checking HTTPS redirect")
@@ -155,14 +168,45 @@ def execute_technical_domain(job):
             print(f"[STEP 6] ❌ SSL check failed | hostname={final_hostname} | ssl_valid=False")
         print(f"[STEP 6] ═══════════════════════════════════════════════════════════")
         
+        # Step 6.5: Detect framework from homepage HTML
+        print(f"[STEP 6.5] ═══════════════════════════════════════════════════════")
+        print(f"[STEP 6.5] Detecting framework from homepage")
+        framework_result = None
+        try:
+            homepage_url = https_redirect_result.get("final_url") or domain_with_protocol
+            print(f"[STEP 6.5] Fetching homepage HTML for framework detection | url={homepage_url}")
+            resp = requests.get(
+                homepage_url,
+                timeout=10,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; OditoBot/1.0)"},
+                allow_redirects=True,
+            )
+            if resp.status_code == 200:
+                html     = resp.text[:100_000]   # first 100 KB is enough for detection
+                headers  = dict(resp.headers)
+                # Extract generator meta tag for higher-confidence detection
+                gen_match = re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', html, re.IGNORECASE)
+                generator = gen_match.group(1) if gen_match else None
+                framework_result = framework_detector.detect_structured(
+                    html=html,
+                    generator=generator,
+                    headers=headers,
+                )
+                print(f"[STEP 6.5] ✅ Framework detected | name={framework_result['name']} | confidence={framework_result['confidence']}% | source={framework_result['source']}")
+            else:
+                print(f"[STEP 6.5] ⚠️ Homepage fetch returned status={resp.status_code} — skipping framework detection")
+        except Exception as fw_err:
+            print(f"[STEP 6.5] ⚠️ Framework detection failed (non-fatal): {fw_err}")
+        print(f"[STEP 6.5] ═══════════════════════════════════════════════════════")
+
         # Step 7: Store results via Node.js API
         print(f"[STEP 7] ═══════════════════════════════════════════════════════════")
         print(f"[STEP 7] Storing results via Node.js API")
         print(f"[STEP 7] projectId={project_id}")
-        
+
         report_data = {
             "projectId": project_id,
-            "domain": base_domain,  # Store base domain without www as requested
+            "domain": base_domain,
             "robotsStatus": robots_result["status"],
             "robotsExists": robots_result["exists"],
             "robotsContent": robots_result["content"],
@@ -171,12 +215,14 @@ def execute_technical_domain(job):
             "sitemapContent": sitemap_result["content"],
             "parsedSitemapUrlCount": sitemap_result["url_count"],
             "llmsTxt": llms_result,
+            "aiCrawlerSignals": ai_crawler_signals,
             "sslValid": ssl_result["ssl_valid"],
             "sslExpiryDate": ssl_result["ssl_expiry_date"],
             "sslDaysRemaining": ssl_result["ssl_days_remaining"],
             "httpsRedirect": https_redirect_result["https_redirect"],
             "redirectChain": https_redirect_result["redirect_chain"],
-            "finalUrl": https_redirect_result["final_url"]
+            "finalUrl": https_redirect_result["final_url"],
+            "frameworkType": framework_result,
         }
         
         print(f"[STEP 7] Report data prepared | keys={list(report_data.keys())}")
