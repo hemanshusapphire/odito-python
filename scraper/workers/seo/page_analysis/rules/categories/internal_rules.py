@@ -16,19 +16,21 @@ class BrokenLinksRule(BaseSEORuleV2):
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
         broken_count = normalized.get("broken_links_count", 0)
-        
+        broken_links = normalized.get("broken_links", [])
+
         if broken_count > 0:
             issues.append(self.create_issue(
                 job_id, project_id, url,
-                f"Found {broken_count} broken link(s) that return 4XX/5XX errors",
-                f"Broken links count: {broken_count}",
+                "Broken Links",
+                broken_links if broken_links else f"Broken links count: {broken_count}",
                 "0 broken links",
                 data_key="broken_links_count",
                 data_path="broken_links_count",
+                context={"broken_links": broken_links, "count": broken_count},
                 impact="Broken links waste crawl budget, reduce user trust, and leak PageRank. Search engines may lower rankings for pages with poor user experience.",
                 recommendation="Fix or redirect broken URLs using 301 redirects to relevant pages. Implement regular link monitoring to catch future issues quickly."
             ))
-        
+
         return issues
 
 

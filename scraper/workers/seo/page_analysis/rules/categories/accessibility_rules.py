@@ -34,8 +34,8 @@ class AltTextAccessibilityRule(BaseSEORuleV2):
             if alt is None or alt == "":
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Image missing alt text: {src}",
-                    f"No alt attribute for {src}",
+                    "Images Missing Alt Text",
+                    src,
                     "Descriptive alt text on every content image",
                     data_key="images",
                     data_path=f"images.{src}.alt"
@@ -73,7 +73,11 @@ class TextContrastRule(BaseSEORuleV2):
                 f"{nodes} element(s) with contrast ratio below WCAG AA threshold",
                 "Contrast ratio ≥ 4.5:1 for normal text, ≥ 3:1 for large text (WCAG 1.4.3)",
                 data_key="headless",
-                data_path="axeViolations"
+                # Per-violation suffix: multiple axe violations in one loop
+                # sharing a bare "axeViolations" path would collide to one
+                # dedup_key (P0-003) and all but one finding would be lost
+                # under dedup_key-keyed upserts. axe ids are unique per page.
+                data_path=f"axeViolations.{violation.get('id', 'unknown')}"
             ))
 
         return issues
@@ -113,7 +117,8 @@ class FormLabelsRule(BaseSEORuleV2):
                 f"{nodes} form element(s) missing accessible labels",
                 "Every input, select, and textarea must have an associated <label> or aria-label",
                 data_key="headless",
-                data_path="axeViolations"
+                # Per-violation suffix — see ColorContrastRule for rationale.
+                data_path=f"axeViolations.{violation.get('id', 'unknown')}"
             ))
 
         return issues
@@ -298,7 +303,8 @@ class VideoCaptionsRule(BaseSEORuleV2):
                 f"{nodes} video element(s) missing captions or accessibility attributes",
                 "All videos should have captions, tracks, and proper accessibility attributes",
                 data_key="headless",
-                data_path="axeViolations"
+                # Per-violation suffix — see ColorContrastRule for rationale.
+                data_path=f"axeViolations.{violation.get('id', 'unknown')}"
             ))
         
         # If no axe violations found but we want to ensure video analysis happened

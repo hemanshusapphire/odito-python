@@ -2,8 +2,10 @@
 
 import json as _json
 from datetime import datetime
+from typing import Optional
 
 # Third-party imports
+import requests
 from bs4 import BeautifulSoup
 
 # Local imports
@@ -114,16 +116,67 @@ def extract_comprehensive_seo_data(html: str, base_url: str, response_headers: d
         }
 
 
-def scrape_page_data(url: str) -> dict:
+def _classify_fetch_exception(e: Exception) -> dict:
+    """
+    Classify an exception raised by fetch_html() into a normalized
+    failure_type for persistent failure tracking (seo_page_failures).
+    Read-only classification of the real exception — never fabricates a
+    reason. Mirrors the same substring/exception-type approach already used
+    by url_qualification/worker.py's _probe_url() for consistency.
+    """
+    # SSLError is a ConnectionError subclass in requests — must check first.
+    if isinstance(e, requests.exceptions.SSLError):
+        return {"failure_type": "SSL_ERROR", "error_message": str(e)[:500]}
+
+    if isinstance(e, requests.exceptions.ConnectionError):
+        s = str(e).lower()
+        if "getaddrinfo" in s or "name or service not known" in s or "nodename nor servname" in s:
+            return {"failure_type": "DNS_ERROR", "error_message": str(e)[:500]}
+        return {"failure_type": "CONNECTION_ERROR", "error_message": str(e)[:500]}
+
+    if isinstance(e, requests.exceptions.Timeout):
+        return {"failure_type": "TIMEOUT", "error_message": str(e)[:500]}
+
+    if isinstance(e, requests.exceptions.HTTPError):
+        return {"failure_type": "HTTP_ERROR", "error_message": str(e)[:500]}
+
+    if isinstance(e, requests.exceptions.RequestException):
+        # TooManyRedirects, InvalidURL, and any other request-layer failure
+        # not covered above — same bucket as a generic connection problem.
+        return {"failure_type": "CONNECTION_ERROR", "error_message": str(e)[:500]}
+
+    module_name = type(e).__module__ or ""
+    if "playwright" in module_name or "selenium" in module_name:
+        return {"failure_type": "RENDER_FAILED", "error_message": str(e)[:500]}
+
+    return {"failure_type": "UNEXPECTED_EXCEPTION", "error_message": str(e)[:500]}
+
+
+def scrape_page_data(url: str, failure_info: Optional[dict] = None) -> dict:
     """
     Scrape comprehensive SEO data from a single URL.
     Uses existing fetch_html logic with JS detection and Selenium fallback.
+
+    failure_info: optional dict, populated in place with
+    {failure_type, error_message, http_status_code} whenever this call
+    returns None. Purely additive and backward compatible — every existing
+    caller that omits this argument sees identical behavior/return values
+    to before; only a caller that passes a dict gets failure detail.
     """
     try:
         # Use existing fetch_html function (includes JS detection and Selenium fallback)
         html, status_code, response_time, response_headers, _final_url = fetch_html(url, timeout=30)
 
         if status_code != 200 or not html:
+            if failure_info is not None:
+                if status_code and status_code != 200:
+                    failure_info["failure_type"] = "NON_200_STATUS"
+                    failure_info["http_status_code"] = status_code
+                    failure_info["error_message"] = f"HTTP {status_code}"
+                else:
+                    failure_info["failure_type"] = "EMPTY_RESPONSE"
+                    failure_info["http_status_code"] = status_code
+                    failure_info["error_message"] = "Empty or missing HTML content"
             return None
 
         # Extract SEO data (including intelligence layer)
@@ -138,4 +191,7 @@ def scrape_page_data(url: str) -> dict:
         return seo_data
 
     except Exception as e:
+        if failure_info is not None:
+            failure_info.update(_classify_fetch_exception(e))
+            failure_info.setdefault("http_status_code", None)
         return None

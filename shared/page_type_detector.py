@@ -11,7 +11,14 @@ Output schema
 -------------
   detect_structured() → {
       "name":       "Contact",
-      "confidence": 98
+      "confidence": 98,
+      "signals":    {
+          "url":        {"type": "Contact", "confidence": 88},
+          "breadcrumb": None,
+          "template":   None,
+          "content":    {"type": "Contact", "confidence": 72},
+          "schema":     None,
+      }
   }
 
 Canonical types (lowercase stored in DB, title-case for display)
@@ -19,14 +26,20 @@ Canonical types (lowercase stored in DB, title-case for display)
   homepage, article, service, product, collection, faq, about,
   contact, pricing, legal, listing, blog, generic
 
-Detection priority (highest → lowest confidence)
--------------------------------------------------
-  1. Schema.org @type   (90)
-  2. URL path patterns  (60–85)
-  3. Title / H1 content (40–70)
-  4. HTML signals       (40–60)
+Classification weighting (multi-signal accumulation)
+-----------------------------------------------------
+  URL Pattern       = 30%  — most reliable structural signal
+  Breadcrumb        = 25%  — user-visible hierarchy confirms URL intent
+  Page Template     = 20%  — HTML class/element patterns
+  Content Intent    = 15%  — Title / H1 keyword signals
+  Schema Signals    = 10%  — tie-breaker ONLY; schema can NEVER override URL
+
+  Schema intentionally has the lowest weight to prevent circular validation:
+  wrong schema on a page must not cause it to be misclassified as that type,
+  which would then make the wrong schema appear "valid".
 """
 
+from collections import defaultdict
 from typing import Dict, List, Any, Optional
 from urllib.parse import urlparse
 import re
@@ -107,9 +120,10 @@ _URL_RULES: List[tuple] = [
     (r"/about[-_]us",               "about",      90),
     (r"/about$",                    "about",      88),
     (r"/our[-_]story",              "about",      82),
+    (r"/who[-_]we[-_]are",          "about",      78),
     (r"/company",                   "about",      72),
     (r"/team",                      "about",      65),
-    (r"/who[-_]we[-_]are",          "about",      78),
+    (r"^/about[-_]",                "about",      70),  # /about-naxonify, /about-company, etc.
 
     # FAQ
     (r"/faq",                       "faq",        88),
@@ -200,9 +214,18 @@ _HTML_RULES: List[tuple] = [
     (r'effective\s+date',                       "legal",    55),
 ]
 
+# Signal weights (must sum to 100)
+_SIGNAL_WEIGHTS = {
+    "url":        30,
+    "breadcrumb": 25,
+    "template":   20,
+    "content":    15,
+    "schema":     10,
+}
+
 
 class PageTypeDetector:
-    """Unified page type detection with multi-signal confidence scoring."""
+    """Unified page type detection with multi-signal weighted confidence scoring."""
 
     CANONICAL_TYPES = list(_DISPLAY_NAMES.keys())
 
@@ -216,55 +239,124 @@ class PageTypeDetector:
         breadcrumbs: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        Detect page type from multiple signals.
+        Detect page type from multiple signals using weighted scoring.
+
+        Signals are weighted so schema can never override URL/breadcrumb evidence.
+        This prevents circular validation where a wrong schema on a page would
+        cause it to be classified as that schema type, making the wrong schema
+        appear valid.
 
         Returns:
-            { "name": "Contact", "confidence": 98 }
+            {
+                "name":       "Service",
+                "confidence": 77,
+                "signals":    {"url": {"type": "Service", "confidence": 82}, ...}
+            }
         """
-        candidates: List[tuple] = []  # (type, confidence)
+        scores: Dict[str, float] = defaultdict(float)
+        fired: List[tuple] = []   # (signal_name, page_type, raw_confidence)
+        signal_log: Dict[str, Any] = {}
 
-        # ── 1. Schema.org (highest confidence) ───────────────────────────────
-        if schema_type:
-            result = self._from_schema(schema_type)
-            if result:
-                candidates.append(result)
-
-        # ── 2. URL path ───────────────────────────────────────────────────────
+        # ── 1. URL (weight: 30) ───────────────────────────────────────────────
         if url:
             result = self._from_url(url)
             if result:
-                candidates.append(result)
+                ptype, conf = result
+                scores[ptype] += (conf / 100.0) * _SIGNAL_WEIGHTS["url"]
+                fired.append(("url", ptype, conf))
+                signal_log["url"] = {"type": _DISPLAY_NAMES.get(ptype, ptype), "confidence": conf}
+            else:
+                signal_log["url"] = None
 
-        # ── 3. Title / H1 ─────────────────────────────────────────────────────
+        # ── 2. Breadcrumbs (weight: 25) ───────────────────────────────────────
+        if breadcrumbs:
+            result = self._from_breadcrumbs(breadcrumbs)
+            if result:
+                ptype, conf = result
+                scores[ptype] += (conf / 100.0) * _SIGNAL_WEIGHTS["breadcrumb"]
+                fired.append(("breadcrumb", ptype, conf))
+                signal_log["breadcrumb"] = {"type": _DISPLAY_NAMES.get(ptype, ptype), "confidence": conf}
+            else:
+                signal_log["breadcrumb"] = None
+
+        # ── 3. Page template / HTML signals (weight: 20) ─────────────────────
+        if html:
+            result = self._from_html(html[:30_000])  # scan head + above fold only
+            if result:
+                ptype, conf = result
+                scores[ptype] += (conf / 100.0) * _SIGNAL_WEIGHTS["template"]
+                fired.append(("template", ptype, conf))
+                signal_log["template"] = {"type": _DISPLAY_NAMES.get(ptype, ptype), "confidence": conf}
+            else:
+                signal_log["template"] = None
+
+        # ── 4. Content intent / Title + H1 (weight: 15) ──────────────────────
         text_signals = " ".join(filter(None, [title, h1]))
         if text_signals:
             result = self._from_text(text_signals)
             if result:
-                candidates.append(result)
+                ptype, conf = result
+                scores[ptype] += (conf / 100.0) * _SIGNAL_WEIGHTS["content"]
+                fired.append(("content", ptype, conf))
+                signal_log["content"] = {"type": _DISPLAY_NAMES.get(ptype, ptype), "confidence": conf}
+            else:
+                signal_log["content"] = None
 
-        # ── 4. Breadcrumbs ────────────────────────────────────────────────────
-        if breadcrumbs:
-            result = self._from_breadcrumbs(breadcrumbs)
+        # ── 5. Schema signals (weight: 10) — tie-breaker, never primary ───────
+        # Schema evidence is deliberately last and lowest-weighted.
+        # A page with wrong schema (e.g. Article on /service/) scores:
+        #   service URL = 82 × 0.30 = 24.6 pts  ← wins
+        #   article schema = 90 × 0.10 = 9.0 pts ← loses
+        if schema_type:
+            result = self._from_schema(schema_type)
             if result:
-                candidates.append(result)
+                ptype, conf = result
+                scores[ptype] += (conf / 100.0) * _SIGNAL_WEIGHTS["schema"]
+                fired.append(("schema", ptype, conf))
+                signal_log["schema"] = {"type": _DISPLAY_NAMES.get(ptype, ptype), "confidence": conf}
+            else:
+                signal_log["schema"] = None
 
-        # ── 5. HTML body signals ──────────────────────────────────────────────
-        if html:
-            result = self._from_html(html[:30_000])  # scan head + above fold only
-            if result:
-                candidates.append(result)
+        if not scores:
+            return {"name": "Generic", "confidence": 40, "signals": signal_log}
 
-        # Pick highest-confidence non-generic result
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        for ptype, confidence in candidates:
+        # ── Pick winner: highest accumulated score, ignoring generic ──────────
+        winner_type: Optional[str] = None
+        for ptype, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True):
             if ptype != "generic":
-                return {
-                    "name":       _DISPLAY_NAMES.get(ptype, ptype.capitalize()),
-                    "confidence": confidence,
-                }
+                winner_type = ptype
+                break
 
-        # Nothing detected
-        return {"name": "Generic", "confidence": 40}
+        if not winner_type:
+            return {"name": "Generic", "confidence": 40, "signals": signal_log}
+
+        # ── Confidence calculation ────────────────────────────────────────────
+        # Base = highest raw confidence among NON-SCHEMA signals agreeing with winner.
+        # Using non-schema signals as base prevents schema-only pages from reporting
+        # 90% confidence when the schema may be wrong (e.g. template plugin setting
+        # Article schema on every page including /about, /contact, /service).
+        # +3 per additional agreeing signal (max +15) for multi-signal convergence.
+        # -5 per conflicting signal (max -20) for disagreement.
+        winner_signals  = [(n, t, c) for n, t, c in fired if t == winner_type]
+        conflict_signals = [(n, t, c) for n, t, c in fired if t != winner_type and t != "generic"]
+
+        non_schema_winner = [(n, t, c) for n, t, c in winner_signals if n != "schema"]
+        if non_schema_winner:
+            primary_conf = max(c for _, _, c in non_schema_winner)
+        else:
+            # Schema is the ONLY signal — unreliable alone; cap at 45.
+            primary_conf = 45
+
+        agreement_bonus = min(15, (len(winner_signals) - 1) * 3)
+        conflict_penalty = min(20, len(conflict_signals) * 5)
+
+        confidence = max(40, min(99, int(primary_conf + agreement_bonus - conflict_penalty)))
+
+        return {
+            "name":       _DISPLAY_NAMES.get(winner_type, winner_type.capitalize()),
+            "confidence": confidence,
+            "signals":    signal_log,
+        }
 
     # ── Legacy compatibility ─────────────────────────────────────────────────
 
@@ -289,7 +381,7 @@ class PageTypeDetector:
         url:         Optional[str] = None,
         schema_type: Optional[str] = None,
         html:        Optional[str] = None,
-        meta_data:   Optional[Dict[str, Any]] = None,
+        _meta_data:  Optional[Dict[str, Any]] = None,
     ) -> str:
         """Legacy: returns canonical display name string."""
         result = self.detect_structured(url=url, schema_type=schema_type, html=html)

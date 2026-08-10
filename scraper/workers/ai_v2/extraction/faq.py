@@ -11,18 +11,49 @@ import re
 from typing import Any
 
 
+# Common English stop words excluded from token overlap matching.
+# Without stop word filtering, questions sharing only "what/is/the/a" can
+# score ≥ 0.6 overlap even though they cover entirely different topics.
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "i", "you", "we", "they",
+    "it", "he", "she", "this", "that", "these", "those", "to", "of",
+    "in", "on", "at", "by", "for", "with", "about", "from", "and", "or",
+    "but", "not", "no", "so", "if", "then", "than", "when", "where",
+    "which", "who", "what", "how", "why",
+})
+
+
 def _normalize(text: str) -> str:
-    """Lowercase, strip punctuation for fuzzy comparison."""
+    """Lowercase and strip punctuation for fuzzy comparison."""
     return re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Return meaningful tokens — stop words excluded."""
+    return {w for w in _normalize(text).split() if w not in _STOP_WORDS}
 
 
 def _questions_match(schema_q: str, visible_q: str, threshold: float = 0.6) -> bool:
     """
-    Return True if schema question and visible question share enough tokens
-    to be considered the same question.
+    Return True if schema question and visible question share enough
+    content-bearing tokens to be considered the same question.
+
+    Uses content tokens only (stop words removed) to prevent false matches
+    between questions that share only function words ("what is the...").
+    Falls back to full-token overlap when content tokens are too sparse
+    (fewer than 2 tokens) to avoid rejecting legitimate short questions.
     """
-    a_tokens = set(_normalize(schema_q).split())
-    b_tokens = set(_normalize(visible_q).split())
+    a_tokens = _content_tokens(schema_q)
+    b_tokens = _content_tokens(visible_q)
+
+    # Sparse question: fall back to full token set to avoid false negatives
+    # on very short questions like "What is SEO?" (only 1 content token: "seo").
+    if len(a_tokens) < 2:
+        a_tokens = set(_normalize(schema_q).split())
+        b_tokens = set(_normalize(visible_q).split())
+
     if not a_tokens:
         return False
     overlap = len(a_tokens & b_tokens) / len(a_tokens)

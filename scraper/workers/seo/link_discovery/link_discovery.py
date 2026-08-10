@@ -157,7 +157,7 @@ import hashlib
 
 from datetime import datetime
 
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 
 
@@ -186,6 +186,8 @@ from scraper.shared.fetcher import fetch_html
 # from scraper.shared.screenshots import capture_homepage_screenshot  # DISABLED
 
 from scraper.shared.recursive_sitemap import discover_all_sitemap_urls
+
+from scraper.shared.url_filters import should_skip_seo_url
 
 
 from db import seo_internal_links, seo_external_links, seo_social_links, seo_page_data, seo_page_issues, db
@@ -349,6 +351,12 @@ def execute_link_discovery(job: LinkDiscoveryJob):
 
         base_domain = get_registrable_domain(url)
 
+        # Safe default: if the redirect-resolution fetch below fails entirely
+        # (before it can set the real value), URL discovery still proceeds
+        # exactly as before this change — normalize_url() no-ops when
+        # canonical_host is None.
+        canonical_host = None
+
 
 
         print(f"🔄 Starting LINK_DISCOVERY job {job.jobId} for URL: {url}")
@@ -469,6 +477,16 @@ def execute_link_discovery(job: LinkDiscoveryJob):
             # Recompute base_domain from the final URL so internal classification matches reality
             base_domain = get_registrable_domain(url)
 
+            # canonical_host: the already-resolved seed URL's host is the single
+            # source of truth for this audit run. Every URL discovered from here
+            # on (sitemap, anchors, second-level) is folded onto this exact host
+            # form via normalize_url(..., canonical_host=canonical_host) so that
+            # e.g. https://example.com/ and https://www.example.com/ never end
+            # up as two separate seo_internal_links records. Whichever form
+            # (www or non-www) the site's own redirect resolved to wins — this
+            # is never hardcoded.
+            canonical_host = urlparse(url).netloc
+
             if main_status == 200 and main_html:
                 # RC-8: seed the per-job HTML cache with the homepage so it is not
                 # re-fetched if the normalized homepage URL is among the selected pages.
@@ -480,9 +498,9 @@ def execute_link_discovery(job: LinkDiscoveryJob):
                 # Add main page internal links to both collections
                 homepage_added = 0
                 for link in main_internal_links:
-                    normalized_link = normalize_url(link) if isinstance(link, str) else normalize_url(link.get("url", ""))
+                    normalized_link = normalize_url(link, canonical_host=canonical_host) if isinstance(link, str) else normalize_url(link.get("url", ""), canonical_host=canonical_host)
 
-                    if normalized_link and normalized_link not in all_internal_urls:
+                    if normalized_link and normalized_link not in all_internal_urls and not should_skip_seo_url(normalized_link):
                         all_internal_urls.add(normalized_link)
                         all_internal_links.append(normalized_link)  # Add to accumulator for iteration
                         homepage_added += 1
@@ -516,11 +534,13 @@ def execute_link_discovery(job: LinkDiscoveryJob):
             
             discovery_funnel["sitemapUrls"] = len(discovered_sitemap_urls)
 
-            # Add discovered URLs to our collections (already filtered by recursive discovery)
+            # Add discovered URLs to our collections (recursive_sitemap already filtered;
+            # should_skip_seo_url is a defensive layer for any that slipped through)
             for sitemap_url in discovered_sitemap_urls:
-                normalized_sitemap_url = normalize_url(sitemap_url)  # Normalize sitemap URLs too
-                all_internal_urls.add(normalized_sitemap_url)
-                all_internal_links.append(normalized_sitemap_url)
+                normalized_sitemap_url = normalize_url(sitemap_url, canonical_host=canonical_host)  # Normalize sitemap URLs too
+                if not should_skip_seo_url(normalized_sitemap_url):
+                    all_internal_urls.add(normalized_sitemap_url)
+                    all_internal_links.append(normalized_sitemap_url)
                 
         except Exception as sitemap_error:
             print(f"[WORKER] Recursive sitemap discovery failed | jobId={job.jobId} | error=\"{str(sitemap_error)}\"")
@@ -529,9 +549,10 @@ def execute_link_discovery(job: LinkDiscoveryJob):
                 sitemap_urls = extract_links_from_sitemap(url)
                 url_metadata = {}  # Empty metadata for fallback
                 for sitemap_url in sitemap_urls:
-                    normalized = normalize_url(sitemap_url)
-                    all_internal_urls.add(normalized)
-                    all_internal_links.append(normalized)
+                    normalized = normalize_url(sitemap_url, canonical_host=canonical_host)
+                    if not should_skip_seo_url(normalized):
+                        all_internal_urls.add(normalized)
+                        all_internal_links.append(normalized)
                 sitemap_discovery_stats = {
                     'sitemaps_processed': 1,
                     'sitemap_indexes_found': 0,
@@ -601,7 +622,7 @@ def execute_link_discovery(job: LinkDiscoveryJob):
             
             # Normalize every URL before deduplication check
             if link_url:
-                normalized_link_url = normalize_url(link_url)
+                normalized_link_url = normalize_url(link_url, canonical_host=canonical_host)
                 
                 if normalized_link_url and normalized_link_url not in seen_internal:
                     seen_internal.add(normalized_link_url)
@@ -711,7 +732,7 @@ def execute_link_discovery(job: LinkDiscoveryJob):
                 page_internal_links, external_links, social_links = extract_all_links_from_html(page_html, internal_url, base_domain)
                 
                 # Normalize all discovered links
-                normalized_page_internal = [normalize_url(link) if isinstance(link, str) else normalize_url(link.get("url", "")) for link in page_internal_links]
+                normalized_page_internal = [normalize_url(link, canonical_host=canonical_host) if isinstance(link, str) else normalize_url(link.get("url", ""), canonical_host=canonical_host) for link in page_internal_links]
                 # External links disabled - skip normalization
                 normalized_social = [{**link_data, "url": normalize_url(link_data["url"])} for link_data in social_links]
                 
@@ -801,12 +822,14 @@ def execute_link_discovery(job: LinkDiscoveryJob):
 
                 # RC-5: persist newly discovered (second-level) internal links.
                 # Dedupe against seen_internal so we never double-store.
+                # should_skip_seo_url guard prevents archive/author/tag URLs
+                # from bypassing the centralized filter at this stage.
                 for sl in page_internal_links:
                     sl_url = sl if isinstance(sl, str) else (sl.get("url", "") if isinstance(sl, dict) else "")
                     if not sl_url:
                         continue
-                    sl_norm = normalize_url(sl_url)
-                    if sl_norm and sl_norm not in seen_internal:
+                    sl_norm = normalize_url(sl_url, canonical_host=canonical_host)
+                    if sl_norm and sl_norm not in seen_internal and not should_skip_seo_url(sl_norm):
                         seen_internal.add(sl_norm)
                         second_level_docs.append({
                             "url": sl_norm,
@@ -920,10 +943,12 @@ def execute_link_discovery(job: LinkDiscoveryJob):
             "socialLinksCount": social_count,
             "totalUrlsFound": total_urls,
             "sitemapDiscovery": sitemap_discovery_stats,
-            "discoveryFunnel": discovery_funnel
+            "discoveryFunnel": discovery_funnel,
+            "canonicalHost": canonical_host,
+            "canonicalUrl": url,
         }
 
-        
+
 
         # Store stats in result_data for summary aggregation
 
@@ -934,7 +959,9 @@ def execute_link_discovery(job: LinkDiscoveryJob):
             "totalUrlsFound": total_urls,
             "duration_ms": duration_ms,
             "sitemapDiscovery": sitemap_discovery_stats,
-            "discoveryFunnel": discovery_funnel
+            "discoveryFunnel": discovery_funnel,
+            "canonicalHost": canonical_host,
+            "canonicalUrl": url,
         }
 
         

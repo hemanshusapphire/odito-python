@@ -29,24 +29,28 @@ from ..rules.registry import RuleRegistry, HUB_CARD_MAP
 
 
 def _card_score(rule_ids: list[str], results: dict[str, RuleResult]) -> dict[str, Any]:
-    """Compute a single card's score block."""
-    total  = len(rule_ids)
-    passed = sum(1 for rid in rule_ids if results.get(rid) and results[rid].passed)
+    """Compute a single card's score block. SKIPPED rules are excluded from total and passed."""
+    executed_ids = [rid for rid in rule_ids if results.get(rid) and results[rid].result != "SKIPPED"]
+    skipped_ids  = [rid for rid in rule_ids if results.get(rid) and results[rid].result == "SKIPPED"]
+
+    total  = len(executed_ids)
+    passed = sum(1 for rid in executed_ids if results[rid].passed)
     score  = round((passed / total) * 100, 2) if total else 0.0
 
     rules_detail = {}
     for rid in rule_ids:
         r = results.get(rid)
         if r:
-            rules_detail[rid] = {
-                "result":   r.result,
-                "evidence": r.evidence,
-            }
+            entry: dict[str, Any] = {"result": r.result, "evidence": r.evidence}
+            if r.result == "SKIPPED" and r.skipped_reason:
+                entry["skipped_reason"] = r.skipped_reason
+            rules_detail[rid] = entry
 
     return {
         "score":   score,
         "passed":  passed,
         "total":   total,
+        "skipped": len(skipped_ids),
         "rules":   rules_detail,
     }
 
@@ -82,8 +86,9 @@ def build_score_document(
         ai_scores document dict (not yet persisted).
     """
     hubs: dict[str, Any] = {}
-    total_passed = 0
-    total_rules  = 0
+    total_passed  = 0
+    total_rules   = 0
+    total_skipped = 0
 
     for hub, cards in HUB_CARD_MAP.items():
         card_blocks: dict[str, Any] = {}
@@ -91,8 +96,9 @@ def build_score_document(
             rule_ids   = registry.get_rules_for_card(hub, card)
             card_block = _card_score(rule_ids, results)
             card_blocks[card] = card_block
-            total_passed += card_block["passed"]
-            total_rules  += card_block["total"]
+            total_passed  += card_block["passed"]
+            total_rules   += card_block["total"]
+            total_skipped += card_block["skipped"]
 
         hubs[hub] = {
             "score": _hub_score(card_blocks),
@@ -113,6 +119,7 @@ def build_score_document(
             "total_rules":      total_rules,
             "total_passed":     total_passed,
             "total_failed":     total_rules - total_passed,
+            "total_skipped":    total_skipped,
             "overall_pass_rate": overall_pass_rate,
         },
     }
@@ -132,12 +139,19 @@ def score_and_save(
     """
     page_id = page.get("_id")
     doc     = build_score_document(page, results, registry, page_id, project_id, job_id)
+    url     = doc["url"]
 
+    print(f"[V2] Saving ai_score: {url}")
+
+    # Identity is (project_id, url) — NOT job_id. job_id still travels inside
+    # `doc` via $set (provenance: "which job last scored this page"), but a
+    # rescore under a different job_id updates this SAME page's doc in place
+    # instead of creating a duplicate, so project-level aggregation never
+    # sees stale, superseded score rows from earlier job_ids.
     saved = ai_scores.find_one_and_update(
         filter={
             "project_id": doc["project_id"],
-            "job_id":     doc["job_id"],
-            "url":        doc["url"],
+            "url":        url,
         },
         update={"$set": doc},
         upsert=True,
@@ -147,8 +161,11 @@ def score_and_save(
     if saved is None:
         saved = ai_scores.find_one({
             "project_id": doc["project_id"],
-            "job_id":     doc["job_id"],
-            "url":        doc["url"],
+            "url":        url,
         })
 
+    if saved is None:
+        raise RuntimeError(f"[V2] ai_scores upsert returned no document for URL: {url}")
+
+    print(f"[V2] Saved ai_score: {url} | _id={saved.get('_id')}")
     return saved

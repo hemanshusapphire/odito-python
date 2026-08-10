@@ -6,6 +6,10 @@ from datetime import datetime
 
 from bson.objectid import ObjectId
 
+from pymongo import UpdateOne
+
+from pymongo.errors import BulkWriteError
+
 from fastapi import HTTPException
 
 import requests
@@ -170,13 +174,30 @@ def execute_page_analysis_logic(job):
 
         # Query pages scraped by the project (not by specific jobId)
 
-        pages = list(seo_page_data.find({
+        # P2-001: optional URL-scope filter. An empty/absent job.urls (the
+        # default) leaves this query byte-identical to Full Audit's — same
+        # dict, same find() call, same absence of a sort (so match ordering
+        # is whatever Mongo's natural order already was, unchanged either
+        # way). A non-empty list narrows via $in, matching the existing
+        # canonical_urls-empty-means-no-override convention already used by
+        # PAGE_SCRAPING/HEADLESS_ACCESSIBILITY (an empty list is treated the
+        # same as "not provided", not as "these zero URLs").
+
+        page_query = {
 
             "projectId": ObjectId(job.projectId),
 
             "scrape_status": "SUCCESS"
 
-        }))
+        }
+
+        url_filter = getattr(job, 'urls', None)
+
+        if url_filter:
+
+            page_query["url"] = {"$in": url_filter}
+
+        pages = list(seo_page_data.find(page_query))
 
         
 
@@ -263,6 +284,12 @@ def execute_page_analysis_logic(job):
         # Analyze each page and collect issues and summaries
         all_issues = []
         all_summaries = []
+        # P3-002: URLs actually re-analyzed THIS run (success path only — a
+        # page that threw and hit the `except` below never gets here). Only
+        # these pages' issue lifecycle may be reconciled after the upsert;
+        # a page that failed/was skipped was never re-checked, so nothing
+        # about its previously-open issues can be concluded either way.
+        successfully_analyzed_pages = []
         successful_analyses = 0
         failed_analyses = 0
         completed_analyses = 0
@@ -306,6 +333,12 @@ def execute_page_analysis_logic(job):
                 }
                 all_summaries.append(summary_doc)
                 all_issues.extend(page_issues)
+                # Same source field + same normalization analyze_page_seo
+                # uses internally for every issue's page_url (normalize_text
+                # via normalize_page_data) — guarantees an exact string match
+                # against the page_url stored on each of this page's issues,
+                # without needing analyze_page_seo to hand the value back.
+                successfully_analyzed_pages.append(normalize_text(page.get("url")))
 
                 successful_analyses += 1
 
@@ -371,22 +404,55 @@ def execute_page_analysis_logic(job):
         print(f"PAGE_ANALYSIS inserting: {len(all_issues)} total issues")
         print(f"PAGE_ANALYSIS inserting: {len(all_summaries)} total summaries")
 
-        # Insert issues (existing logic)
+        # Upsert issues keyed on dedup_key (P0-005) — see upsert_issues for
+        # the full contract. Replaces the previous insert_many, which
+        # appended duplicate rows on every re-analysis of the same page.
         if all_issues:
             try:
-                result = seo_page_issues.insert_many(all_issues, ordered=False)
-                print(f"PAGE_ANALYSIS inserted: {len(result.inserted_ids)} issues")
+                result = upsert_issues(all_issues)
+                print(f"PAGE_ANALYSIS upserted: inserted={result.upserted_count} updated={result.modified_count} of {len(all_issues)} issues")
             except Exception as insert_error:
-                print(f"PAGE_ANALYSIS insert failed: {insert_error}")
+                print(f"PAGE_ANALYSIS upsert failed: {insert_error}")
                 # Try one by one to see which fail
                 for i, issue in enumerate(all_issues):
                     try:
-                        seo_page_issues.insert_one(issue)
-                        print(f"PAGE_ANALYSIS inserted {i}: {issue.get('issue_code')}")
+                        upsert_issues([issue])
+                        print(f"PAGE_ANALYSIS upserted {i}: {issue.get('issue_code')}")
                     except Exception as single_error:
                         print(f"PAGE_ANALYSIS failed {i}: {issue.get('issue_code')} - {single_error}")
         else:
             print("PAGE_ANALYSIS no issues to insert!")
+
+        # P3-002: reconcile issue lifecycle (OPEN/RESOLVED/REOPENED) for
+        # every page that was ACTUALLY re-analyzed this run — never for a
+        # page that threw and hit the per-page `except` above, since that
+        # page's current state is simply unknown, not "no issues found".
+        # Scoping to successfully_analyzed_pages (not all `pages`) is what
+        # makes this safe for a single-URL Verification run (exactly one
+        # page) as well as a chunked/partial full-crawl batch: a page
+        # outside THIS job's scope never has its issues touched.
+        if successfully_analyzed_pages:
+            from scraper.workers.seo.page_analysis.rules.issue_identity import reconcile_issue_lifecycle
+            dedup_keys_by_page = {}
+            for issue in all_issues:
+                # Defensive .get(): every real factory-produced issue always
+                # has both fields, but must never let one malformed entry
+                # crash the whole PAGE_ANALYSIS job.
+                page_url = issue.get("page_url")
+                dedup_key = issue.get("dedup_key")
+                if page_url and dedup_key:
+                    dedup_keys_by_page.setdefault(page_url, set()).add(dedup_key)
+
+            verified_at = datetime.utcnow()
+            for url in successfully_analyzed_pages:
+                try:
+                    outcome = reconcile_issue_lifecycle(
+                        seo_page_issues, job.projectId, url,
+                        dedup_keys_by_page.get(url, set()), verified_at
+                    )
+                    print(f"PAGE_ANALYSIS lifecycle reconciled | url={url} | resolved={outcome['resolved']} | reopened={outcome['reopened']}")
+                except Exception as reconcile_error:
+                    print(f"PAGE_ANALYSIS lifecycle reconciliation failed | url={url} | error={reconcile_error}")
 
         # Insert summaries (new logic)
         if all_summaries:
@@ -787,7 +853,16 @@ def normalize_page_data(page):
         # Include HTML and Link metrics missing from normalization
         "code_to_html_ratio": page.get("code_to_html_ratio", 0),
         "broken_links_count": page.get("broken_links_count", 0),
+        "broken_links": page.get("broken_links", []),
         
+        # Page classification — written by context_enrichment.py in page_scraping.py.
+        # Rules should call _get_page_type(normalized) (defined in schema_rules.py and
+        # accessible via the rule module) rather than reading these fields directly,
+        # but both are exposed here so the field is discoverable.
+        "page_type": page.get("page_type", "generic"),
+        "page_type_confidence": page.get("page_type_confidence", 0),
+        "page_context": page.get("page_context", {}),
+
         # Include 404 analysis metrics missing from normalization
         "is_404_page": page.get("is_404_page", False),
         "custom_404_detected": page.get("custom_404_detected", False),
@@ -859,7 +934,17 @@ def analyze_page_seo(page, job_id, project_id,
 
 
 def create_issue(job_id, project_id, url, rule_no, category, severity, issue_code, issue_message, detected_value, expected_value, data_key=None, data_path=None):
-    """Create a standardized issue document"""
+    """Create a standardized issue document.
+
+    Note: the live issue factory is BaseSEORuleV2.create_issue (every rule
+    goes through it) — this module-level factory currently has no callers,
+    but is kept field-identical so any future caller produces complete
+    documents, including the P0-003 lifecycle metadata.
+    """
+
+    from scraper.workers.seo.page_analysis.rules.issue_identity import lifecycle_fields
+
+    created_at = datetime.utcnow()
 
     return {
         "projectId": ObjectId(project_id),
@@ -875,8 +960,71 @@ def create_issue(job_id, project_id, url, rule_no, category, severity, issue_cod
         "expected_value": expected_value,
         "data_key": data_key,  # NEW: Reference to seo_page_data field
         "data_path": data_path,  # NEW: Optional sub-filter for complex data
-        "created_at": datetime.utcnow()
+        "created_at": created_at,
+        # P0-003 lifecycle metadata — see issue_identity.py for the
+        # dedup_key contract. Additive only.
+        **lifecycle_fields(project_id, url, issue_code, data_path, created_at)
     }
+
+
+# Lifecycle fields written once at issue creation and NEVER refreshed by
+# re-analysis (P0-005). They mirror issue_identity.lifecycle_fields' keys:
+# lifecycle state belongs to the (future, P3-002) transition function, not to
+# the analysis write path — an upsert refreshing an existing issue must not
+# reset a fix_count or flip a status back to "open".
+LIFECYCLE_INSERT_ONLY_FIELDS = ("status", "first_detected_at", "last_verified_at", "fix_count", "regression_count")
+
+
+def upsert_issues(issues, collection=None):
+    """Persist analysis issues via dedup_key-keyed upsert (P0-005).
+
+    Replaces the previous insert_many write. dedup_key (P0-003) is the
+    issue's identity, enforced unique by db.py's unique_dedup_key index:
+
+    - New identity  → full document inserted ($set + $setOnInsert union is
+      exactly the factory document — Full Audit output unchanged).
+    - Existing identity → analysis payload refreshed ($set of everything
+      except lifecycle fields); lifecycle state untouched ($setOnInsert).
+
+    Single bulk_write, ordered=False — same batching/ordering behavior as
+    the insert_many it replaces. A duplicate-key error (11000) can still
+    occur when two concurrent upserts race to insert the SAME missing
+    dedup_key; the losers are retried once (on retry the document exists and
+    the update leg matches). Any non-duplicate write error is re-raised
+    unchanged.
+
+    collection is injectable for tests only; production call sites omit it.
+    """
+    if collection is None:
+        collection = seo_page_issues
+
+    def _ops(docs):
+        ops = []
+        for issue in docs:
+            set_fields = {
+                key: value for key, value in issue.items()
+                if key not in LIFECYCLE_INSERT_ONLY_FIELDS and key not in ("dedup_key", "_id")
+            }
+            insert_only = {key: issue[key] for key in LIFECYCLE_INSERT_ONLY_FIELDS if key in issue}
+            insert_only["dedup_key"] = issue["dedup_key"]
+            ops.append(UpdateOne(
+                {"dedup_key": issue["dedup_key"]},
+                {"$set": set_fields, "$setOnInsert": insert_only},
+                upsert=True,
+            ))
+        return ops
+
+    try:
+        return collection.bulk_write(_ops(issues), ordered=False)
+    except BulkWriteError as bwe:
+        write_errors = bwe.details.get("writeErrors", [])
+        non_duplicate_errors = [we for we in write_errors if we.get("code") != 11000]
+        if non_duplicate_errors:
+            raise
+        retry_docs = [issues[we["index"]] for we in write_errors]
+        result = collection.bulk_write(_ops(retry_docs), ordered=False)
+        print(f"[WORKER] Retried {len(retry_docs)} seo_page_issues upsert(s) after a concurrent duplicate-key race")
+        return result
 
 
 def is_job_cancelled(job_id):

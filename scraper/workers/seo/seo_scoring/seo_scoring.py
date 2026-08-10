@@ -35,53 +35,61 @@ def get_db_connection():
         raise
 
 def discover_collection_schema(db, collection_name: str) -> Dict[str, Any]:
-    """Discover schema from a collection by sampling documents"""
+    """Discover schema from a collection by sampling documents.
+
+    Returns {} when the collection is empty so callers can skip it in field detection.
+    """
     try:
         collection = db[collection_name]
         sample = collection.find_one()
-        
+
         if not sample:
             print(f"[SCHEMA] {collection_name} is empty")
-            return {}
-        
-        # Discover top-level keys
+            return {}  # empty dict = empty collection; callers must check with `if schema`
+
         top_level_keys = list(sample.keys())
         print(f"[SCHEMA] {collection_name} top-level keys: {top_level_keys}")
-        
-        # Discover nested keys for important fields
+
         nested_structure = {}
         for key, value in sample.items():
             if isinstance(value, dict):
                 nested_structure[key] = list(value.keys())
-                print(f"[SCHEMA] {collection_name}.{key} nested keys: {nested_structure[key]}")
-        
+
         return {
             "sample": sample,
             "top_level_keys": top_level_keys,
             "nested_structure": nested_structure
         }
-        
+
     except Exception as e:
         print(f"[ERROR] Schema discovery failed for {collection_name}: {e}")
         return {}
 
 def detect_project_field(schemas: Dict[str, Any]) -> str:
-    """Detect the project identifier field across collections"""
+    """Detect the project identifier field from non-empty collections only.
+
+    seo_page_performance is optional — it may be empty when SEO_SCORING runs.
+    Requiring it in an intersection causes a guaranteed failure on fresh audits.
+    We resolve by voting: the field that appears in the most non-empty collections wins.
+    Tie-break order matches the priority list.
+    """
     possible_fields = ["projectId", "project_id", "seo_project_id", "projectid"]
-    
+
+    # Only vote from collections that actually have documents
+    required_collections = ["seo_page_data", "seo_page_issues"]
+    optional_collections = ["seo_page_performance"]
+
     for field in possible_fields:
-        found_in_all = True
-        for collection_name in ["seo_page_data", "seo_page_issues", "seo_page_performance"]:
-            schema = schemas.get(collection_name, {})
-            top_level_keys = schema.get("top_level_keys", [])
-            if field not in top_level_keys:
-                found_in_all = False
-                break
-        
-        if found_in_all:
+        # Must be present in all required (non-empty) collections
+        found_in_required = all(
+            field in schemas.get(col, {}).get("top_level_keys", [])
+            for col in required_collections
+            if schemas.get(col)  # skip if schema is empty dict (empty collection)
+        )
+        if found_in_required:
             print(f"[SCHEMA] Detected project field: {field}")
             return field
-    
+
     print(f"[ERROR] No common project field found across collections")
     return None
 
@@ -227,6 +235,119 @@ def website_grade(score: float) -> str:
     if score >= 40: return "D"
     return "F"
 
+def detect_project_field_from_page_scores(db) -> str:
+    """Detect the project identifier field already used in seo_page_scores.
+
+    F4-016: PROJECT_SEO_AGGREGATION reads/writes only seo_page_scores and
+    seoprojects — it has no need for the full schema discovery
+    execute_seo_scoring_logic runs against seo_page_data/seo_page_issues
+    (which may not even be freshly populated at aggregation time for a
+    Verification Batch). Whatever field name SEO_SCORING already wrote each
+    score_doc's project identifier under is sampled directly instead.
+    """
+    possible_fields = ["projectId", "project_id", "seo_project_id", "projectid"]
+    sample = db.seo_page_scores.find_one()
+    if not sample:
+        return None
+    for field in possible_fields:
+        if field in sample:
+            return field
+    return None
+
+def compute_and_persist_website_score(db, project_field: str, project_object_id, job_id: str) -> float:
+    """Website-level SEO score aggregation (SEMrush-style).
+
+    Extracted verbatim from execute_seo_scoring_logic's own former Phase 7
+    (F4-016) so it can be invoked exactly once per Verification Batch via
+    PROJECT_SEO_AGGREGATION, instead of once per page. Reads ALL
+    seo_page_scores for the project — deliberately not scoped to job_id, for
+    the same reason project_aggregator.aggregate_project reads all
+    ai_scores: a job_id-scoped read would only reflect whichever job most
+    recently touched each page, not the whole project's current state.
+    """
+    page_scores = list(
+        db.seo_page_scores.find(
+            {project_field: project_object_id},
+            {"page_score": 1}
+        )
+    )
+
+    if not page_scores:
+        print(f"[WEBSITE] No page scores found for website calculation | jobId={job_id}")
+        return 0
+
+    website_score = round(
+        sum(p["page_score"] for p in page_scores) / len(page_scores),
+        2
+    )
+    website_grade_letter = website_grade(website_score)
+
+    print(f"[WEBSITE] Website score calculated | score={website_score} | grade={website_grade_letter} | jobId={job_id}")
+
+    project_check = db.seoprojects.find_one({"_id": project_object_id})
+    if not project_check:
+        print(f"[ERROR] Project NOT found | project_object_id={project_object_id}")
+
+    update_result = db.seoprojects.update_one(
+        {"_id": project_object_id},
+        {
+            "$set": {
+                "website_score": round(website_score, 2),
+                "website_grade": website_grade_letter,
+                "pages_scored": len(page_scores),
+                "last_scored_at": datetime.utcnow(),
+                "scoring_version": "1.1"
+            }
+        }
+    )
+
+    print(f"[PROJECT] Website metrics write result | matched={update_result.matched_count} | modified={update_result.modified_count} | jobId={job_id}")
+
+    if update_result.matched_count == 0:
+        print(f"[ERROR] No project document found for update | project_object_id={project_object_id}")
+    elif update_result.modified_count == 0:
+        print(f"[WARN] Project found but not modified (values may be the same)")
+    else:
+        print(f"[SUCCESS] Project updated with website metrics | jobId={job_id}")
+
+    return website_score
+
+def execute_project_seo_aggregation_logic(job):
+    """PROJECT_SEO_AGGREGATION (F4-016) — website-level SEO scoring, run
+    exactly once per Verification Batch by chainingEngine's barrier, instead
+    of once per URL. Reuses compute_and_persist_website_score unchanged; the
+    only new logic here is locating the project-field name already used in
+    seo_page_scores and reporting completion/failure back to Node.
+    """
+    try:
+        print(f"[WORKER] PROJECT_SEO_AGGREGATION started | jobId={job.jobId} | projectId={job.projectId}")
+
+        if not ObjectId.is_valid(job.projectId):
+            raise ValueError(f"Invalid projectId: {job.projectId}")
+        project_object_id = ObjectId(job.projectId)
+
+        db = get_db_connection()
+
+        project_field = detect_project_field_from_page_scores(db)
+        if not project_field:
+            error_msg = f"No seo_page_scores found for project {job.projectId} — cannot aggregate"
+            print(f"[ERROR] {error_msg}")
+            send_failure_callback(job.jobId, error_msg)
+            return
+
+        website_score = compute_and_persist_website_score(db, project_field, project_object_id, job.jobId)
+
+        stats = {"websiteScore": round(website_score, 2)}
+        send_completion_callback(job.jobId, stats)
+        print(f"[WORKER] PROJECT_SEO_AGGREGATION completed | jobId={job.jobId} | website_score={website_score:.2f}")
+
+    except Exception as e:
+        error_msg = f"Project SEO aggregation failed: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        import traceback
+        traceback.print_exc()
+        send_failure_callback(job.jobId, error_msg)
+
 def execute_seo_scoring_logic(job):
     """Execute SEO scoring job logic with schema discovery"""
     try:
@@ -272,7 +393,21 @@ def execute_seo_scoring_logic(job):
             project_field: project_object_id,
             "scrape_status": "SUCCESS"   # ✅ correct field - minimal filtering
         }
-        
+
+        # P2-002: optional URL-scope filter. Applied here (not appended to
+        # total_pages_count above, which is a separate, already-unused
+        # diagnostic count of every page in the project regardless of scope
+        # or scrape_status — left untouched, out of scope for "page
+        # selection"). Uses field_mapping["url_data"] — the SAME
+        # schema-discovered field name the rest of this function already
+        # uses to identify a page's URL (see url_data_field below) — not a
+        # hardcoded "url" key, so this stays consistent with this worker's
+        # existing schema-adaptive design. Empty/absent list is treated as
+        # "no filter", matching every sibling worker's convention.
+        url_filter = getattr(job, 'urls', None)
+        if url_filter:
+            page_query[field_mapping["url_data"]] = {"$in": url_filter}
+
         # Check filtered pages count
         filtered_pages_count = db.seo_page_data.count_documents(page_query)
         
@@ -389,77 +524,21 @@ def execute_seo_scoring_logic(job):
                 print(f"[STORAGE] No valid score documents to store | jobId={job.jobId}")
         
         # PHASE 7: WEBSITE-LEVEL SCORING (SEMrush-style)
-        if pages_scored > 0:
+        #
+        # F4-016: for a batched Verification run (job.batchId set), this
+        # project-wide recomputation is deferred to the PROJECT_SEO_AGGREGATION
+        # job — fired exactly once per batch by chainingEngine's barrier —
+        # instead of running once per page here. compute_and_persist_website_score
+        # is unchanged either way; only this call site decides whether THIS
+        # job also runs it inline. Full Audit / legacy verification (no
+        # batchId) are byte-identical to before.
+        is_batched = bool(getattr(job, 'batchId', None))
+        if pages_scored > 0 and not is_batched:
             print(f"[WEBSITE] Calculating website-level score | pages_scored={pages_scored} | jobId={job.jobId}")
-            
-            # Get all page scores for this project
-            page_scores = list(
-                db.seo_page_scores.find(
-                    {project_field: project_object_id},
-                    {"page_score": 1}
-                )
-            )
-            
-            if page_scores:
-                # Calculate weighted average of page scores
-                website_score = round(
-                    sum(p["page_score"] for p in page_scores) / len(page_scores),
-                    2
-                )
-                website_grade_letter = website_grade(website_score)
-                
-                print(f"[WEBSITE] Website score calculated | score={website_score} | grade={website_grade_letter} | jobId={job.jobId}")
-                
-                # Verify project exists before update
-                project_check = db.seoprojects.find_one({"_id": project_object_id})
-                if project_check:
-                    # Project exists, proceed with update
-                    pass
-                else:
-                    print(f"[ERROR] Project NOT found | projectId={job.projectId} | project_object_id={project_object_id}")
-                    print(f"[DEBUG] Available projects (first 3):")
-                    sample_projects = list(db.seoprojects.find({}, {"_id": 1, "project_name": 1}).limit(3))
-                    for p in sample_projects:
-                        print(f"   - _id: {p['_id']} | project_name: {p.get('project_name', 'N/A')}")
-                
-                # Update project with website-level metrics using safe partial update
-                update_result = db.seoprojects.update_one(
-                    {"_id": project_object_id},
-                    {
-                        "$set": {
-                            "website_score": round(website_score, 2),
-                            "website_grade": website_grade_letter,
-                            "pages_scored": len(page_scores),
-                            "last_scored_at": datetime.utcnow(),
-                            "scoring_version": "1.1"
-                        }
-                    }
-                )
-                
-                print(f"[PROJECT] Website metrics write result | matched={update_result.matched_count} | modified={update_result.modified_count} | projectId={job.projectId} | jobId={job.jobId}")
-                
-                # Verify existing fields are preserved after update
-                if update_result.modified_count > 0:
-                    project_after = db.seoprojects.find_one({"_id": project_object_id})
-                    if project_after:
-                        existing_fields = list(project_after.keys())
-                        print(f"[VERIFY] Project fields after SEO update: {existing_fields}")
-                        
-                        # Check for ai_visibility field specifically
-                        if "ai_visibility" in project_after:
-                            print(f"[VERIFY] ai_visibility field preserved: {project_after['ai_visibility']}")
-                        else:
-                            print(f"[WARN] ai_visibility field NOT found after SEO update")
-                
-                if update_result.matched_count == 0:
-                    print(f"[ERROR] No project document found for update | projectId={job.projectId} | project_object_id={project_object_id}")
-                elif update_result.modified_count == 0:
-                    print(f"[WARN] Project found but not modified (values may be the same) | projectId={job.projectId}")
-                else:
-                    print(f"[SUCCESS] Project updated with website metrics | projectId={job.projectId} | jobId={job.jobId}")
-            else:
-                website_score = 0
-                print(f"[WEBSITE] No page scores found for website calculation | jobId={job.jobId}")
+            website_score = compute_and_persist_website_score(db, project_field, project_object_id, job.jobId)
+        elif is_batched:
+            website_score = 0
+            print(f"[WEBSITE] Batched run — deferring website-level scoring to PROJECT_SEO_AGGREGATION | jobId={job.jobId}")
         else:
             website_score = 0
             print(f"[WEBSITE] No pages scored - skipping website calculation | jobId={job.jobId}")

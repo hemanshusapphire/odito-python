@@ -11,10 +11,13 @@ from typing import Any
 
 
 def _find_types(structured_data: list, *types: str) -> list[dict]:
-    """Return all schema items whose @type matches any of the requested types (case-insensitive)."""
+    """Return all schema items whose @type matches any of the requested types (case-insensitive).
+    Non-dict items in structured_data are silently skipped."""
     needle = {t.lower() for t in types}
     result = []
     for item in structured_data:
+        if not isinstance(item, dict):
+            continue
         raw_type = item.get("@type", "")
         variants = raw_type if isinstance(raw_type, list) else [raw_type]
         if any(v.lower() in needle for v in variants):
@@ -49,6 +52,8 @@ def extract_schema(page_data: dict[str, Any]) -> dict[str, Any]:
 
     types_present = []
     for item in raw:
+        if not isinstance(item, dict):
+            continue
         t = item.get("@type", "")
         if isinstance(t, list):
             types_present.extend(t)
@@ -67,7 +72,8 @@ def extract_schema(page_data: dict[str, Any]) -> dict[str, Any]:
     if lb:
         addr = lb.get("address", {}) or {}
         geo  = lb.get("geo", {}) or {}
-        hours = lb.get("openingHoursSpecification", []) or []
+        hours_raw = lb.get("openingHoursSpecification") or []
+        hours = hours_raw if isinstance(hours_raw, list) else [hours_raw]
         same_as = lb.get("sameAs", []) or []
         local_business = {
             "present":    True,
@@ -149,17 +155,41 @@ def extract_schema(page_data: dict[str, Any]) -> dict[str, Any]:
         }
 
     # ── Speakable schema ──────────────────────────────────────────────────────
-    speakable_item = _first(raw, "WebPage", "Article", "NewsArticle")
+    # Speakable can appear as:
+    #   (a) a .speakable property on any WebPage / Article / NewsArticle item
+    #   (b) a standalone SpeakableSpecification item in the graph
+    #
+    # The old code used _first() and only passed when css_selectors was present.
+    # Bugs fixed:
+    #   - Now iterates ALL eligible items so the first item lacking speakable
+    #     does not hide it on a second item.
+    #   - Accepts xpath-only implementations (valid per schema.org spec).
+    #   - Detects standalone SpeakableSpecification items.
     speakable = None
-    if speakable_item and speakable_item.get("speakable"):
-        spk = speakable_item["speakable"]
-        css = spk.get("cssSelector", []) if isinstance(spk, dict) else []
-        xp  = spk.get("xpath", [])        if isinstance(spk, dict) else []
-        speakable = {
-            "present":   True,
-            "css_selectors": css if isinstance(css, list) else [css],
-            "xpath":         xp  if isinstance(xp,  list) else [xp],
-        }
+
+    def _extract_speakable_selectors(spk_val) -> tuple[list, list]:
+        spk = spk_val if isinstance(spk_val, dict) else {}
+        css_raw = spk.get("cssSelector", []) if spk else []
+        xp_raw  = spk.get("xpath", [])        if spk else []
+        css = (css_raw if isinstance(css_raw, list) else [css_raw]) if css_raw else []
+        xp  = (xp_raw  if isinstance(xp_raw,  list) else [xp_raw])  if xp_raw  else []
+        return css, xp
+
+    for candidate in _find_types(raw, "WebPage", "Article", "NewsArticle"):
+        spk_val = candidate.get("speakable")
+        if not spk_val:
+            continue
+        css, xp = _extract_speakable_selectors(spk_val)
+        if css or xp:
+            speakable = {"present": True, "css_selectors": css, "xpath": xp}
+            break
+
+    if not speakable:
+        for spec in _find_types(raw, "SpeakableSpecification"):
+            css, xp = _extract_speakable_selectors(spec)
+            if css or xp:
+                speakable = {"present": True, "css_selectors": css, "xpath": xp}
+                break
 
     return {
         "types_present":  list(set(types_present)),

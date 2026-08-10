@@ -20,11 +20,16 @@ class RuleAEO055SpeakableSchema(BaseRule):
         speakable = page.get("schema", {}).get("speakable") or {}
         present   = bool(speakable.get("present", False))
         selectors = speakable.get("css_selectors", []) or []
-        if present and selectors:
+        xpath     = speakable.get("xpath", []) or []
+        # Pass when speakable is declared with at least one targeting mechanism —
+        # either CSS selectors OR XPath is valid per schema.org spec.
+        # Old code failed xpath-only implementations (selectors was empty → FAIL).
+        if present and (selectors or xpath):
             return self._pass({
                 "speakable_present": True,
-                "css_selectors": selectors,
-                "selector_count": len(selectors),
+                "css_selectors":    selectors,
+                "xpath":            xpath,
+                "selector_count":   len(selectors) + len(xpath),
             })
         return self._fail({"speakable_present": False})
 

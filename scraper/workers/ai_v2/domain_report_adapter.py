@@ -14,7 +14,8 @@ V2 extraction layer expects:
     robots_rules:     list[{user_agent: str, rules: [{type: str, path: str}]}]
     llms_txt:         {exists, urls_listed, broken_urls, malformed,
                        location, status_code, byte_size}
-    sitemap:          {exists: bool, url: str|None}
+    sitemap:          {exists: bool, url: str|None, url_count: int|None}
+    reachability:     {discovered: int|None, qualified: int|None}
 """
 
 import sys, os
@@ -110,6 +111,17 @@ def build_v2_domain_report(project_id: Any) -> dict[str, Any]:
         "exists": bool(doc.get("sitemapExists", False)),
         # V1 doesn't reliably store the sitemap URL
         "url":    None,
+        # AISO-CV8 (Sitemap Breadth Sanity) — V1 field was already being
+        # written by technical_domain/worker.py but never bridged into V2.
+        "url_count": doc.get("parsedSitemapUrlCount"),
+    }
+
+    # reachability — AISO-CV9 (Site-Wide Reachability Ratio). Populated by
+    # url_qualification/worker.py's post-probe patch onto this same document;
+    # absent (None) on projects audited before that patch existed.
+    reachability: dict[str, Any] = {
+        "discovered": doc.get("discoveredUrls"),
+        "qualified":  doc.get("qualifiedUrls"),
     }
 
     return {
@@ -117,4 +129,5 @@ def build_v2_domain_report(project_id: Any) -> dict[str, Any]:
         "robots_exists": bool(doc.get("robotsExists", False)),
         "llms_txt":      llms_txt,
         "sitemap":       sitemap,
+        "reachability":  reachability,
     }

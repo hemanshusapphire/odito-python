@@ -10,6 +10,8 @@ from datetime import datetime
 from bson.objectid import ObjectId
 from typing import List, Optional
 
+from .issue_identity import lifecycle_fields
+
 
 class BaseSEORuleV2(ABC):
     """Abstract base class for all modular SEO rules.
@@ -66,6 +68,8 @@ class BaseSEORuleV2(ABC):
                    "h1_text": "..."
                  }
         """
+        created_at = datetime.utcnow()
+
         issue = {
             "projectId": ObjectId(project_id),
             "seo_jobId": ObjectId(job_id),
@@ -80,7 +84,11 @@ class BaseSEORuleV2(ABC):
             "expected_value": expected_value,
             "data_key": data_key,
             "data_path": data_path,
-            "created_at": datetime.utcnow()
+            "created_at": created_at,
+            # P0-003 lifecycle metadata — see issue_identity.py for the
+            # dedup_key contract. Additive only: every pre-existing field
+            # above is unchanged.
+            **lifecycle_fields(project_id, url, self.rule_id, data_path, created_at)
         }
 
         if impact:

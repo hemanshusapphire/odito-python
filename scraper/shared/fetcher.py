@@ -6,6 +6,7 @@ import random
 import threading
 import logging
 import warnings
+from collections import OrderedDict
 from datetime import datetime
 import time
 
@@ -94,8 +95,20 @@ _session = _build_session()
 # for link discovery without escalating to a (costly) browser render.
 MIN_STATIC_ANCHORS = 5
 
-# JS Domain Cache
-_js_rendering_cache = {}
+# ---------------------------------------------------------------------------
+# Per-URL rendering-decision cache.
+#
+# Deliberately keyed by the exact URL, never by domain: one page's rendering
+# requirement must never be assumed for another page on the same site (a real
+# site can easily mix static marketing pages with a JS-heavy app section on
+# the same domain). Bounded + LRU-evicted so a long-lived worker process
+# serving many audits over time cannot grow this without limit. Thread-safe
+# via a single lock — reads/writes are O(1) dict operations, negligible next
+# to actual page-fetch cost.
+# ---------------------------------------------------------------------------
+_RENDER_DECISION_CACHE_MAX_SIZE = 5000
+_render_decision_cache: "OrderedDict[str, bool]" = OrderedDict()
+_render_decision_cache_lock = threading.Lock()
 
 # Fix B: Audit-level stable User-Agent — set once before fan-out, cleared after.
 # Module-level so all 8 ThreadPoolExecutor threads read the same value without locking.
@@ -103,16 +116,31 @@ _audit_user_agent: str | None = None
 
 
 
-def _is_js_cached(url: str) -> bool:
-    """Check if domain is cached for JS rendering."""
-    return get_domain(url) in _js_rendering_cache
+def _is_js_cached(url: str) -> bool | None:
+    """Return this exact URL's previously-recorded rendering decision.
+
+    Returns None if this URL has never been evaluated before — callers must
+    treat None as "unknown", not as False.
+    """
+    with _render_decision_cache_lock:
+        if url in _render_decision_cache:
+            _render_decision_cache.move_to_end(url)
+            return _render_decision_cache[url]
+        return None
 
 
-def _cache_js_domain(url: str):
-    """Cache domain for JS rendering."""
-    domain = get_domain(url)
-    if domain:
-        _js_rendering_cache[domain] = True
+def _cache_js_domain(url: str, needs_js: bool = True):
+    """Record this exact URL's rendering decision (page-specific, bounded, LRU-evicted).
+
+    Kept under the historical name for callers already using it, but the
+    cache key is now the URL itself, not its domain — see module docstring
+    above for why domain-wide caching was removed.
+    """
+    with _render_decision_cache_lock:
+        _render_decision_cache[url] = needs_js
+        _render_decision_cache.move_to_end(url)
+        if len(_render_decision_cache) > _RENDER_DECISION_CACHE_MAX_SIZE:
+            _render_decision_cache.popitem(last=False)
 
 
 def set_audit_user_agent(ua: str | None) -> None:
@@ -126,26 +154,62 @@ def _get_request_ua() -> str:
     return _audit_user_agent if _audit_user_agent else random.choice(USER_AGENTS)
 
 
-def probe_rendering_need(url: str, timeout: int = 10) -> bool:
-    """Pre-probe whether a domain requires JS rendering before the page fan-out.
+# ---------------------------------------------------------------------------
+# Public, read-only accessors for internal fetch state.
+#
+# Added so callers outside this module (e.g. PAGE_SCRAPING's cloaking-detection
+# feature) can reuse the same per-URL JS-rendering knowledge, connection
+# pool, and stable User-Agent that fetch_html() already maintains, instead of
+# duplicating a fresh HTTP session / UA-selection / cache of their own. These
+# are pure wrappers — zero new logic, no change to fetch_html()'s behavior or
+# return signature.
+# ---------------------------------------------------------------------------
+def is_js_rendering_domain(url: str) -> bool:
+    """Was this exact URL previously determined (this process lifetime) to
+    require JS rendering? Thin public wrapper around the internal per-URL
+    cache used by fetch_html()'s static-first escalation logic.
 
-    Called once per audit, before the ThreadPoolExecutor starts. If the probe
-    detects that the site needs JS rendering, it pre-populates
-    _js_rendering_cache so every worker thread starts with the same rendering
-    decision — eliminating the race condition where some threads receive static
-    HTML and others receive Playwright-rendered HTML for pages on the same domain.
+    Despite the name (kept for backward compatibility with existing callers),
+    this is a per-URL, not per-domain, decision — see the cache's own
+    docstring above.
+    """
+    return _is_js_cached(url) is True
+
+
+def get_request_user_agent() -> str:
+    """Public accessor for the audit-stable User-Agent (falls back to random)."""
+    return _get_request_ua()
+
+
+def get_pooled_session() -> requests.Session:
+    """Public accessor for the shared, connection-pooled requests.Session."""
+    return _session
+
+
+def probe_rendering_need(url: str, timeout: int = 10) -> bool:
+    """Pre-probe whether this specific URL requires JS rendering.
+
+    Called by PAGE_SCRAPING before its ThreadPoolExecutor starts, against a
+    handful of that chunk's own URLs, purely as a warm-up: it pre-populates
+    this one URL's entry in the per-URL rendering-decision cache so that if
+    the same exact URL is fetched again later in the run, the redundant
+    detection work (and, if applicable, a wasted static-HTTP attempt before
+    falling back to Playwright) is skipped. It intentionally has no effect on
+    any other URL, including other pages on the same domain — see the cache's
+    own docstring for why domain-wide propagation was removed.
 
     Args:
-        url: Any URL from the site being audited (homepage or first discovered URL)
+        url: The specific URL to probe.
         timeout: HTTP timeout in seconds (kept short — probe is best-effort)
 
     Returns:
-        True if JS rendering is required, False if static HTML is sufficient.
-        Failures are swallowed silently; worst case the per-page logic runs
-        as before.
+        True if this URL requires JS rendering, False if static HTML is
+        sufficient. Failures are swallowed silently; worst case the per-page
+        logic in fetch_html() runs the detection again on the real fetch.
     """
-    if _is_js_cached(url):
-        return True  # already decided for this domain this process lifetime
+    cached = _is_js_cached(url)
+    if cached is not None:
+        return cached  # already decided for this exact URL this process lifetime
 
     try:
         headers = {
@@ -154,13 +218,15 @@ def probe_rendering_need(url: str, timeout: int = 10) -> bool:
         }
         res = _session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         html = res.text
+        soup = BeautifulSoup(html, "lxml")
 
-        if needs_js_rendering(html):
-            _cache_js_domain(url)
-            print(f"[RENDER] probe: JS rendering required for {get_domain(url)!r} — cache pre-populated")
+        if needs_js_rendering(html, soup=soup):
+            _cache_js_domain(url, needs_js=True)
+            print(f"[RENDER] probe: JS rendering required for {url!r} — cached for this URL")
             return True
 
-        print(f"[RENDER] probe: static HTML sufficient for {get_domain(url)!r}")
+        _cache_js_domain(url, needs_js=False)
+        print(f"[RENDER] probe: static HTML sufficient for {url!r}")
         return False
 
     except Exception as e:
@@ -168,20 +234,94 @@ def probe_rendering_need(url: str, timeout: int = 10) -> bool:
         return False
 
 
+def _has_spa_framework_fingerprint(html_lower: str, soup: "BeautifulSoup") -> bool:
+    """Look for genuine SPA hydration/framework fingerprints -- not generic
+    container ids. A bare ``id="app"`` or ``id="root"`` div is a common,
+    framework-agnostic layout convention used by plenty of static sites and
+    page builders; on its own it is not evidence of any JS framework, so it
+    is deliberately NOT checked here. Every check below is a marker that a
+    real framework's own runtime writes into the page, and that ordinary
+    prose/static HTML has no reason to ever contain.
+    """
+    # React: hydration attributes React itself writes onto rendered DOM nodes.
+    if "data-reactroot" in html_lower or "data-reactid" in html_lower:
+        return True
+
+    # Next.js: the canonical hydration payload script Next.js always emits.
+    if soup.find("script", id=re.compile(r"^__next_data__$", re.IGNORECASE)):
+        return True
+    if "/_next/static/" in html_lower:
+        return True
+
+    # Vue: SSR marker, or the data-v-XXXXXXXX scoped-style attribute every
+    # compiled Vue single-file component carries on its rendered elements.
+    if 'data-server-rendered="true"' in html_lower:
+        return True
+    if re.search(r"data-v-[0-9a-f]{6,}", html_lower):
+        return True
+
+    # Angular: the ng-version attribute Angular CLI apps always render on
+    # their root component, or the legacy AngularJS 1.x ng-app directive --
+    # both require the "=" immediately after so a coincidental substring in
+    # unrelated text/URLs (e.g. "tracking-apps") can never match.
+    if re.search(r"\bng-version\s*=", html_lower) or re.search(r"\bng-app\s*=", html_lower):
+        return True
+
+    # Gatsby: its own, near-unique root container id.
+    if soup.find(id="___gatsby"):
+        return True
+
+    # Nuxt: its own root container id, or the runtime data global it sets.
+    if soup.find(id="__nuxt") or "window.__nuxt__" in html_lower:
+        return True
+
+    return False
+
+
+def _has_shopify_fingerprint(html_lower: str, soup: "BeautifulSoup") -> bool:
+    """Look for genuine Shopify platform signals -- never a bare "shopify"
+    text match, which matches equally well when a page's own prose simply
+    *mentions* Shopify (e.g. an article titled "Shopify SEO" or a sentence
+    listing well-known e-commerce brands). Every check below is something
+    only an actual Shopify-hosted storefront's theme engine emits.
+    """
+    # Shopify's own asset CDN -- only ever appears in <script>/<link> src
+    # attributes on a real Shopify storefront, never in ordinary body text.
+    if "cdn.shopify.com" in html_lower or "cdn.shopifycdn.net" in html_lower:
+        return True
+
+    # The global `Shopify` JS object every Shopify theme initializes.
+    if "window.shopify" in html_lower or re.search(r"\bshopify\s*=\s*shopify\s*\|\|", html_lower):
+        return True
+
+    # Shopify-specific meta tags (checkout API token, digital wallet, etc.)
+    # and the occasional explicit generator meta tag.
+    for meta in soup.find_all("meta"):
+        name = (meta.get("name") or "").strip().lower()
+        if name.startswith("shopify-"):
+            return True
+        if name == "generator" and "shopify" in (meta.get("content") or "").lower():
+            return True
+
+    return False
+
+
 def needs_js_rendering(html: str, soup: "BeautifulSoup | None" = None) -> bool:
     """Determine if page needs JavaScript rendering.
 
     Enhanced detection for:
-    - React/Next/Vue/Angular SPA frameworks
-    - Shopify Liquid templates
+    - React/Next/Vue/Angular/Gatsby/Nuxt SPA frameworks (genuine fingerprints only)
+    - Shopify storefronts (genuine platform signals only)
     - Client-side rendered content
     - Minimal server-side content
 
     Accepts an optional pre-parsed ``soup`` so callers that already parsed the
-    HTML do not pay for a second BeautifulSoup parse (single-pass). The previous
-    implementation tokenized every word with a regex over the full document text
-    purely to count words; we now use a much cheaper visible-text length check
-    that preserves the same "light content" intent without the CPU/GIL cost.
+    HTML do not pay for a second BeautifulSoup parse (single-pass).
+
+    Deliberately page-specific: this function only ever inspects the HTML it
+    is given and returns a decision for that one page. Callers are
+    responsible for not generalizing the result to any other URL (see the
+    per-URL rendering-decision cache above).
     """
     if soup is None:
         soup = BeautifulSoup(html, "lxml")
@@ -189,24 +329,14 @@ def needs_js_rendering(html: str, soup: "BeautifulSoup | None" = None) -> bool:
     html_lower = html.lower()
 
     # Condition 1: Very light visible content (likely client-rendered).
-    # Cheaper proxy for the old "<100 words" heuristic.
     visible_text = soup.get_text(strip=True)
     is_light_content = len(visible_text) < 600
 
-    # Condition 2: SPA framework markers
-    has_js_markers = bool(
-        soup.find(id="root") or
-        soup.find(id="__next") or
-        soup.find(id="app") or
-        soup.find(id="vue-app") or
-        soup.find("ng-app")
-    )
+    # Condition 2: genuine SPA framework fingerprints (not generic container ids)
+    has_js_markers = _has_spa_framework_fingerprint(html_lower, soup)
 
-    # Condition 3: Shopify-specific markers (string scan is cheap, avoid re-parse)
-    has_shopify_markers = (
-        "shopify" in html_lower or
-        "myshopify.com" in html_lower
-    )
+    # Condition 3: genuine Shopify platform signals (not a text mention of the word)
+    has_shopify_markers = _has_shopify_fingerprint(html_lower, soup)
 
     # Condition 4: Missing critical content despite having HTML structure
     has_title = bool(soup.find("title"))
@@ -217,43 +347,51 @@ def needs_js_rendering(html: str, soup: "BeautifulSoup | None" = None) -> bool:
 
 
 def detect_js_framework_early(html_snippet: str, resp_headers: dict = None) -> str | None:
-    """Detect JS framework from response headers or first ~2KB of HTML.
-    
+    """Detect JS framework from response headers or first ~3KB of HTML.
+
     Returns framework name if detected, None otherwise.
     Used to skip remaining HTTP retries and go straight to Playwright.
+
+    Every pattern below anchors on an actual attribute assignment or a
+    near-unique runtime token, never a bare word, so it cannot match generic
+    prose, URL slugs, or filenames that merely happen to contain the same
+    letters (e.g. "tracking-apps" must never match Angular's "ng-app").
     """
-    # Check response headers first (cheapest detection)
+    # Check response headers first (cheapest detection). Headers are set by
+    # the server/CDN itself, not page content, so these are already low-risk;
+    # scoped to specific known header names/values rather than "any header
+    # containing this substring" for extra precision.
     if resp_headers:
         headers_lower = {k.lower(): v.lower() for k, v in resp_headers.items() if isinstance(v, str)}
-        
+
         # Next.js
-        if 'x-powered-by' in headers_lower and 'next' in headers_lower['x-powered-by']:
+        if 'x-powered-by' in headers_lower and 'next.js' in headers_lower['x-powered-by']:
             return 'nextjs'
-        
-        # Shopify
-        if any('shopify' in v for v in headers_lower.values()):
+
+        # Shopify: its own well-known response headers.
+        if 'x-shopid' in headers_lower or 'x-shopify-stage' in headers_lower or 'x-sorting-hat-podid' in headers_lower:
             return 'shopify'
-        
+
         # Nuxt
         if 'x-powered-by' in headers_lower and 'nuxt' in headers_lower['x-powered-by']:
             return 'nuxt'
-    
+
     # Check first 3KB of HTML for framework markers (no full parse needed)
     snippet = html_snippet[:3000].lower() if html_snippet else ""
-    
-    if '__next_data__' in snippet or '__next' in snippet:
+
+    if 'id="__next_data__"' in snippet or '/_next/static/' in snippet:
         return 'nextjs'
-    if 'data-reactroot' in snippet or 'id="root"' in snippet:
+    if 'data-reactroot' in snippet or 'data-reactid' in snippet:
         return 'react'
-    if 'ng-version' in snippet or 'ng-app' in snippet:
+    if re.search(r"\bng-version\s*=", snippet) or re.search(r"\bng-app\s*=", snippet):
         return 'angular'
-    if '__nuxt' in snippet or 'nuxt' in snippet:
+    if 'id="__nuxt"' in snippet or 'window.__nuxt__' in snippet:
         return 'nuxt'
-    if 'data-vue-app' in snippet or 'id="vue-app"' in snippet:
+    if 'data-server-rendered="true"' in snippet or re.search(r"data-v-[0-9a-f]{6,}", snippet):
         return 'vue'
-    if 'gatsby' in snippet:
+    if 'id="___gatsby"' in snippet or 'content="gatsby' in snippet:
         return 'gatsby'
-    
+
     return None
 
 
@@ -443,7 +581,10 @@ def fetch_html(url: str, timeout: int = 8, prefer_static_for_links: bool = False
     
     # Static-first mode (link discovery) skips the eager browser path; it will
     # escalate to a render later only if the static HTML has too few anchors.
-    if (is_shopify or _is_js_cached(url)) and not prefer_static_for_links:
+    # _is_js_cached(url) is a per-URL decision (see cache docstring above) --
+    # only THIS exact URL's own prior outcome can shortcut straight to a
+    # browser render here, never another page's.
+    if (is_shopify or _is_js_cached(url) is True) and not prefer_static_for_links:
         if PLAYWRIGHT_AVAILABLE:
             try:
                 html, status, rt, _, final_url = fetch_html_playwright(url, timeout * 3, user_agent=_get_request_ua())

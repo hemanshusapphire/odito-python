@@ -20,6 +20,7 @@ from ...base import BaseRule, RuleResult
 class RuleAISO001GPTBot(BaseRule):
     RULE_ID  = "AISO-001"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "critical"
+    SCOPE    = "domain"
     ISSUE_TITLE       = "GPTBot Access Blocked"
     ISSUE_DESCRIPTION = "robots.txt is preventing OpenAI's GPTBot from crawling this page. ChatGPT and all GPT-powered products cannot cite your content."
     RECOMMENDATION    = "Remove the Disallow directive for GPTBot. If blocked by a wildcard rule, add: User-agent: GPTBot / Allow: / beneath the wildcard block."
@@ -35,6 +36,7 @@ class RuleAISO001GPTBot(BaseRule):
 class RuleAISO002PerplexityBot(BaseRule):
     RULE_ID  = "AISO-002"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "critical"
+    SCOPE    = "domain"
     ISSUE_TITLE       = "PerplexityBot Access Blocked"
     ISSUE_DESCRIPTION = "PerplexityBot is blocked, removing your content from Perplexity AI's answer and citation pool entirely."
     RECOMMENDATION    = "Remove the PerplexityBot block from robots.txt, or add an explicit Allow: / override if blocked by a wildcard rule."
@@ -50,6 +52,7 @@ class RuleAISO002PerplexityBot(BaseRule):
 class RuleAISO003ClaudeBot(BaseRule):
     RULE_ID  = "AISO-003"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "high"
+    SCOPE    = "domain"
     ISSUE_TITLE       = "ClaudeBot Access Blocked"
     ISSUE_DESCRIPTION = "Anthropic's ClaudeBot is blocked, reducing citation probability across Claude AI products."
     RECOMMENDATION    = "Remove the ClaudeBot block from robots.txt."
@@ -65,6 +68,7 @@ class RuleAISO003ClaudeBot(BaseRule):
 class RuleAISO004GoogleExtended(BaseRule):
     RULE_ID  = "AISO-004"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "critical"
+    SCOPE    = "domain"
     ISSUE_TITLE       = "Google-Extended Blocked — AI Overview Visibility Eliminated"
     ISSUE_DESCRIPTION = "Google-Extended is blocked, removing this page from Google AI Overviews and Gemini — the highest-volume AI answer surface."
     RECOMMENDATION    = "Remove the Google-Extended block immediately. If blocked via wildcard, add: User-agent: Google-Extended / Allow: /."
@@ -80,6 +84,7 @@ class RuleAISO004GoogleExtended(BaseRule):
 class RuleAISO005Bingbot(BaseRule):
     RULE_ID  = "AISO-005"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "high"
+    SCOPE    = "domain"
     ISSUE_TITLE       = "Bingbot Blocked — Microsoft Copilot Visibility Lost"
     ISSUE_DESCRIPTION = "Bingbot is blocked. Microsoft Copilot and all Bing AI products cannot cite your pages."
     RECOMMENDATION    = "Remove the Bingbot block from robots.txt."
@@ -95,6 +100,7 @@ class RuleAISO005Bingbot(BaseRule):
 class RuleAISO006LlmsTxtExists(BaseRule):
     RULE_ID  = "AISO-006"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "medium"
+    SCOPE    = "domain"
     ISSUE_TITLE       = "llms.txt File Missing"
     ISSUE_DESCRIPTION = "No llms.txt found. AI crawlers lack a structured signal for which pages to prioritise."
     RECOMMENDATION    = "Create an llms.txt file at your domain root following the llmstxt.org specification."
@@ -116,15 +122,16 @@ class RuleAISO006LlmsTxtExists(BaseRule):
 class RuleAISO007LlmsTxtAccurate(BaseRule):
     RULE_ID  = "AISO-007"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "medium"
+    SCOPE    = "domain"
+    DEPENDS_ON = ["AISO-006:PASS"]
     ISSUE_TITLE       = "llms.txt Contains Broken or Outdated References"
     ISSUE_DESCRIPTION = "Your llms.txt lists pages that no longer exist or are malformed, degrading AI crawler trust."
     RECOMMENDATION    = "Audit all URLs in llms.txt. Remove deleted pages and update moved ones. Run this review monthly."
     EXPECTED_IMPACT   = "medium"
 
     def evaluate(self, page: dict[str, Any]) -> RuleResult:
-        llms = page.get("crawlability", {}).get("llms_txt", {})
-        if not llms.get("exists", False):
-            return self._fail({"found": False, "reason": "llms.txt absent — cannot be accurate"})
+        # AISO-006:PASS guarantees llms.txt exists before this runs.
+        llms      = page.get("crawlability", {}).get("llms_txt", {})
         broken    = llms.get("broken_urls", [])
         malformed = bool(llms.get("malformed", False))
         if not broken and not malformed:
@@ -145,6 +152,8 @@ class RuleAISO007LlmsTxtAccurate(BaseRule):
 class RuleAISO008GPTBotExplicitAllow(BaseRule):
     RULE_ID  = "AISO-008"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "medium"
+    SCOPE    = "domain"
+    DEPENDS_ON = ["AISO-006:PASS", "AISO-007:EXECUTED"]
     ISSUE_TITLE       = "GPTBot Not Explicitly Allowed"
     ISSUE_DESCRIPTION = "robots.txt does not contain a named GPTBot Allow directive. While GPTBot may not be blocked, an explicit allow signals deliberate AI-readiness to crawlers and auditors."
     RECOMMENDATION    = "Add a dedicated GPTBot stanza to robots.txt: User-agent: GPTBot / Allow: /"
@@ -160,6 +169,8 @@ class RuleAISO008GPTBotExplicitAllow(BaseRule):
 class RuleAISO009ClaudeBotExplicitAllow(BaseRule):
     RULE_ID  = "AISO-009"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "medium"
+    SCOPE    = "domain"
+    DEPENDS_ON = ["AISO-006:PASS", "AISO-007:EXECUTED"]
     ISSUE_TITLE       = "ClaudeBot Not Explicitly Allowed"
     ISSUE_DESCRIPTION = "robots.txt does not contain a named ClaudeBot Allow directive. An explicit allow signals deliberate support for Anthropic's crawler."
     RECOMMENDATION    = "Add a dedicated ClaudeBot stanza to robots.txt: User-agent: ClaudeBot / Allow: /"
@@ -175,6 +186,8 @@ class RuleAISO009ClaudeBotExplicitAllow(BaseRule):
 class RuleAISO010PerplexityBotExplicitAllow(BaseRule):
     RULE_ID  = "AISO-010"
     HUB, CARD, SEVERITY = "aiso", "crawlability", "medium"
+    SCOPE    = "domain"
+    DEPENDS_ON = ["AISO-006:PASS", "AISO-007:EXECUTED"]
     ISSUE_TITLE       = "PerplexityBot Not Explicitly Allowed"
     ISSUE_DESCRIPTION = "robots.txt does not contain a named PerplexityBot Allow directive. An explicit allow signals deliberate support for Perplexity AI's crawler."
     RECOMMENDATION    = "Add a dedicated PerplexityBot stanza to robots.txt: User-agent: PerplexityBot / Allow: /"

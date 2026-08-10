@@ -77,31 +77,11 @@ jobs = db["jobs"]
 # collection for domain-level performance analysis
 seo_domain_performance = db["seo_domain_performance"]
 
-# collection for AI visibility analysis
-seo_ai_visibility = db["seo_ai_visibility"]
-
-# collection for AI visibility internal links (discovery)
-seo_ai_internal_links = db["seo_ai_internal_links"]
-
-# collection for AI visibility projects
-seo_ai_visibility_project = db["seo_ai_visibility_project"]
-
-
-# collection for AI visibility page scores
-seo_ai_page_scores = db["seo_ai_page_scores"]
-
-# collection for AI visibility issues (derived from rule_breakdown)
-seo_ai_visibility_issues = db["seo_ai_visibility_issues"]
-
 # collection for SEO page analysis summaries
 seo_page_summary = db["seo_page_summary"]
 
 # collection for domain-level technical data (robots.txt, sitemap.xml)
 domain_technical_reports = db["domain_technical_reports"]
-
-# collections for keyword research results
-seo_keyword_research = db["seo_keyword_research"]
-seo_keyword_opportunities = db["seo_keyword_opportunities"]
 
 # collection for SEO ranking results (onboarding)
 seo_rankings = db["seo_rankings"]
@@ -160,6 +140,27 @@ except Exception as e:
     else:
         print(f"⚠️ Failed to create index on seo_page_data (page_type): {e}")
 
+# Unique index (projectId, url) — the sole guard against duplicate SUCCESS
+# documents when a whole PAGE_SCRAPING chunk job is retried after a partial
+# crash. resetProjectCrawlData() already clears every seo_page_data document
+# for a project at the start of each new audit run, so at any moment all
+# documents for one projectId belong to the current run only — no run_id
+# field is needed here for this constraint to be correct. page_scraping.py's
+# insert_many is the only writer to this collection in the whole codebase
+# and is paired with duplicate-key-tolerant error handling for this index.
+try:
+    seo_page_data.create_index(
+        [("projectId", 1), ("url", 1)],
+        unique=True,
+        name="unique_project_url"
+    )
+    print("✅ Created unique index on seo_page_data (projectId, url)")
+except Exception as e:
+    if "already exists" in str(e):
+        print("✅ Unique index on seo_page_data (projectId, url) already exists")
+    else:
+        print(f"⚠️ Failed to create unique index on seo_page_data (projectId, url): {e}")
+
 try:
     seo_page_issues.create_index([("projectId", 1)])
     print("✅ Created index on seo_page_issues (projectId)")
@@ -169,84 +170,32 @@ except Exception as e:
     else:
         print(f"⚠️ Failed to create index on seo_page_issues: {e}")
 
-# Create unique index for AI visibility page scores (mirroring SEO structure)
+# Unique index on dedup_key (P0-005) — converts seo_page_issues from
+# insert-only to upsert-capable. dedup_key (P0-003: sha256 of
+# project|url|issue_code|data_path, stamped by both issue factories and
+# backfilled by P0-004) is the issue's identity; this index enforces one
+# document per identity and guards the upsert write path in
+# page_analysis.upsert_issues against concurrent-insert races.
+#
+# PRECONDITION: 100% dedup_key coverage + zero duplicate identities
+# (P0-004 backfill + duplicate resolution must have run). If a duplicate
+# still exists, this build FAILS — the loud error below is intentional and
+# means the P0-004 dry-run report must be re-run and resolved. The upsert
+# write path remains functionally correct without the index (filter-based),
+# so a failed build here degrades race-safety/speed, not correctness.
 try:
-    # Drop old index if it exists to prevent conflicts
-    try:
-        seo_ai_page_scores.drop_index("unique_project_ai_page_score")
-        print("🔄 Dropped old unique_project_ai_page_score index")
-    except:
-        pass  # Index doesn't exist, that's fine
-    
-    # Create new index with correct field name for consistency with issues collection
-    seo_ai_page_scores.create_index(
-        [("projectId", 1), ("page_url", 1)],  # 🔥 PHASE 4: Use page_url to match issues collection
+    seo_page_issues.create_index(
+        [("dedup_key", 1)],
         unique=True,
-        name="unique_project_ai_page_score"
+        name="unique_dedup_key"
     )
-    print("✅ Created unique index on seo_ai_page_scores (projectId, page_url)")
+    print("✅ Created unique index on seo_page_issues (dedup_key)")
 except Exception as e:
     if "already exists" in str(e):
-        print("✅ Unique index on seo_ai_page_scores already exists")
+        print("✅ Unique index on seo_page_issues (dedup_key) already exists")
     else:
-        print(f"⚠️ Failed to create index on seo_ai_page_scores: {e}")
-
-
-# Create indexes for AI page scores
-try:
-    seo_ai_page_scores.create_index([("projectId", 1), ("page_url", 1)], unique=True)  # 🔥 FIXED: Use page_url not url
-    seo_ai_page_scores.create_index([("projectId", 1), ("overall_page_score", -1)])
-    seo_ai_page_scores.create_index([("projectId", 1), ("blocking", 1)])
-    seo_ai_page_scores.create_index([("ai_jobId", 1)])
-    print("✅ Created indexes on seo_ai_page_scores")
-except Exception as e:
-    if "already exists" in str(e):
-        print("✅ Indexes on seo_ai_page_scores already exist")
-    else:
-        print(f"⚠️ Failed to create indexes on seo_ai_page_scores: {e}")
-
-# ==================== AI PIPELINE UNIQUE INDEXES ====================
-# CRITICAL: Prevent duplicate AI visibility records per (projectId, url)
-try:
-    seo_ai_visibility.create_index(
-        [("projectId", 1), ("url", 1)],
-        unique=True,
-        name="unique_project_url_visibility"
-    )
-    print("✅ Created unique index on seo_ai_visibility (projectId, url)")
-    
-    # Check for existing duplicates
-    duplicate_pipeline = [
-        {"$group": {"_id": {"projectId": "$projectId", "url": "$url"}, "count": {"$sum": 1}}},
-        {"$match": {"count": {"$gt": 1}}}
-    ]
-    duplicates = list(seo_ai_visibility.aggregate(duplicate_pipeline))
-    if duplicates:
-        print(f"⚠️ WARNING: Found {len(duplicates)} duplicate AI visibility records")
-        print("   Run manual cleanup if needed: seo_ai_visibility.deleteMany(duplicates)")
-    else:
-        print("✅ No duplicate AI visibility records found")
-        
-except Exception as e:
-    if "already exists" in str(e):
-        print("✅ Unique index on seo_ai_visibility already exists")
-    else:
-        print(f"⚠️ Failed to create index on seo_ai_visibility: {e}")
-
-print("✅ AI Pipeline unique indexes creation completed")
-
-# Create index for AI visibility issues (for efficient querying and cleanup)
-try:
-    seo_ai_visibility_issues.create_index([("projectId", 1), ("page_url", 1)])
-    seo_ai_visibility_issues.create_index([("projectId", 1), ("severity", 1)])
-    seo_ai_visibility_issues.create_index([("category", 1)])
-    seo_ai_visibility_issues.create_index([("created_at", -1)])
-    print("✅ Created indexes on seo_ai_visibility_issues")
-except Exception as e:
-    if "already exists" in str(e):
-        print("✅ Indexes on seo_ai_visibility_issues already exist")
-    else:
-        print(f"⚠️ Failed to create indexes on seo_ai_visibility_issues: {e}")
+        print(f"⚠️ Failed to create unique index on seo_page_issues (dedup_key): {e}")
+        print("⚠️ ACTION REQUIRED: run `python -m scripts.backfill_seo_page_issues_lifecycle` (dry run) and resolve any missing/duplicate dedup_keys before this index can build.")
 
 # Create unique index for domain technical reports (one per project)
 try:
@@ -352,6 +301,55 @@ except Exception as e:
     else:
         print(f"⚠️ Failed to create indexes on seo_audit_url_pool: {e}")
 
+# Persistent PAGE_SCRAPING failure tracking — one document per URL that
+# scrape_single_url() could not turn into a seo_page_data record (timeout,
+# DNS/SSL/connection error, non-200 status, empty response, extraction
+# failure, render failure, or an unexpected exception). Purely additive
+# observability: nothing reads from this collection to make a pipeline
+# decision, and nothing existing writes to it except the new failure-path
+# code in page_scraping.py.
+seo_page_failures = db["seo_page_failures"]
+
+try:
+    # Lookup: every failure for one audit run (the primary reporting query)
+    seo_page_failures.create_index(
+        [("project_id", 1), ("run_id", 1)],
+        name="project_run_lookup"
+    )
+    # Breakdown query: count by failure_type within a run
+    seo_page_failures.create_index(
+        [("project_id", 1), ("run_id", 1), ("failure_type", 1)],
+        name="project_run_failure_type_lookup"
+    )
+    # Paginated/sorted report query (GET /projects/:id/page-failures): lets
+    # Mongo satisfy the {project_id, run_id} filter AND the failed_at sort
+    # entirely from the index — no in-memory sort stage — at the 10k+
+    # failures-in-one-run scale the reporting API must stay performant at.
+    seo_page_failures.create_index(
+        [("project_id", 1), ("run_id", 1), ("failed_at", -1)],
+        name="project_run_recent_lookup"
+    )
+    # Per-URL forensic lookup across runs (mirrors seo_audit_url_pool's
+    # project_url_lookup index) — "has this URL ever failed, and how".
+    seo_page_failures.create_index(
+        [("project_id", 1), ("url", 1)],
+        name="project_url_lookup"
+    )
+    # TTL: automatically delete records older than 90 days — audit trail
+    # only, longer retention than seo_audit_url_pool since these are rarer
+    # and more valuable for forensic investigation.
+    seo_page_failures.create_index(
+        [("failed_at", 1)],
+        expireAfterSeconds=90 * 24 * 60 * 60,  # 90 days
+        name="ttl_90d"
+    )
+    print("✅ Created indexes on seo_page_failures")
+except Exception as e:
+    if "already exists" in str(e):
+        print("✅ Indexes on seo_page_failures already exist")
+    else:
+        print(f"⚠️ Failed to create indexes on seo_page_failures: {e}")
+
 # ── AI Intelligence V2 collections ──────────────────────────────────────────
 ai_pages     = db["ai_pages"]
 ai_scores    = db["ai_scores"]
@@ -368,8 +366,18 @@ except Exception as e:
     print("✅ ai_pages indexes exist" if "already exists" in str(e) else f"⚠️ ai_pages index error: {e}")
 
 try:
-    # ai_scores: one score doc per (project, job, url)
-    ai_scores.create_index([("project_id", 1), ("job_id", 1), ("url", 1)], unique=True, name="v2_unique_score")
+    # ai_scores: one score doc per (project, url). job_id is kept as a plain
+    # field (provenance — "which job last scored this page") but is NOT part
+    # of the identity, so a future single-URL verification run updates the
+    # same page's score doc in place instead of creating a duplicate keyed
+    # by its own new job_id. Previously unique on (project_id, job_id, url).
+    try:
+        ai_scores.create_index([("project_id", 1), ("url", 1)], unique=True, name="v2_unique_score")
+    except Exception as key_conflict:
+        # Old index (project_id, job_id, url) still holds this name — replace it.
+        if "already exists" not in str(key_conflict):
+            ai_scores.drop_index("v2_unique_score")
+            ai_scores.create_index([("project_id", 1), ("url", 1)], unique=True, name="v2_unique_score")
     ai_scores.create_index([("page_id", 1)],   name="v2_score_by_page")
     ai_scores.create_index([("job_id", 1)],    name="v2_scores_by_job")
     print("✅ Created indexes on ai_scores")
@@ -389,8 +397,21 @@ except Exception as e:
     print("✅ ai_issues indexes exist" if "already exists" in str(e) else f"⚠️ ai_issues index error: {e}")
 
 try:
-    # ai_projects: one aggregate per (project, job)
-    ai_projects.create_index([("project_id", 1), ("job_id", 1)],     unique=True, name="v2_unique_project_job")
+    # ai_projects: one CURRENT aggregate per project. job_id is kept as a
+    # plain field (provenance — "which job last computed this") but is NOT
+    # part of the identity: every Node-side reader (aiHubController,
+    # AuditHistoryService, AiHubSnapshotService, V2IssueExtractor,
+    # contextExtractor) already queries by project_id alone, sorted by
+    # computed_at desc, taking the latest doc — never by job_id. Keeping
+    # job_id in the unique index let a single-URL verification run's own
+    # job_id create a brand-new "latest" doc that silently replaced the
+    # project-wide aggregate. Previously unique on (project_id, job_id).
+    try:
+        ai_projects.create_index([("project_id", 1)], unique=True, name="v2_unique_project_job")
+    except Exception as key_conflict:
+        if "already exists" not in str(key_conflict):
+            ai_projects.drop_index("v2_unique_project_job")
+            ai_projects.create_index([("project_id", 1)], unique=True, name="v2_unique_project_job")
     ai_projects.create_index([("project_id", 1), ("computed_at", -1)], name="v2_project_latest")
     print("✅ Created indexes on ai_projects")
 except Exception as e:

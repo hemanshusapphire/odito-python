@@ -25,13 +25,14 @@ Hub / card taxonomy:
 
 from typing import Any
 from .base import BaseRule, RuleResult
+from .page_type_matrix import SKIP_MATRIX, GEO_LOCALBUSINESS_RULES
 
 
 # Hub → card ordering (determines display order and aggregation structure).
 HUB_CARD_MAP: dict[str, list[str]] = {
     "aiso": ["crawlability", "citability", "authority", "coverage"],
     "aeo":  ["answer_readiness", "question_coverage", "faq_coverage", "snippet_score", "voice_search"],
-    "geo":  ["entity_authority", "knowledge_graph_score", "brand_corroboration"],
+    "geo":  ["entity_authority", "knowledge_graph_score", "brand_corroboration", "schema_coverage"],
 }
 
 
@@ -78,22 +79,130 @@ class RuleRegistry:
         for rule in rules:
             self.register(rule)
 
+    # ── Dependency checking ───────────────────────────────────────────────────
+
+    def _check_dependencies(
+        self, rule: BaseRule, resolved: dict[str, RuleResult]
+    ) -> str | None:
+        """
+        Verify all DEPENDS_ON conditions against already-evaluated results.
+
+        Returns None if all dependencies are satisfied, or a skip-reason string
+        if any dependency is not met.
+
+        Condition tokens (case-insensitive):
+            PASS     — dependency must have result == "PASS"
+            EXECUTED — dependency must have been run (result != "SKIPPED")
+        """
+        for dep_spec in rule.DEPENDS_ON:
+            parts = dep_spec.split(":", 1)
+            if len(parts) != 2:
+                continue
+            dep_id, condition = parts[0].strip(), parts[1].strip().upper()
+            dep_result = resolved.get(dep_id)
+
+            if dep_result is None:
+                return (
+                    f"Dependency {dep_id} has not been evaluated — "
+                    f"check registration order in loader.py"
+                )
+
+            if condition == "PASS":
+                if dep_result.result != "PASS":
+                    return (
+                        f"Skipped because prerequisite {dep_id} did not pass "
+                        f"(was {dep_result.result})"
+                    )
+            elif condition == "EXECUTED":
+                if dep_result.result == "SKIPPED":
+                    return (
+                        f"Skipped because prerequisite {dep_id} was itself skipped"
+                    )
+
+        return None
+
+    def _check_page_type_skip(
+        self, rule: BaseRule, page_type: str, page: dict[str, Any]
+    ) -> str | None:
+        """
+        Return a skip-reason string if this rule should not evaluate on this
+        page type.  Return None if the rule should proceed.
+
+        Gate order:
+          1. Domain-scope rules always bypass — never skipped by page type.
+          2. Known page type (non-generic) — consult SKIP_MATRIX.
+          3. Generic page type — schema-presence fallback for GEO LocalBusiness
+             rules: skip unless LocalBusiness schema is actually present.
+        """
+        # Guard 1: domain-scope rules are never gated by page type.
+        if rule.SCOPE == "domain":
+            return None
+
+        pt = (page_type or "generic").strip().lower()
+
+        # Guard 2: known page type — consult SKIP_MATRIX.
+        if pt != "generic":
+            skip_set = SKIP_MATRIX.get(rule.RULE_ID)
+            if skip_set and pt in skip_set:
+                return (
+                    f"Rule {rule.RULE_ID} not applicable to '{pt}' pages "
+                    f"(page-type gate)"
+                )
+            return None
+
+        # Guard 3: generic page — schema-presence fallback for GEO LocalBusiness
+        # rules. Evaluate if LocalBusiness schema is present on this page;
+        # skip otherwise to avoid false failures on non-local-business pages
+        # whose URL did not match a known pattern.
+        if rule.RULE_ID in GEO_LOCALBUSINESS_RULES:
+            lb = (page.get("schema") or {}).get("local_business") or {}
+            if not lb.get("present", False):
+                return (
+                    "Generic page with no LocalBusiness schema — "
+                    "GEO local entity rules not applicable"
+                )
+
+        return None
+
     # ── Evaluation ────────────────────────────────────────────────────────────
 
     def evaluate_page(self, page: dict[str, Any]) -> dict[str, RuleResult]:
         """
-        Run every registered rule against the ai_pages document.
+        Run every registered rule against the ai_pages document, respecting
+        DEPENDS_ON declarations and page-type applicability.
+
+        Gate order per rule:
+          1. Dependency gate  — DEPENDS_ON conditions
+          2. Page-type gate   — SKIP_MATRIX + generic schema-presence fallback
+          3. Rule evaluation  — rule.evaluate(page)
+
+        Skipped rules receive result="SKIPPED" and are excluded from scoring
+        and issue generation.
 
         Returns:
             dict mapping rule_id → RuleResult
         """
+        page_type = (page.get("page_type") or "generic").strip().lower()
+
         results: dict[str, RuleResult] = {}
         for rule_id, rule in self._rules.items():
+            # Gate 1 — dependency check
+            skip_reason = self._check_dependencies(rule, results)
+            if skip_reason is not None:
+                results[rule_id] = rule._skip(skip_reason)
+                continue
+
+            # Gate 2 — page-type check
+            skip_reason = self._check_page_type_skip(rule, page_type, page)
+            if skip_reason is not None:
+                results[rule_id] = rule._skip(skip_reason)
+                continue
+
             try:
                 results[rule_id] = rule.evaluate(page)
             except Exception as exc:
                 # A rule crash must not abort the whole page evaluation.
-                # Treat as FAIL with error evidence.
+                # Treat as FAIL with error evidence so issues are surfaced.
                 results[rule_id] = RuleResult(
                     rule_id=rule_id,
                     hub=rule.HUB,
@@ -105,6 +214,7 @@ class RuleRegistry:
                     issue_description=rule.ISSUE_DESCRIPTION,
                     recommendation=rule.RECOMMENDATION,
                     expected_impact=rule.EXPECTED_IMPACT,
+                    scope=rule.SCOPE,
                 )
         return results
 

@@ -6,6 +6,7 @@ Used by Page Scraping, Headless Accessibility, and URL Qualification workers.
 from typing import List, Dict, Any
 from bson.objectid import ObjectId
 from db import seo_internal_links
+from .url_filters import should_skip_seo_url
 
 # Type rank used for deterministic ordering across all workers
 _TYPE_RANK: Dict[str, int] = {
@@ -16,19 +17,28 @@ _TYPE_RANK: Dict[str, int] = {
 }
 
 
-def get_candidate_pool(project_id: str, max_size: int = 75) -> List[Dict[str, Any]]:
+def get_candidate_pool(project_id: str, max_size: int = 20000) -> List[Dict[str, Any]]:
     """
     Return ALL discovered URLs for a project with type metadata, sorted
     deterministically by (type_rank ASC, url_length ASC, url ASC).
 
-    Used by URL_QUALIFICATION to build the probe candidate pool.
+    Used by URL_QUALIFICATION to build the probe candidate pool. The only
+    caller (url_qualification/worker.py) always passes its own
+    CANDIDATE_POOL_SIZE explicitly, so this default is a fallback only.
 
     Args:
         project_id: Project ID (string or ObjectId)
-        max_size:   Upper bound on returned pool (default 75 covers typical 70-80 crawl)
+        max_size:   Upper bound on returned pool (default 20000 — high enough
+                    to cover real-world single-site discovery counts so the
+                    URL Selection screen can show the full discovered set;
+                    still bounded to protect against pathological outliers)
 
     Returns:
-        List of dicts: {url, type, type_rank}
+        List of dicts: {url, type, type_rank, sourceUrl, sourceSitemap}
+        sourceUrl/sourceSitemap are discovery-provenance fields carried
+        straight through from seo_internal_links (may be None) — purely
+        additive, for downstream explainability (e.g. URL_QUALIFICATION's
+        qualification_details); no effect on pool selection/ordering.
     """
     if isinstance(project_id, str):
         project_id = ObjectId(project_id)
@@ -38,7 +48,7 @@ def get_candidate_pool(project_id: str, max_size: int = 75) -> List[Dict[str, An
     try:
         docs = list(seo_internal_links.find(
             {"projectId": project_id},
-            {"url": 1, "type": 1, "_id": 0}
+            {"url": 1, "type": 1, "sourceUrl": 1, "sourceSitemap": 1, "_id": 0}
         ))
 
         seen: set = set()
@@ -47,12 +57,16 @@ def get_candidate_pool(project_id: str, max_size: int = 75) -> List[Dict[str, An
             url = doc.get("url")
             if not url or url in seen:
                 continue
+            if should_skip_seo_url(url):
+                continue
             seen.add(url)
             page_type = (doc.get("type") or "other").strip().lower()
             unique.append({
                 "url": url,
                 "type": page_type,
                 "type_rank": _TYPE_RANK.get(page_type, 99),
+                "sourceUrl": doc.get("sourceUrl"),
+                "sourceSitemap": doc.get("sourceSitemap"),
             })
 
         # Deterministic: type_rank ASC, URL length ASC, URL lexicographic ASC
@@ -102,7 +116,7 @@ def get_top_urls(project_id: str, limit: int = 25) -> List[str]:
             "url": 1   # alphabetical for consistency
         }).limit(limit))
         
-        primary_url_list = [doc["url"] for doc in primary_urls if doc.get("url")]
+        primary_url_list = [doc["url"] for doc in primary_urls if doc.get("url") and not should_skip_seo_url(doc["url"])]
         
         print(f"[URL_SELECTOR] Primary URLs found: {len(primary_url_list)} (main: {sum(1 for doc in primary_urls if doc.get('type') == 'main')}, service: {sum(1 for doc in primary_urls if doc.get('type') == 'service')})")
         
@@ -127,7 +141,7 @@ def get_top_urls(project_id: str, limit: int = 25) -> List[str]:
                 "url": 1    # alphabetical for consistency
             }).limit(remaining_needed))
             
-            fallback_url_list = [doc["url"] for doc in fallback_urls if doc.get("url")]
+            fallback_url_list = [doc["url"] for doc in fallback_urls if doc.get("url") and not should_skip_seo_url(doc["url"])]
             
             print(f"[URL_SELECTOR] Fallback URLs found: {len(fallback_url_list)}")
             
@@ -169,11 +183,11 @@ def get_urls_from_job_or_db(project_id: str, job_urls: List[str] = None, limit: 
         List of URLs to process
     """
     if job_urls and len(job_urls) > 0:
-        # Use job URLs but apply deterministic ordering and limit
+        # Use job URLs but apply deterministic ordering, filtering, and limit
         print(f"[URL_SELECTOR] Using {len(job_urls)} URLs from job input")
-        
-        # Sort for consistency and limit
-        sorted_urls = sorted(set(job_urls))  # Remove duplicates and sort
+
+        # Deduplicate, filter excluded pages, then sort for consistency
+        sorted_urls = sorted(u for u in set(job_urls) if not should_skip_seo_url(u))
         return sorted_urls[:limit]
     else:
         # Use type-based selection from database

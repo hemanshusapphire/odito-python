@@ -58,20 +58,53 @@ def send_failure_callback(job_id, error_message):
         # Silent failure for error callbacks
 
 
-def normalize_url(url: str) -> str:
-    """Normalize URL for consistent processing with HTTPS enforcement and trailing slash handling."""
+def _strip_www(netloc: str) -> str:
+    """Strip a leading 'www.' label, for same-site COMPARISON purposes only.
+
+    Never used to decide which host form is "correct" — that decision always
+    belongs to the already-resolved canonical_host (see normalize_url), which
+    may itself be a www host. This is only how we detect that two netlocs are
+    aliases of the same site.
+    """
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
+def normalize_url(url: str, canonical_host: str = None) -> str:
+    """Normalize URL for consistent processing with HTTPS enforcement and trailing
+    slash handling.
+
+    Args:
+        url: URL to normalize.
+        canonical_host: optional already-resolved canonical host for the site
+            (e.g. the final, redirect-resolved netloc of the audit's seed URL).
+            When provided, any URL whose netloc is a www/non-www alias of the
+            same registrable domain is rewritten onto this exact host string —
+            whichever form (www or non-www) it happens to be. URLs on an
+            unrelated domain are left untouched. This does NOT hardcode
+            stripping "www"; canonical_host may itself include it.
+    """
     try:
         # Decode URL encoding first
         url = unquote(url)
-        
+
         parsed = urlparse(url)
-        
+
         # Force HTTPS scheme
         scheme = "https"
-        
+
         # Lowercase domain only
         netloc = parsed.netloc.lower()
-        
+
+        # Fold host aliases (www vs non-www, or any other alias of the same
+        # registrable domain) onto the already-resolved canonical host for
+        # this audit run, preventing e.g. https://example.com/ and
+        # https://www.example.com/ from being stored/qualified as two
+        # different pages.
+        if canonical_host:
+            canonical_host_lower = canonical_host.lower()
+            if netloc != canonical_host_lower and _strip_www(netloc) == _strip_www(canonical_host_lower):
+                netloc = canonical_host_lower
+
         # Remove tracking parameters (utm, fbclid, etc.)
         # Keep only essential query parameters
         query_params = []
@@ -104,6 +137,10 @@ def normalize_url(url: str) -> str:
             parsed = urlparse(url)
             scheme = "https"
             netloc = parsed.netloc.lower()
+            if canonical_host:
+                canonical_host_lower = canonical_host.lower()
+                if netloc != canonical_host_lower and _strip_www(netloc) == _strip_www(canonical_host_lower):
+                    netloc = canonical_host_lower
             path = parsed.path.rstrip("/")
             if path == "":
                 path = "/"
@@ -116,12 +153,7 @@ def get_registrable_domain(url: str) -> str:
     """Extract registrable domain (handles www, subdomains)."""
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
-    
-    # Remove www. for comparison
-    if domain.startswith("www."):
-        domain = domain[4:]
-    
-    return domain
+    return _strip_www(domain)
 
 
 def classify_link(url: str, base_domain: str):

@@ -8,15 +8,6 @@ import string
 from datetime import datetime
 from pathlib import Path
 
-# 🔥🔥🔥 EXECUTION VERIFICATION 🔥🔥🔥
-print("🔥🔥🔥 MAIN.PY EXECUTING - VERIFIED 🔥🔥🔥")
-print("📂 FILE PATH:", __file__)
-print("📁 CWD:", os.getcwd())
-print("🧠 PROCESS ID:", os.getpid())
-print("🐍 PYTHON PATH:", sys.executable)
-print("📦 SYS PATH:", sys.path[:3])  # First 3 entries only
-print("🔥🔥🔥 END VERIFICATION 🔥🔥🔥")
-
 # Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()
@@ -46,56 +37,50 @@ from api.performance import router as performance_router
 from api.domain_performance import router as domain_performance_router
 from api.seo_scoring import router as seo_scoring_router
 from api.ai_visibility import router as ai_visibility_router
-from api.ai_visibility_scoring_v2 import router as ai_visibility_scoring_v2_router, AIVisibilityScoringV2Job
 from api.technical_domain import router as technical_domain_router
 from api.headless_accessibility import router as headless_accessibility_router
 from api.url_qualification import router as url_qualification_router
 from api.crawl_graph import router as crawl_graph_router
-from api.keyword_research import router as keyword_research_router
-from api.onboarding import router as onboarding_router
 from api.homepage_audit import router as homepage_audit_router
 from api.pagespeed import router as pagespeed_router
 from api.homepage_pagespeed import router as homepage_pagespeed_router
 from api.website_extraction import router as website_extraction_router
-from scraper.workers.ai.ai_visibility.ai_visibility import execute_ai_visibility, AIVisibilityJob
+from api.ai_visibility import AIVisibilityJob
 
-# Configure logging to suppress third-party errors
+# Configure logging to suppress third-party noise
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+
+def _log(level, msg):
+    if level == 'DEBUG' and LOG_LEVEL != 'DEBUG':
+        return
+    print(f"[{level}] {msg}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup/shutdown hooks"""
-    # Startup
-    print("🚀 STARTING BACKGROUND WORKER LOOP")
-    print("🎯 LIFESPAN STARTUP - FastAPI starting up")
-    enable_polling = os.getenv('ENABLE_POLLING', 'false').lower() == 'true'
-    print(f"🔧 ENABLE_POLLING env var: {os.getenv('ENABLE_POLLING')}")
-    print(f"🔧 enable_polling boolean: {enable_polling}")
-    
-    # Force start worker loop regardless of env var
-    print("✅ FORCE STARTING poll_for_jobs()")
     asyncio.create_task(poll_for_jobs())
-    print("[POLL] Job polling started")
-    
+    _log('INFO', 'Job polling started')
+
     yield
-    # Shutdown - close shared HTTP client
+
     try:
         from scraper.shared.http_client import close_http_client
         await close_http_client()
-        print("[SHUTDOWN] Shared HTTP client closed")
+        _log('INFO', 'Shared HTTP client closed')
     except Exception as e:
-        print(f"[SHUTDOWN] Error closing HTTP client: {e}")
+        _log('WARN', f'Error closing HTTP client: {e}')
 
-    # Shutdown - close any persistent Playwright browsers in the pool
     try:
         from scraper.shared.browser_pool import shutdown_browser_pool
         shutdown_browser_pool()
-        print("[SHUTDOWN] Browser pool closed")
+        _log('INFO', 'Browser pool closed')
     except Exception as e:
-        print(f"[SHUTDOWN] Error closing browser pool: {e}")
+        _log('WARN', f'Error closing browser pool: {e}')
 
 app = FastAPI(lifespan=lifespan)
 
@@ -103,31 +88,34 @@ app = FastAPI(lifespan=lifespan)
 running_parallel_jobs = set()
 running_jobs_lock = threading.Lock()
 
-PARALLEL_JOB_TYPES = {'PAGE_SCRAPING', 'HEADLESS_ACCESSIBILITY', 'CRAWL_GRAPH', 'AI_VISIBILITY', 'URL_QUALIFICATION'}
+PARALLEL_JOB_TYPES = {
+    'PAGE_SCRAPING', 'HEADLESS_ACCESSIBILITY', 'CRAWL_GRAPH', 'AI_VISIBILITY', 'URL_QUALIFICATION',
+    # LINK_DISCOVERY/DOMAIN_PERFORMANCE call synchronous, blocking execute_*
+    # functions with no internal await -- without a dedicated thread here,
+    # claiming one of these on the poller's own event loop would stall
+    # poll_for_jobs() (and every other coroutine sharing this single-worker
+    # event loop) for the job's full duration, exactly like the non-parallel
+    # 'else' branch below already does for other sync job types.
+    'LINK_DISCOVERY', 'DOMAIN_PERFORMANCE',
+}
 
 def run_job_in_thread(job, job_type):
     """Run a job in a separate thread with thread-safe logging"""
-    thread_id = threading.current_thread().ident
     job_id = job['_id']
-    
-    print(f"[THREAD-{thread_id}] Starting {job_type} job | jobId={job_id}")
-    
+    _log('INFO', f'Job started in thread | type={job_type} | jobId={job_id}')
     try:
-        # Run the async process_claimed_job in a new event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(process_claimed_job(job))
         finally:
             loop.close()
-        
-        print(f"[THREAD-{thread_id}] Completed {job_type} job | jobId={job_id}")
+        _log('INFO', f'Job completed in thread | type={job_type} | jobId={job_id}')
     except Exception as e:
-        print(f"[THREAD-{thread_id}] ERROR in {job_type} job | jobId={job_id} | error={str(e)}")
+        _log('ERROR', f'Job failed in thread | type={job_type} | jobId={job_id} | error={str(e)}')
         import traceback
         traceback.print_exc()
     finally:
-        # Remove from running jobs
         with running_jobs_lock:
             if job_id in running_parallel_jobs:
                 running_parallel_jobs.remove(job_id)
@@ -135,12 +123,11 @@ def run_job_in_thread(job, job_type):
 # PULL model polling function
 async def poll_for_jobs():
     """Poll for jobs from MongoDB via Node.js API"""
-    print("� POLLING LOOP STARTED")
     backend_url = config.get_service_url('backend')
-    print(f"🌐 Backend URL: {backend_url}")
-    
-    # List of job types to poll for (in priority order)
+
     job_types = [
+        'LINK_DISCOVERY',
+        'DOMAIN_PERFORMANCE',
         'URL_QUALIFICATION',
         'PAGE_SCRAPING',
         'HEADLESS_ACCESSIBILITY',
@@ -149,52 +136,36 @@ async def poll_for_jobs():
         'PAGE_ANALYSIS',
         'SEO_SCORING',
         'AI_VISIBILITY',
-        'AI_VISIBILITY_SCORING',
         'TECHNICAL_DOMAIN',
-        'CRAWL_GRAPH'
+        'CRAWL_GRAPH',
+        # F4-016: project-level Verification Batch aggregation — runs once
+        # per batch, not once per URL. Deliberately NOT in PARALLEL_JOB_TYPES:
+        # each is a single project-wide recomputation (same class of work as
+        # SEO_SCORING/AI_VISIBILITY's own per-page runs), so it's serialized
+        # on the poller's event loop exactly like those are.
+        'PROJECT_SEO_AGGREGATION',
+        'PROJECT_AI_AGGREGATION',
     ]
-    
-    print("📋 JOB TYPES LIST:", job_types)
-    print("📋 TECHNICAL_DOMAIN IN LIST:", 'TECHNICAL_DOMAIN' in job_types)
-    
+
     from scraper.shared.http_client import get_http_client
-    
+
     while True:
         try:
-            print("🔁 Polling for jobs...")
-            print(" POLLING LOOP ITERATION START")
-            print(f"[POLL DEBUG] job_types = {job_types}")
             for job_type in job_types:
-                print(f"🔁 Trying job_type: {job_type}")
-                print(f"[POLL DEBUG] Trying job_type = {job_type}")
-                print(f"[POLL] Checking for job type: {job_type}")
-                print(f"[POLL] Requesting job type: {job_type}")
                 try:
                     claim_url = f"{backend_url}/api/jobs/claim"
-                    print(f"🌐 Claim URL: {claim_url}?job_type={job_type}")
-                    print(f"[POLL DEBUG] Claim URL = {claim_url}?job_type={job_type}")
-                    print(f"[POLL] Claim API URL: {claim_url}")
-                    print(f"[POLL] Claim params: job_type={job_type}")
                     http_client = get_http_client()
                     response = await http_client.get(
                         claim_url,
                         params={'job_type': job_type}
                     )
-                    print(f"📥 Response status: {response.status_code}")
-                    print(f"📥 Response body: {response.text}")
-                    print(f"[POLL] Response for {job_type}: {response}")
-                    print(f"[POLL] Response for {job_type}: status={response.status_code}")
-                    
+
                     if response.status_code == 200:
                         data = response.json()
-                        print(f"[POLL] Backend response for {job_type}: {data}")
                         if data.get('success') and data.get('data'):
-                            # Backend returns {success: true, data: {job_id, jobType, ...}}
                             job_data = data['data']
                             job_id = job_data.get('job_id')
-                            print(f"[POLL] Job FOUND for {job_type}: {job_id}")
-                            print(f"[CLAIM] Claimed job: {job_id} | type: {job_type}")
-                            # Construct job object from response fields
+                            _log('INFO', f'Job claimed | type={job_type} | jobId={job_id}')
                             job = {
                                 '_id': job_data.get('job_id'),
                                 'jobType': job_data.get('jobType'),
@@ -202,53 +173,40 @@ async def poll_for_jobs():
                                 'input_data': job_data.get('input_data'),
                                 'status': job_data.get('status')
                             }
-                            print(f"[POLL] Claimed {job_type} job: {job['_id']}")
-                            
-                            # Check if this job should run in parallel
+
                             if job_type in PARALLEL_JOB_TYPES:
                                 job_id = job['_id']
-                                
-                                # Check if job is already running (prevent duplicates)
                                 with running_jobs_lock:
                                     if job_id in running_parallel_jobs:
-                                        print(f"[POLL] Job {job_id} already running in parallel, skipping")
                                         continue
                                     running_parallel_jobs.add(job_id)
-                                
-                                # Run in background thread
                                 thread = threading.Thread(
                                     target=run_job_in_thread,
                                     args=(job, job_type),
                                     daemon=True
                                 )
                                 thread.start()
-                                print(f"[POLL] Started {job_type} in background thread | jobId={job_id}")
-                                # Don't break - continue polling for other parallel jobs
                             else:
-                                # Synchronous execution for other job types
                                 await process_claimed_job(job)
-                                break  # Process one job at a time, then restart cycle
-                        else:
-                            print(f"[POLL] No job in response for {job_type}")
+                                break
                 except Exception as e:
-                    print(f"[POLL] Error polling for {job_type}: {e}")
-            
-            await asyncio.sleep(2)  # Poll every 2 seconds for faster job pickup
+                    _log('ERROR', f'Poll error for {job_type}: {e}')
+
+            await asyncio.sleep(2)
         except Exception as e:
-            print("❌ Polling error:", e)
+            _log('ERROR', f'Polling loop error: {e}')
             import traceback
             traceback.print_exc()
-            await asyncio.sleep(5)  # Wait before retrying
+            await asyncio.sleep(5)
 
 def normalize_job_to_model(job: dict, job_type: str):
     """Convert dict job to appropriate Pydantic model based on job type"""
     input_data = job.get('input_data', {})
-    
-    # Extract common fields with fallbacks
+
     job_id = job.get('_id') or job.get('job_id')
     project_id = job.get('project_id') or job.get('projectId')
     user_id = job.get('user_id') or job.get('userId') or 'unknown'
-    
+
     if job_type == 'TECHNICAL_DOMAIN':
         from api.technical_domain import TechnicalDomainJob
         return TechnicalDomainJob(
@@ -264,6 +222,7 @@ def normalize_job_to_model(job: dict, job_type: str):
             projectId=str(project_id),
             userId=str(user_id),
             sourceJobId=input_data.get('source_job_id', ''),
+            canonicalHost=input_data.get('canonical_host') or None,
         )
     elif job_type == 'PAGE_SCRAPING':
         from api.scraping import PageScrapingJob
@@ -273,7 +232,9 @@ def normalize_job_to_model(job: dict, job_type: str):
             userId=str(user_id),
             urls=input_data.get('urls', []),
             canonical_urls=input_data.get('canonical_urls', []),
-            sourceJobId=input_data.get('source_job_id')
+            sourceJobId=input_data.get('source_job_id'),
+            is_retry=input_data.get('is_retry', False),
+            retry_round=input_data.get('retry_round', 0)
         )
     elif job_type == 'HEADLESS_ACCESSIBILITY':
         from api.headless_accessibility import HeadlessAccessibilityJob
@@ -291,7 +252,8 @@ def normalize_job_to_model(job: dict, job_type: str):
             jobId=str(job_id),
             projectId=str(project_id),
             userId=str(user_id),
-            sourceJobId=input_data.get('source_job_id', '')
+            sourceJobId=input_data.get('source_job_id', ''),
+            urls=input_data.get('urls', [])
         )
     elif job_type == 'PERFORMANCE_MOBILE':
         from api.performance import PerformanceMobileJob
@@ -315,24 +277,38 @@ def normalize_job_to_model(job: dict, job_type: str):
             jobId=str(job_id),
             projectId=str(project_id),
             userId=str(user_id),
-            sourceJobId=input_data.get('source_job_id', '')
+            sourceJobId=input_data.get('source_job_id', ''),
+            urls=input_data.get('urls', []),
+            batchId=input_data.get('batchId')
         )
     elif job_type == 'AI_VISIBILITY':
-        from scraper.workers.ai.ai_visibility.ai_visibility import AIVisibilityJob
+        from api.ai_visibility import AIVisibilityJob
         return AIVisibilityJob(
             jobId=str(job_id),
             projectId=str(project_id),
             userId=str(user_id),
             domain=input_data.get('domain', ''),
-            sourceJobId=input_data.get('source_job_id', '')
+            sourceJobId=input_data.get('source_job_id', ''),
+            urls=input_data.get('urls', []),
+            batchId=input_data.get('batchId')
         )
-    elif job_type == 'AI_VISIBILITY_SCORING':
-        from api.ai_visibility_scoring_v2 import AIVisibilityScoringV2Job
-        return AIVisibilityScoringV2Job(
+    elif job_type == 'PROJECT_SEO_AGGREGATION':
+        from api.seo_scoring import ProjectSeoAggregationJob
+        return ProjectSeoAggregationJob(
             jobId=str(job_id),
             projectId=str(project_id),
             userId=str(user_id),
-            sourceJobId=input_data.get('source_job_id', '')
+            batchId=input_data.get('batchId'),
+            sourceJobId=input_data.get('source_job_id')
+        )
+    elif job_type == 'PROJECT_AI_AGGREGATION':
+        from api.ai_visibility import ProjectAiAggregationJob
+        return ProjectAiAggregationJob(
+            jobId=str(job_id),
+            projectId=str(project_id),
+            userId=str(user_id),
+            batchId=input_data.get('batchId'),
+            sourceJobId=input_data.get('source_job_id')
         )
     elif job_type == 'CRAWL_GRAPH':
         from api.crawl_graph import CrawlGraphJob
@@ -342,9 +318,24 @@ def normalize_job_to_model(job: dict, job_type: str):
             userId=str(user_id),
             sourceJobId=input_data.get('source_job_id', '')
         )
+    elif job_type == 'LINK_DISCOVERY':
+        from api.jobs import LinkDiscoveryJob
+        return LinkDiscoveryJob(
+            jobId=str(job_id),
+            projectId=str(project_id),
+            userId=str(user_id),
+            main_url=input_data.get('main_url', '')
+        )
+    elif job_type == 'DOMAIN_PERFORMANCE':
+        from api.domain_performance import DomainPerformanceJob
+        return DomainPerformanceJob(
+            jobId=str(job_id),
+            projectId=str(project_id),
+            userId=str(user_id),
+            main_url=input_data.get('main_url', '')
+        )
     else:
-        # Return dict as fallback for unknown job types
-        print(f"[WARNING] Unknown job type {job_type}, returning dict")
+        _log('WARN', f'Unknown job type {job_type}, returning dict')
         return job
 
 async def process_claimed_job(job):
@@ -352,78 +343,60 @@ async def process_claimed_job(job):
     try:
         job_id = str(job['_id'])
         job_type = job['jobType']
-        
-        print(f"[PROCESS] Entered process_claimed_job | jobId={job.get('job_id')} | type={job_type}")
-        print(f"[POLL] Worker picked job {job['_id']} (type: {job_type})")
-        print(f"[DEBUG] About to execute handler for {job_type}")
-        
-        # Normalize job dict to Pydantic model
-        print(f"[DEBUG] Normalizing job from dict to model | type={job_type}")
+
+        _log('INFO', f'Job started | type={job_type} | jobId={job_id}')
+
         job_model = normalize_job_to_model(job, job_type)
-        print(f"[PROCESS] Job normalized | type={job_type} | model={type(job_model).__name__}")
-        print(f"[DEBUG] Job normalized successfully | type={type(job_model).__name__}")
-        
-        # Import handlers dynamically to avoid circular imports
+
         from api.headless_accessibility import handle_headless_accessibility
         from api.performance import handle_performance_mobile, handle_performance_desktop
         from api.seo_scoring import handle_seo_scoring
         from api.ai_visibility import handle_ai_visibility
         from scraper.workers.seo.technical_domain.worker import execute_technical_domain
         from api.crawl_graph import handle_crawl_graph
-        
-        # Map job types to existing handlers (call synchronously, not await)
+
         if job_type == 'URL_QUALIFICATION':
-            print(f"[DEBUG] Executing URL_QUALIFICATION handler")
             from scraper.workers.seo.url_qualification.worker import execute_url_qualification
             await execute_url_qualification(job_model)
         elif job_type == 'PAGE_SCRAPING':
-            print(f"[DEBUG] Executing PAGE_SCRAPING handler")
             handle_page_scraping(job_model)
         elif job_type == 'PAGE_ANALYSIS':
-            print(f"[DEBUG] Executing PAGE_ANALYSIS handler")
             handle_page_analysis(job_model)
         elif job_type == 'HEADLESS_ACCESSIBILITY':
-            print(f"[DEBUG] Executing HEADLESS_ACCESSIBILITY handler")
             await handle_headless_accessibility(job_model)
         elif job_type == 'PERFORMANCE_MOBILE':
-            print(f"[DEBUG] Executing PERFORMANCE_MOBILE handler")
-            print(f"[DEBUG] BEFORE handler call | jobType={job_type} | jobId={job_id}")
             result = await handle_performance_mobile(job_model)
-            print(f"[DEBUG] AFTER handler call | jobType={job_type} | jobId={job_id} | result={result}")
         elif job_type == 'PERFORMANCE_DESKTOP':
-            print(f"[DEBUG] Executing PERFORMANCE_DESKTOP handler")
-            print(f"[DEBUG] BEFORE handler call | jobType={job_type} | jobId={job_id}")
             result = handle_performance_desktop(job_model)
-            print(f"[DEBUG] AFTER handler call | jobType={job_type} | jobId={job_id} | result={result}")
         elif job_type == 'SEO_SCORING':
-            print(f"[DEBUG] Executing SEO_SCORING handler")
             handle_seo_scoring(job_model)
         elif job_type == 'AI_VISIBILITY':
-            print(f"[DEBUG] Executing AI_VISIBILITY handler")
             await handle_ai_visibility(job_model)
-        elif job_type == 'AI_VISIBILITY_SCORING':
-            print(f"[DEBUG] Executing AI_VISIBILITY_SCORING handler")
-            from api.ai_visibility_scoring_v2 import handle_ai_visibility_scoring
-            await handle_ai_visibility_scoring(job_model)
+        elif job_type == 'PROJECT_SEO_AGGREGATION':
+            from api.seo_scoring import handle_project_seo_aggregation
+            handle_project_seo_aggregation(job_model)
+        elif job_type == 'PROJECT_AI_AGGREGATION':
+            from api.ai_visibility import handle_project_ai_aggregation
+            handle_project_ai_aggregation(job_model)
         elif job_type == 'TECHNICAL_DOMAIN':
-            print(f"[DEBUG] TECHNICAL_DOMAIN handler triggered")
-            print(f"[DISPATCH] About to execute handler for TECHNICAL_DOMAIN")
-            print(f"[DEBUG] Executing TECHNICAL_DOMAIN worker")
             execute_technical_domain(job_model)
-            print(f"[DISPATCH] Finished handler for TECHNICAL_DOMAIN")
         elif job_type == 'CRAWL_GRAPH':
-            print(f"[DEBUG] Executing CRAWL_GRAPH handler")
             handle_crawl_graph(job_model)
+        elif job_type == 'LINK_DISCOVERY':
+            from scraper.workers.seo.link_discovery.link_discovery import execute_link_discovery
+            execute_link_discovery(job_model)
+        elif job_type == 'DOMAIN_PERFORMANCE':
+            from api.domain_performance import execute_domain_performance_logic
+            execute_domain_performance_logic(job_model)
         else:
-            print(f"[WARNING] Unknown job type: {job_type}")
-        
-        print(f"[DONE] Job completed {job['_id']}")
-        
+            _log('WARN', f'Unknown job type: {job_type}')
+
+        _log('INFO', f'Job completed | type={job_type} | jobId={job_id}')
+
     except Exception as e:
-        print(f"[ERROR] Failed to process job {job['_id']}: {e}")
-        print(f"[ERROR] PROCESS_JOB FAILED: {str(e)}")
+        _log('ERROR', f'Job failed | jobId={job.get("_id")} | error={e}')
         import traceback
-        print(f"[ERROR] Traceback: {traceback.format_exc()}")
+        print(traceback.format_exc())
 
 # Include API routers
 app.include_router(health_router, prefix="/api", tags=["health"])
@@ -434,13 +407,10 @@ app.include_router(performance_router, prefix="/api", tags=["performance"])
 app.include_router(domain_performance_router, prefix="/api", tags=["domain_performance"])
 app.include_router(seo_scoring_router, prefix="/api", tags=["seo_scoring"])
 app.include_router(ai_visibility_router, prefix="/api", tags=["ai_visibility"])
-app.include_router(ai_visibility_scoring_v2_router, prefix="/api", tags=["ai_visibility_scoring_v2"])
 app.include_router(technical_domain_router, prefix="/api", tags=["technical_domain"])
 app.include_router(headless_accessibility_router, prefix="/api", tags=["headless_accessibility"])
 app.include_router(url_qualification_router, prefix="/api", tags=["url_qualification"])
 app.include_router(crawl_graph_router, prefix="/api", tags=["crawl_graph"])
-app.include_router(keyword_research_router, prefix="/api", tags=["keyword_research"])
-app.include_router(onboarding_router, prefix="/api", tags=["onboarding"])
 app.include_router(homepage_audit_router, prefix="/api", tags=["homepage_audit"])
 app.include_router(pagespeed_router, prefix="/api", tags=["pagespeed"])
 app.include_router(homepage_pagespeed_router, prefix="/api", tags=["homepage_pagespeed"])
@@ -471,86 +441,56 @@ class JobCompletion(BaseModel):
     stats: dict | None = None
 
 
-
 def send_progress_update(job_id: str, percentage: int, step: str, message: str, subtext: str = None):
     """Send progress update to Node.js backend"""
     try:
         node_backend_url = config.get_service_url('node_backend')
         progress_url = f"{node_backend_url}/api/jobs/{job_id}/progress"
-        
         payload = {
             "percentage": percentage,
             "step": step,
             "message": message,
             "subtext": subtext
         }
-        
         response = requests.post(progress_url, json=payload, timeout=5)
         response.raise_for_status()
-        
-        print(f"📊 Progress update sent: {percentage}% - {step}")
-        
     except Exception as e:
-        print(f"⚠️ Failed to send progress update: {e}")
-        # Don't raise exception - progress updates are non-critical
+        _log('WARN', f'Failed to send progress update: {e}')
 
 def generate_worker_id():
     """Generate a unique worker ID"""
     return f"worker-{''.join(random.choices(string.ascii_lowercase + string.digits, k=8))}"
 
 
-@app.post("/jobs/ai-visibility")
-def handle_ai_visibility(job: AIVisibilityJob):
-    """Handle AI_VISIBILITY job dispatched dealt Node.js"""
-    return execute_ai_visibility(job)
-
 @app.post("/workers/claim")
 def claim_job(request: JobClaimRequest):
     try:
-        print(f"🔄 Worker {request.worker_id} requesting job of type: {request.job_type}")
-        
-        # DEBUG: Add these prints
         node_backend_url = config.get_service_url('node_backend')
-        print(f"🔍 DEBUG: NODE_BACKEND_URL = '{node_backend_url}'")
-        
         node_url = f"{node_backend_url}/api/workers/claim"
-        print(f"🔍 DEBUG: Final node_url = '{node_url}'")
-        
         claim_payload = {
             "job_type": request.job_type,
             "worker_id": request.worker_id
         }
-        print(f"🔍 DEBUG: claim_payload = {claim_payload}")
-        
-        print(f"📡 Sending claim request to: {node_url}")
-        print(f"📦 Payload: {claim_payload}")
-        
         response = requests.post(node_url, json=claim_payload, timeout=10)
-        print(f"🔍 DEBUG: Response status = {response.status_code}")
-        print(f"🔍 DEBUG: Response text = {response.text}")
         response.raise_for_status()
-        
+
         result = response.json()
-        print(f"📥 Response from Node: {result}")
-        
         if result.get("success"):
             job_data = result.get("data", {})
-            print(f"✅ Job claimed successfully: {job_data}")
             return JobClaimResponse(
                 success=True,
                 message="Job claimed successfully",
                 data=job_data
             )
         else:
-            print(f"❌ Failed to claim job: {result.get('message', 'Unknown error')}")
             return JobClaimResponse(
                 success=False,
                 message=result.get('message', 'Failed to claim job'),
                 data=None
             )
-            
+
     except Exception as e:
-        print(f"❌ Error claiming job: {str(e)}")
+        _log('ERROR', f'Error claiming job: {str(e)}')
         return JobClaimResponse(
             success=False,
             message=f"Error claiming job: {str(e)}",
@@ -560,14 +500,14 @@ def claim_job(request: JobClaimRequest):
 def test_node_connection():
     """Test connection to Node.js backend manually"""
     import requests
-    
+
     node_backend_url = config.get_service_url('node_backend')
     test_url = f"{node_backend_url}/api/workers/claim"
     test_payload = {"job_type": "LINK_DISCOVERY", "worker_id": "debug-test"}
-    
+
     print(f"🧪 MANUAL TEST: URL = {test_url}")
     print(f"🧪 MANUAL TEST: Payload = {test_payload}")
-    
+
     try:
         response = requests.post(test_url, json=test_payload, timeout=10)
         print(f"🧪 MANUAL TEST: Status = {response.status_code}")
@@ -577,13 +517,12 @@ def test_node_connection():
         print(f"🧪 MANUAL TEST: Exception = {e}")
 
 if __name__ == "__main__":
-    # 🚨 CRASH TEST REMOVED - Worker can now run
     test_node_connection()
-    
+
     worker_id = sys.argv[1] if len(sys.argv) > 1 else generate_worker_id()
-    
+
     print(f"🤖 Starting Python worker with ID: {worker_id}")
     print("🚀 Worker ready to receive dispatched jobs from Node.js")
-    
+
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

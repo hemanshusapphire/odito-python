@@ -12,9 +12,10 @@ Data flow:
     Scraping → Extraction → ai_pages
 """
 
-import sys, os
+import sys, os, traceback
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse, urlunparse
 from bson import ObjectId
 from pymongo import ReturnDocument
 
@@ -26,13 +27,41 @@ if _PW_ROOT not in sys.path:
 
 from db import ai_pages  # V2 collection declared in db.py
 
-from .crawlability import extract_crawlability
-from .schema       import extract_schema
-from .content      import extract_content
-from .faq          import extract_faq
-from .geo          import extract_geo
-from .technical    import extract_technical
-from .entities     import extract_entities
+from .crawlability   import extract_crawlability
+from .schema         import extract_schema
+from .content        import extract_content
+from .faq            import extract_faq
+from .geo            import extract_geo
+from .technical      import extract_technical
+from .entities       import extract_entities
+from .site_structure import extract_site_structure
+
+
+def _normalize_url(url: str) -> str:
+    """Lowercase hostname, strip trailing slash, drop fragment."""
+    if not url:
+        return ""
+    try:
+        p = urlparse(url.strip())
+        path = p.path.rstrip("/") or "/"
+        return urlunparse((p.scheme.lower(), p.netloc.lower(), path, "", p.query, ""))
+    except Exception:
+        return url.strip()
+
+
+def _safe_extract(label: str, func: Callable, *args, url: str = "?", **kwargs) -> dict:
+    """
+    Call func(*args, **kwargs) and return {} on any exception.
+
+    Logs the full traceback so the failure is visible without killing the page.
+    """
+    try:
+        result = func(*args, **kwargs)
+        return result if isinstance(result, dict) else {}
+    except Exception as exc:
+        print(f"[V2 EXTRACTOR] {label} failed for {url}: {exc}")
+        print(traceback.format_exc())
+        return {}
 
 
 def _enrich_from_raw_html(page_data: dict[str, Any]) -> None:
@@ -125,11 +154,18 @@ def _enrich_from_raw_html(page_data: dict[str, Any]) -> None:
                     col_count = max(
                         (len(r.find_all(["td", "th"])) for r in rows), default=0
                     )
-                    tables.append({"rows": len(rows), "columns": col_count})
+                    # has_headers distinguishes data tables from layout tables;
+                    # content.py uses this to exclude layout tables from qualifying_tables.
+                    has_headers = bool(tbl.find("th"))
+                    tables.append({"rows": len(rows), "columns": col_count, "has_headers": has_headers})
 
             external_links: list[dict] = []
             internal_links: list[dict] = []
             for a in soup.find_all("a", href=True):
+                # Exclude links inside navigation chrome — nav/footer/header links
+                # inflate authority counts and distort external link signals.
+                if any(p.name in _BOILERPLATE for p in a.parents):
+                    continue
                 href = a.get("href", "")
                 text = a.get_text(strip=True)
                 if href.startswith("http"):
@@ -194,6 +230,7 @@ def build_ai_page(
     domain_report: dict[str, Any],
     project_id: Any,
     job_id: Any,
+    site_structure_lookup: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     """
     Build a complete ai_pages document from scraper output.
@@ -203,6 +240,9 @@ def build_ai_page(
         domain_report: domain_technical_reports document for this domain.
         project_id:    ObjectId of the parent project.
         job_id:        ObjectId of the current job run.
+        site_structure_lookup: url -> {is_orphan, click_depth} map loaded
+            once per job by the caller (see pipeline.run_v2_pipeline) —
+            this function performs no crawl-graph query of its own.
 
     Returns:
         ai_pages document dict (not yet persisted).
@@ -213,20 +253,25 @@ def build_ai_page(
     _enrich_from_raw_html(enriched)
 
     raw_html: str = enriched.get("raw_html", "") or ""
-    url: str      = enriched.get("url", "") or ""
+    # Normalize URL so trailing-slash/case variants produce the same document key.
+    url: str = _normalize_url(enriched.get("url", "") or "")
 
-    # Run all sub-extractors independently.
-    schema      = extract_schema(enriched)
-    content_sig = extract_content(enriched)
-    crawl_sig   = extract_crawlability(domain_report)
-    tech_sig    = extract_technical(enriched, domain_report, raw_html)
-    faq_sig     = extract_faq(schema.get("faq_schema_pairs", []), enriched)
-    entity_sig  = extract_entities(
-        enriched,
-        schema,
-        content_sig.get("internal_links", []),
-    )
-    geo_sig = extract_geo(enriched, schema, raw_html, content_sig=content_sig)
+    # Run all sub-extractors with isolated fault tolerance: one crashed extractor
+    # must not prevent the page document from being saved.
+    schema      = _safe_extract("schema",       extract_schema,       enriched,                                               url=url)
+    content_sig = _safe_extract("content",      extract_content,      enriched,                                               url=url)
+    crawl_sig   = _safe_extract("crawlability", extract_crawlability, domain_report,                                          url=url)
+    tech_sig    = _safe_extract("technical",    extract_technical,    enriched, domain_report, raw_html,                      url=url)
+    faq_sig     = _safe_extract("faq",          extract_faq,          schema.get("faq_schema_pairs", []), enriched,           url=url)
+    entity_sig  = _safe_extract("entities",     extract_entities,     enriched, schema, content_sig.get("internal_links", []), url=url)
+    geo_sig     = _safe_extract("geo",          extract_geo,          enriched, schema, raw_html, content_sig=content_sig,    url=url)
+    site_struct_sig = _safe_extract("site_structure", extract_site_structure, site_structure_lookup or {}, url, url=url)
+
+    # Normalize page_type from seo_page_data (stored as title-case "Contact",
+    # "Homepage", etc. by context_enrichment.py) to lowercase canonical key.
+    # Falls back to "generic" when absent — gate treats generic conservatively.
+    raw_page_type = enriched.get("page_type") or "generic"
+    page_type     = raw_page_type.strip().lower()
 
     return {
         "project_id":  ObjectId(project_id) if not isinstance(project_id, ObjectId) else project_id,
@@ -235,6 +280,7 @@ def build_ai_page(
         "domain":      enriched.get("domain", ""),
         "scraped_at":  enriched.get("scraped_at") or datetime.now(timezone.utc),
         "version":     "v2",
+        "page_type":   page_type,
         "crawlability": crawl_sig,
         "schema":       schema,
         "faq":          faq_sig,
@@ -242,6 +288,7 @@ def build_ai_page(
         "content":      content_sig,
         "geo":          geo_sig,
         "technical":    tech_sig,
+        "site_structure": site_struct_sig,
     }
 
 
@@ -250,19 +297,23 @@ def extract_and_save(
     domain_report: dict[str, Any],
     project_id: Any,
     job_id: Any,
+    site_structure_lookup: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     """
     Build the ai_pages document and upsert it into MongoDB.
 
     Returns the saved document (with _id).
     """
-    doc = build_ai_page(page_data, domain_report, project_id, job_id)
+    doc = build_ai_page(page_data, domain_report, project_id, job_id, site_structure_lookup)
+    url = doc["url"]
+
+    print(f"[V2] Saving ai_page: {url}")
 
     result = ai_pages.find_one_and_update(
         filter={
             "project_id": doc["project_id"],
             "job_id":     doc["job_id"],
-            "url":        doc["url"],
+            "url":        url,
         },
         update={"$set": doc},
         upsert=True,
@@ -273,7 +324,11 @@ def extract_and_save(
         result = ai_pages.find_one({
             "project_id": doc["project_id"],
             "job_id":     doc["job_id"],
-            "url":        doc["url"],
+            "url":        url,
         })
 
+    if result is None:
+        raise RuntimeError(f"[V2] ai_pages upsert returned no document for URL: {url}")
+
+    print(f"[V2] Saved ai_page: {url} | _id={result.get('_id')}")
     return result

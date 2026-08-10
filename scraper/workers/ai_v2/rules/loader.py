@@ -23,6 +23,7 @@ from .categories.aeo.voice_search      import RULES as AEO_VOICE_SEARCH
 from .categories.geo.entity_authority      import RULES as GEO_ENTITY_AUTHORITY
 from .categories.geo.knowledge_graph_score import RULES as GEO_KNOWLEDGE_GRAPH
 from .categories.geo.brand_corroboration   import RULES as GEO_BRAND_CORROBORATION
+from .categories.geo.schema_coverage       import RULES as GEO_SCHEMA_COVERAGE
 
 _ALL_RULES = (
     AISO_CRAWLABILITY
@@ -37,6 +38,7 @@ _ALL_RULES = (
     + GEO_ENTITY_AUTHORITY
     + GEO_KNOWLEDGE_GRAPH
     + GEO_BRAND_CORROBORATION
+    + GEO_SCHEMA_COVERAGE
 )
 
 

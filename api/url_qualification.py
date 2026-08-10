@@ -32,6 +32,7 @@ async def handle_url_qualification(job_data: dict):
             projectId=job_data.get("projectId", ""),
             userId=job_data.get("userId", ""),
             sourceJobId=job_data.get("sourceJobId", ""),
+            canonicalHost=job_data.get("canonicalHost") or None,
         )
 
         print(f"[ROUTE] Calling execute_url_qualification | jobId={job_id}")

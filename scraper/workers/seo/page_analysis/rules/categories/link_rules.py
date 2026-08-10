@@ -22,11 +22,12 @@ class LinksToRedirectingUrlsRule(BaseSEORuleV2):
             if status in [301, 302]:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Internal link points to redirecting URL: {link.get('url')} (status: {status})",
-                    f"Link to {link.get('url')} redirects with {status}",
+                    "Links to Redirecting URLs",
+                    link.get('url') or "",
                     "Direct link to final destination URL",
                     data_key="internal_links",
-                    data_path=f"internal_links.{link.get('url')}"
+                    data_path=f"internal_links.{link.get('url')}",
+                    context={"redirect_url": link.get('url'), "status_code": status}
                 ))
         
         return issues
@@ -51,8 +52,8 @@ class RelNofollowInternalRule(BaseSEORuleV2):
                 if not any(page in url_lower for page in ['login', 'admin', 'legal', 'privacy', 'terms']):
                     issues.append(self.create_issue(
                         job_id, project_id, url,
-                        f"Internal link has rel=nofollow: {link.get('url')}",
-                        f"Nofollow on internal link: {link.get('url')}",
+                        "Internal Link Has Rel=Nofollow",
+                        link.get('url') or "",
                         "No nofollow on internal links",
                         data_key="internal_links",
                         data_path=f"internal_links.{link.get('url')}.rel"

@@ -14,6 +14,12 @@ class PageScrapingJob(BaseModel):
     urls: list[str] = []
     canonical_urls: list[str] = []  # Canonical URL set from URL_QUALIFICATION (preferred)
     sourceJobId: str | None = None
+    # URL-level retry (chainingEngine._maybeCreatePageScrapingRetryChunks):
+    # is_retry/retry_round distinguish a retry chunk (canonical_urls sourced
+    # from seo_page_failures, not URL_SELECTION) from an initial chunk.
+    # retry_round is 1-indexed (1 = first retry round); 0 means "not a retry".
+    is_retry: bool = False
+    retry_round: int = 0
 
 @router.post("/jobs/page-scraping")
 def handle_page_scraping(job: PageScrapingJob):

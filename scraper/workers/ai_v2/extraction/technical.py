@@ -69,6 +69,29 @@ def extract_technical(
     sitemap_data: dict = domain_report.get("sitemap", {}) or {}
     sitemap_exists: bool = bool(sitemap_data.get("exists", False))
     sitemap_url: str | None = sitemap_data.get("url") or None
+    # Breadth of the sitemap (AISO-CV8). None when the adapter has no count
+    # (e.g. sitemap doesn't exist, or predates this field) — rules must treat
+    # None as "unknown", not zero.
+    sitemap_url_count = sitemap_data.get("url_count")
+
+    # ── Reachability (AISO-CV9) ─────────────────────────────────────────────
+    # discovered/qualified come from the URL_QUALIFICATION worker's stats,
+    # bridged in by domain_report_adapter.py. Both are None when qualification
+    # stats haven't been persisted for this project yet (older audits).
+    reachability_data: dict = domain_report.get("reachability", {}) or {}
+    reachability = {
+        "discovered": reachability_data.get("discovered"),
+        "qualified":  reachability_data.get("qualified"),
+    }
+
+    # ── URL parameter / duplicate-variant hygiene (AISO-CV10) ──────────────
+    # Written directly onto seo_page_data by the scraper (page_scraping.py) —
+    # read straight off page_data, no new computation needed here.
+    url_hygiene = {
+        "has_parameters":   bool(page_data.get("has_parameters", False)),
+        "parameter_count":  page_data.get("parameter_count", 0),
+        "has_double_slash": bool(page_data.get("has_double_slash", False)),
+    }
 
     return {
         "noindex":           noindex,
@@ -77,7 +100,10 @@ def extract_technical(
         "canonical_is_self": canonical_is_self,
         "js_rendered_only":  js_rendered_only,
         "sitemap": {
-            "exists": sitemap_exists,
-            "url":    sitemap_url,
+            "exists":    sitemap_exists,
+            "url":       sitemap_url,
+            "url_count": sitemap_url_count,
         },
+        "reachability": reachability,
+        "url_hygiene":  url_hygiene,
     }

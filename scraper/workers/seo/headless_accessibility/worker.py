@@ -42,6 +42,12 @@ _AXE_LOCAL_PATH = Path(__file__).resolve().parent.parent.parent.parent / "shared
 _AXE_SCRIPT_CACHE = None
 ENABLE_RESOURCE_BLOCKING = os.environ.get("BLOCK_HEAVY_RESOURCES", "1") == "1"
 
+# Max concurrent page scans (browser contexts) per job. Externalized so it can
+# be tuned per-deployment without a code change/redeploy. Default of "3"
+# preserves the exact previous hardcoded behavior when the env var is unset —
+# no behavior change unless an operator explicitly sets it.
+HEADLESS_A11Y_CONCURRENCY = int(os.environ.get("HEADLESS_A11Y_CONCURRENCY", "3"))
+
 
 def _load_axe_script() -> str:
     """Load axe-core script from local vendor bundle (cached after first load)."""
@@ -503,7 +509,7 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
     """
     from playwright.async_api import async_playwright
 
-    semaphore = asyncio.Semaphore(3)  # Max 3 concurrent pages
+    semaphore = asyncio.Semaphore(HEADLESS_A11Y_CONCURRENCY)  # Env-tunable, default 3 (unchanged)
     all_results = []
     total = len(urls)
 
@@ -514,7 +520,7 @@ async def _run_accessibility_scan(job_id, project_id, urls, node_backend_url):
     # Pre-load axe-core script (cached for all URLs)
     _load_axe_script()
 
-    print(f"[HEADLESS_A11Y] Starting scan | jobId={job_id} | urls={total}")
+    print(f"[HEADLESS_A11Y] Starting scan | jobId={job_id} | urls={total} | concurrency={HEADLESS_A11Y_CONCURRENCY}")
 
     with job_tracker.stage("browser_launch"):
         async with async_playwright() as pw:

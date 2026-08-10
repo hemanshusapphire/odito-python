@@ -1,0 +1,397 @@
+"""
+Centralized SEO URL filtering — single source of truth for URL exclusion rules.
+
+All crawler components that build the URL pool must pass candidate URLs through
+``should_skip_seo_url`` before accepting them.  This is the only function calling
+code needs; the category predicates (``is_conversion_page`` etc.) exist for
+downstream logic that needs category-specific branching.
+
+Pipeline integration points
+---------------------------
+  link_discovery.py     – homepage anchor ingestion       (Path A)
+  link_discovery.py     – second-level link storage       (Path A2)
+  recursive_sitemap.py  – sitemap URL ingestion           (Path B)
+  url_selector.py       – candidate pool read             (defensive layer)
+
+Extending
+---------
+Add patterns to the appropriate tuple below.  No changes to calling code are
+required — every component delegates to ``should_skip_seo_url``.
+
+Auditable page types (PASS)
+---------------------------
+  homepage, service, location, product, pricing, contact, about, faq,
+  article/blog
+
+Non-auditable page types (FAIL → excluded)
+-------------------------------------------
+  conversion, authentication, transaction, system/CMS internals, archives
+  (author, tag, category, feed, embed, attachment, pagination, search)
+"""
+
+from __future__ import annotations
+
+import logging
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Pattern tables
+# ---------------------------------------------------------------------------
+# All patterns are lowercase with no surrounding slashes.
+# Matching is *segment-exact*: a pattern matches only when it appears as a
+# complete path component, so "/accounting-services" does not match "account"
+# and "/thank-you-for-your-purchase" does not match "thank-you".
+
+# Post-action confirmation pages — no organic SEO value.
+_CONVERSION_SEGMENTS: tuple[str, ...] = (
+    'thank-you',
+    'thankyou',
+    'thank_you',
+    'confirmation',
+    'order-received',
+    'order-confirmation',
+    'order-success',
+    'payment-success',
+    'payment-complete',
+    'payment-confirmed',
+    'purchase-complete',
+    'purchase-confirmation',
+    'booking-confirmed',
+    'booking-success',
+    'unsubscribe-success',
+    'download-success',
+    'form-success',
+    'request-received',
+    'submission-confirmed',
+)
+
+# User authentication and session-management pages.
+_AUTHENTICATION_SEGMENTS: tuple[str, ...] = (
+    'login',
+    'logout',
+    'signin',
+    'sign-in',
+    'signout',
+    'sign-out',
+    'signup',
+    'sign-up',
+    'register',
+    'registration',
+    'forgot-password',
+    'reset-password',
+    'password-reset',
+    'verify-email',
+    'email-verification',
+)
+
+# E-commerce transactional pages — not organic landing pages.
+_TRANSACTION_SEGMENTS: tuple[str, ...] = (
+    'checkout',
+    'cart',
+    'basket',
+    'account',
+    'my-account',
+    'user',
+)
+
+# CMS internals, page-builder artifacts, and utility pages.
+_SYSTEM_SEGMENTS: tuple[str, ...] = (
+    # WordPress internals
+    'wp-admin',
+    'wp-json',
+    'wp-includes',
+    'wp-template',
+    'wp-templates',
+    'wp-custom-css',
+    # Content lifecycle / staging
+    'draft',
+    'revision',
+    'trash',
+    'sample-post',
+    'staging',
+    'preview',
+    'test',
+    # Utility / non-content
+    'search',
+    '404',
+    '500',
+    # Page-builder single-component paths
+    'pxl-template',
+    'pxl-templates',
+    'elementor_library',
+    'elementor-template',
+    'fl-builder',
+    'divi-template',
+    'extra-template',
+    'acf-template',
+    'template-part',
+)
+
+# Legal / policy pages — not auditable business content.
+# Segment-exact matching: "/privacy-policy" matches "privacy-policy" as a
+# full path component; "/privacy-policy-overview" does NOT match.
+_LEGAL_SEGMENTS: tuple[str, ...] = (
+    # Privacy variants
+    'privacy-policy',
+    'privacy_policy',
+    'privacy',
+    # Terms variants
+    'terms-conditions',
+    'terms-of-service',
+    'terms-of-use',
+    'terms-and-conditions',
+    'terms_conditions',
+    'terms',
+    # Cookie policy
+    'cookie-policy',
+    'cookie_policy',
+    'cookies',
+    # Other legal
+    'gdpr',
+    'disclaimer',
+    'legal',
+    'legal-notice',
+    'imprint',
+    'accessibility-statement',
+    'refund-policy',
+    'return-policy',
+    'shipping-policy',
+    'acceptable-use-policy',
+    'copyright',
+)
+
+# Review / testimonial / portfolio pages — no applicable schema rules.
+# Qualified but misclassified pages generate cascading LocalBusiness false
+# positives.  Exclude them from the crawl pool entirely.
+_REVIEW_SEGMENTS: tuple[str, ...] = (
+    'reviews',
+    'review',
+    'testimonials',
+    'testimonial',
+    'case-studies',
+    'case-study',
+    'case_studies',
+    'case_study',
+    'portfolio',
+    'success-stories',
+    'success-story',
+    'client-stories',
+    'client-story',
+    'our-work',
+    'work',
+)
+
+# WordPress and CMS archive / taxonomy pages — generated by the CMS, not
+# authored business content.  No SEO audit value.
+#
+# Each entry is a *segment-exact* path component (same matching rules as the
+# tables above): "/author/naxonify" matches "author"; "/tag/news" matches
+# "tag"; etc.
+_ARCHIVE_SEGMENTS: tuple[str, ...] = (
+    # WordPress taxonomy / user archives
+    'author',           # /author/[username]   — WP author archive
+    'tag',              # /tag/[slug]           — WP tag archive
+    'category',         # /category/[slug]      — WP category archive
+    # Feed / embed / media endpoints
+    'feed',             # /feed/                — RSS and Atom feeds
+    'embed',            # /embed/[slug]         — WP oEmbed endpoint pages
+    'attachment',       # /attachment/[slug]    — WP media attachment pages
+    # Generic CMS archive patterns
+    'archive',          # /archive/             — generic date or term archives
+    'archives',         # /archives/            — alternate plural form
+)
+
+# Multi-component path infixes that span more than one path segment and
+# therefore cannot be matched with segment-exact logic.
+# Checked as substrings of the normalized path (with an appended slash so
+# that URLs ending exactly at the prefix boundary also match).
+_SYSTEM_PATH_INFIXES: tuple[str, ...] = (
+    '/wp-content/plugins/',
+)
+
+# Archive path infixes — pagination and legacy WordPress ID query strings.
+# Checked as substrings of the full normalized URL (not just the path) so
+# that query-string forms like "/?p=123" are also caught.
+_ARCHIVE_PATH_INFIXES: tuple[str, ...] = (
+    '/page/',           # /page/2, /page/3, …   — WP pagination archives
+    '/?p=',             # /?p=123               — WP legacy post-by-ID URLs
+    '&p=',              # &p=123                — same in query strings
+    '/paged/',          # /paged/2/             — alternate WP pagination slug
+)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _path_has_segment(path: str, segment: str) -> bool:
+    """Return True if *segment* is an exact path component inside *path*.
+
+    >>> _path_has_segment('/thank-you', 'thank-you')
+    True
+    >>> _path_has_segment('/blog/thank-you', 'thank-you')
+    True
+    >>> _path_has_segment('/thank-you-note', 'thank-you')
+    False
+    >>> _path_has_segment('/accounting-services', 'account')
+    False
+    """
+    needle = '/' + segment
+    return (needle + '/') in path or path.endswith(needle)
+
+
+def _classify(url: str) -> str | None:
+    """Return the exclusion-category label for *url*, or None when the URL is
+    eligible for the SEO audit pipeline.  Never raises.
+    """
+    try:
+        path = urlparse(url).path.lower().rstrip('/') or '/'
+    except Exception:
+        return None
+
+    for seg in _CONVERSION_SEGMENTS:
+        if _path_has_segment(path, seg):
+            return 'conversion_page'
+
+    for seg in _AUTHENTICATION_SEGMENTS:
+        if _path_has_segment(path, seg):
+            return 'authentication_page'
+
+    for seg in _TRANSACTION_SEGMENTS:
+        if _path_has_segment(path, seg):
+            return 'transaction_page'
+
+    for seg in _SYSTEM_SEGMENTS:
+        if _path_has_segment(path, seg):
+            return 'system_page'
+
+    padded = path + '/'
+    for infix in _SYSTEM_PATH_INFIXES:
+        if infix in padded:
+            return 'system_page'
+
+    for seg in _ARCHIVE_SEGMENTS:
+        if _path_has_segment(path, seg):
+            return 'archive_page'
+
+    # Archive infixes are checked against the full URL (not just path) to
+    # catch query-string forms like /?p=123.
+    full_url_lower = url.lower()
+    for infix in _ARCHIVE_PATH_INFIXES:
+        if infix in full_url_lower:
+            return 'archive_page'
+
+    for seg in _LEGAL_SEGMENTS:
+        if _path_has_segment(path, seg):
+            return 'legal_page'
+
+    for seg in _REVIEW_SEGMENTS:
+        if _path_has_segment(path, seg):
+            return 'review_page'
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def should_skip_seo_url(url: str) -> bool:
+    """Return True if *url* must be excluded from the SEO audit pipeline.
+
+    Emits a structured ``[URL_FILTER]`` log line for every rejected URL so
+    that exclusions are fully auditable.  This is the **only entry point**
+    crawler components should call.
+    """
+    reason = _classify(url)
+    if reason is not None:
+        logger.info('[URL_FILTER] reason=%s url=%s', reason, url)
+        return True
+    return False
+
+
+def is_conversion_page(url: str) -> bool:
+    """True if *url* is a post-action confirmation page with no SEO value."""
+    try:
+        path = urlparse(url).path.lower().rstrip('/') or '/'
+    except Exception:
+        return False
+    return any(_path_has_segment(path, seg) for seg in _CONVERSION_SEGMENTS)
+
+
+def is_authentication_page(url: str) -> bool:
+    """True if *url* is a user authentication or session-management page."""
+    try:
+        path = urlparse(url).path.lower().rstrip('/') or '/'
+    except Exception:
+        return False
+    return any(_path_has_segment(path, seg) for seg in _AUTHENTICATION_SEGMENTS)
+
+
+def is_transaction_page(url: str) -> bool:
+    """True if *url* is an e-commerce transactional page."""
+    try:
+        path = urlparse(url).path.lower().rstrip('/') or '/'
+    except Exception:
+        return False
+    return any(_path_has_segment(path, seg) for seg in _TRANSACTION_SEGMENTS)
+
+
+def is_system_page(url: str) -> bool:
+    """True if *url* is a CMS internal, builder artifact, or utility page."""
+    try:
+        path = urlparse(url).path.lower().rstrip('/') or '/'
+    except Exception:
+        return False
+    if any(_path_has_segment(path, seg) for seg in _SYSTEM_SEGMENTS):
+        return True
+    padded = path + '/'
+    return any(infix in padded for infix in _SYSTEM_PATH_INFIXES)
+
+
+def is_legal_page(url: str) -> bool:
+    """True if *url* is a legal or policy page (privacy, terms, GDPR, etc.).
+
+    These pages carry no auditable business content and are excluded from the
+    crawl pool so they never reach schema validation or issue generation.
+    """
+    try:
+        path = urlparse(url).path.lower().rstrip('/') or '/'
+    except Exception:
+        return False
+    return any(_path_has_segment(path, seg) for seg in _LEGAL_SEGMENTS)
+
+
+def is_review_page(url: str) -> bool:
+    """True if *url* is a reviews, testimonials, case-study, or portfolio page.
+
+    These pages generate cascading LocalBusiness schema false positives when
+    misclassified.  Excluding them at qualification prevents all downstream
+    false failures (Geo Missing, NAP Missing, AggregateRating Missing, etc.).
+    """
+    try:
+        path = urlparse(url).path.lower().rstrip('/') or '/'
+    except Exception:
+        return False
+    return any(_path_has_segment(path, seg) for seg in _REVIEW_SEGMENTS)
+
+
+def is_archive_page(url: str) -> bool:
+    """True if *url* is a CMS-generated archive, taxonomy, or pagination page.
+
+    Covers WordPress author archives (/author/*), tag and category archives
+    (/tag/*, /category/*), feeds (/feed/), embed endpoints (/embed/*),
+    attachment pages (/attachment/*), pagination (/page/2), and legacy WP
+    post-by-ID query strings (/?p=123).  None of these are auditable business
+    or content pages.
+    """
+    try:
+        path = urlparse(url).path.lower().rstrip('/') or '/'
+    except Exception:
+        return False
+    if any(_path_has_segment(path, seg) for seg in _ARCHIVE_SEGMENTS):
+        return True
+    full_url_lower = url.lower()
+    return any(infix in full_url_lower for infix in _ARCHIVE_PATH_INFIXES)

@@ -1,5 +1,6 @@
 """Page analysis API routes."""
 
+from typing import Optional, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from bson.objectid import ObjectId
@@ -11,6 +12,11 @@ class PageAnalysisJob(BaseModel):
     projectId: str
     userId: str
     sourceJobId: str  # Reference to PAGE_SCRAPING job
+    # P2-001: optional URL-scope filter. Empty/absent (the default, matching
+    # the existing urls/canonical_urls convention on PageScrapingJob and
+    # HeadlessAccessibilityJob) means "no filter" — Full Audit's call site
+    # never sets this field and is completely unaffected.
+    urls: Optional[List[str]] = []
 
 @router.post("/jobs/page-analysis")
 def handle_page_analysis(job: PageAnalysisJob):

@@ -7,7 +7,7 @@ Every rule in V2:
   - implements evaluate(page: dict) -> RuleResult
 
 There are NO scores, weights, normalization, or category averages.
-evaluate() returns exactly PASS or FAIL with structured evidence.
+evaluate() returns exactly PASS, FAIL, or SKIPPED with structured evidence.
 """
 
 from abc import ABC, abstractmethod
@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from typing import Literal, Any
 
 
-Verdict = Literal["PASS", "FAIL"]
+Verdict = Literal["PASS", "FAIL", "SKIPPED"]
+Scope   = Literal["page", "domain"]
 
 
 @dataclass
@@ -31,13 +32,19 @@ class RuleResult:
     issue_description: str = ""
     recommendation:    str = ""
     expected_impact:   str = ""
+    scope:         str = "page"   # "page" | "domain"
+    skipped_reason: str = ""
 
     @property
     def passed(self) -> bool:
         return self.result == "PASS"
 
+    @property
+    def skipped(self) -> bool:
+        return self.result == "SKIPPED"
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "rule_id":          self.rule_id,
             "hub":              self.hub,
             "card":             self.card,
@@ -48,7 +55,11 @@ class RuleResult:
             "issue_description": self.issue_description,
             "recommendation":   self.recommendation,
             "expected_impact":  self.expected_impact,
+            "scope":            self.scope,
         }
+        if self.skipped_reason:
+            d["skipped_reason"] = self.skipped_reason
+        return d
 
 
 class BaseRule(ABC):
@@ -65,6 +76,9 @@ class BaseRule(ABC):
         RECOMMENDATION     str
         EXPECTED_IMPACT    str
 
+    Subclasses MAY declare:
+        DEPENDS_ON         list[str]  — e.g. ["AISO-006:PASS", "AISO-007:EXECUTED"]
+
     Subclasses MUST implement:
         evaluate(page: dict) -> RuleResult
     """
@@ -73,10 +87,12 @@ class BaseRule(ABC):
     HUB:               str = ""
     CARD:              str = ""
     SEVERITY:          str = "medium"
+    SCOPE:             str = "page"   # "page" | "domain"
     ISSUE_TITLE:       str = ""
     ISSUE_DESCRIPTION: str = ""
     RECOMMENDATION:    str = ""
     EXPECTED_IMPACT:   str = ""
+    DEPENDS_ON:        list = []  # list[str] — "RULE_ID:CONDITION" specs
 
     # ── Factory helpers ──────────────────────────────────────────────────────
 
@@ -92,6 +108,7 @@ class BaseRule(ABC):
             issue_description=self.ISSUE_DESCRIPTION,
             recommendation=self.RECOMMENDATION,
             expected_impact=self.EXPECTED_IMPACT,
+            scope=self.SCOPE,
         )
 
     def _fail(self, evidence: dict[str, Any]) -> RuleResult:
@@ -106,6 +123,23 @@ class BaseRule(ABC):
             issue_description=self.ISSUE_DESCRIPTION,
             recommendation=self.RECOMMENDATION,
             expected_impact=self.EXPECTED_IMPACT,
+            scope=self.SCOPE,
+        )
+
+    def _skip(self, reason: str) -> RuleResult:
+        return RuleResult(
+            rule_id=self.RULE_ID,
+            hub=self.HUB,
+            card=self.CARD,
+            result="SKIPPED",
+            evidence={},
+            severity=self.SEVERITY,
+            issue_title=self.ISSUE_TITLE,
+            issue_description=self.ISSUE_DESCRIPTION,
+            recommendation=self.RECOMMENDATION,
+            expected_impact=self.EXPECTED_IMPACT,
+            scope=self.SCOPE,
+            skipped_reason=reason,
         )
 
     # ── Interface ─────────────────────────────────────────────────────────────
@@ -119,7 +153,7 @@ class BaseRule(ABC):
             page: full ai_pages document for one URL.
 
         Returns:
-            RuleResult with result="PASS" or "FAIL" and structured evidence.
+            RuleResult with result="PASS", "FAIL", or "SKIPPED" and structured evidence.
         """
 
     def __repr__(self) -> str:

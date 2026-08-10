@@ -5,14 +5,22 @@ from pydantic import BaseModel
 from bson.objectid import ObjectId
 from datetime import datetime
 import os
+import time
 import requests
 from urllib.parse import urlparse
 
-# Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()
 
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# Retry configuration
+# ---------------------------------------------------------------------------
+_RETRY_DELAYS = [0, 30, 60]          # seconds before each attempt (3 total)
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
+_PSI_TIMEOUT = 120                   # seconds per individual PSI request
+
 
 class DomainPerformanceJob(BaseModel):
     jobId: str
@@ -20,463 +28,459 @@ class DomainPerformanceJob(BaseModel):
     userId: str
     main_url: str
 
+
+# ---------------------------------------------------------------------------
+# Node.js callback helpers
+# ---------------------------------------------------------------------------
+
+def _node_url():
+    url = os.environ.get("NODE_BACKEND_URL", "")
+    if not url:
+        raise RuntimeError("NODE_BACKEND_URL not set")
+    return url
+
+
+def _emit_ws_event(project_id: str, event: str, payload: dict):
+    """Fire a WebSocket event via the Node.js SSE/socket bridge (best-effort)."""
+    try:
+        requests.post(
+            f"{_node_url()}/api/pagespeed/ws-event",
+            json={"projectId": project_id, "event": event, "payload": payload},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[WS] Failed to emit {event}: {e}")
+
+
+def _mark_job_failed(job_id: str, error: str):
+    try:
+        requests.post(
+            f"{_node_url()}/api/jobs/{job_id}/fail",
+            json={"error": error},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[CALLBACK] Failed to mark job failed | jobId={job_id} | {e}")
+
+
+def _mark_job_complete(job_id: str, stats: dict):
+    try:
+        requests.post(
+            f"{_node_url()}/api/jobs/{job_id}/complete",
+            json={"stats": stats, "result_data": stats},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[CALLBACK] Failed to mark job complete | jobId={job_id} | {e}")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI route
+# ---------------------------------------------------------------------------
+
 @router.post("/jobs/domain-performance")
 def handle_domain_performance(job: DomainPerformanceJob):
-    """Handle DOMAIN_PERFORMANCE job dispatched from Node.js"""
+    """Handle DOMAIN_PERFORMANCE job dispatched from Node.js."""
     print(f"[DEBUG] DOMAIN_PERFORMANCE endpoint called | jobId={job.jobId} | projectId={job.projectId}")
-    
-    # Import here to avoid circular imports
+
     from main import completed_jobs, completed_jobs_lock
     from db import db
-    
+
     try:
-        # Defensive guard: skip if already completed
         with completed_jobs_lock:
             if job.jobId in completed_jobs:
-                print(f"ℹ️ Skipping already completed DOMAIN_PERFORMANCE job | jobId={job.jobId}")
-                return {
-                    "status": "already_completed",
-                    "jobId": job.jobId,
-                    "message": "Job already completed"
-                }
-        
+                print(f"[INFO] Skipping already completed DOMAIN_PERFORMANCE job | jobId={job.jobId}")
+                return {"status": "already_completed", "jobId": job.jobId}
+
         print(f"[WORKER] DOMAIN_PERFORMANCE started | jobId={job.jobId}")
-        
-        # Execute domain performance analysis
         result = execute_domain_performance_logic(job)
-        
-        # Mark as completed
+
         with completed_jobs_lock:
             completed_jobs.add(job.jobId)
-        
-        return {
-            "status": "accepted",
-            "jobId": job.jobId,
-            "message": "DOMAIN_PERFORMANCE job accepted and processing"
-        }
-        
+
+        return {"status": "accepted", "jobId": job.jobId, "message": "DOMAIN_PERFORMANCE job accepted and processing"}
+
     except Exception as e:
-        print(f"[ERROR] DOMAIN_PERFORMANCE handler failed | jobId={job.jobId} | reason=\"{str(e)}\"")
-        return {
-            "status": "error",
-            "jobId": job.jobId,
-            "error": str(e)
-        }
+        print(f"[ERROR] DOMAIN_PERFORMANCE handler failed | jobId={job.jobId} | reason=\"{e}\"")
+        return {"status": "error", "jobId": job.jobId, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Score validation
+# ---------------------------------------------------------------------------
 
 def validate_scores(metrics, device_type):
-    """Validate scores and log warnings for zero values"""
-    if 'error' in metrics:
-        print(f"[VALIDATION] {device_type} metrics contain error, skipping score validation")
+    if "error" in metrics:
         return
-        
-    score_fields = ['performance_score', 'accessibility_score', 'best_practices_score', 'seo_score']
-    zero_scores = []
-    
-    for field in score_fields:
-        score = metrics.get(field, 0)
-        if score == 0:
-            zero_scores.append(field)
-    
-    if zero_scores:
-        print(f"[WARNING] {device_type} scores that are 0: {zero_scores}")
-        print(f"[WARNING] This may indicate missing categories in Lighthouse response or API configuration issues")
-        
-        # Log available categories for debugging
-        if 'categories_debug' in metrics:
-            print(f"[DEBUG] Available categories in {device_type}: {metrics['categories_debug']}")
-    else:
-        print(f"[VALIDATION] All {device_type} scores are non-zero: { {field: metrics.get(field, 'N/A') for field in score_fields} }")
+    zero_fields = [f for f in ["performance_score", "accessibility_score", "best_practices_score", "seo_score"]
+                   if metrics.get(f, 0) == 0]
+    if zero_fields:
+        print(f"[WARNING] {device_type} zero scores: {zero_fields}")
+
+
+# ---------------------------------------------------------------------------
+# PSI fetch with exponential backoff retry
+# ---------------------------------------------------------------------------
+
+def _fetch_psi_with_retry(main_url: str, strategy: str, api_key: str, job_id: str) -> dict:
+    """
+    Call the Google PageSpeed Insights API with up to 3 attempts.
+
+    Retry on: 429, 500, 502, 503, connection errors, timeouts.
+    Do NOT retry: 400, 401, 403, 404, invalid URL errors.
+
+    Returns metrics dict on success, or raises on permanent failure.
+    """
+    last_error = None
+    api_url = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+    params = {
+        "url": main_url,
+        "strategy": strategy,
+        "key": api_key,
+        "category": ["performance", "accessibility", "best-practices", "seo"],
+    }
+
+    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        if delay > 0:
+            print(f"[RETRY] {strategy} attempt {attempt} | waiting {delay}s | jobId={job_id}")
+            time.sleep(delay)
+
+        print(f"[PSI] {strategy} attempt {attempt}/{len(_RETRY_DELAYS)} | jobId={job_id}")
+        try:
+            response = requests.get(api_url, params=params, timeout=_PSI_TIMEOUT)
+
+            if response.status_code == 200:
+                data = response.json()
+                metrics = extract_metrics(data)
+                metrics["_attempt"] = attempt
+                return metrics
+
+            if response.status_code in _RETRYABLE_STATUS_CODES:
+                last_error = f"HTTP {response.status_code}"
+                print(f"[RETRY] {strategy} retryable error | status={response.status_code} | attempt={attempt}")
+                continue
+
+            # Non-retryable HTTP error (400, 401, 403, 404 …)
+            body = response.text[:300]
+            raise RuntimeError(f"PSI non-retryable error {response.status_code}: {body}")
+
+        except requests.Timeout:
+            last_error = f"Timeout after {_PSI_TIMEOUT}s"
+            print(f"[RETRY] {strategy} timed out | attempt={attempt}")
+
+        except requests.ConnectionError as ce:
+            last_error = f"Connection error: {ce}"
+            print(f"[RETRY] {strategy} connection error | attempt={attempt} | {ce}")
+
+    raise RuntimeError(f"{strategy} PSI failed after {len(_RETRY_DELAYS)} attempts: {last_error}")
+
+
+# ---------------------------------------------------------------------------
+# Core execution logic
+# ---------------------------------------------------------------------------
 
 def execute_domain_performance_logic(job: DomainPerformanceJob):
-    """Execute domain-level PageSpeed analysis for both mobile and desktop"""
+    """Execute domain-level PageSpeed analysis for both mobile and desktop."""
+    start_ts = time.time()
     print(f"[DOMAIN_PERFORMANCE] Starting analysis for {job.main_url}")
-    
-    # Get MongoDB connection
-    from db import db
-    
-    # PageSpeed API key from environment
-    api_key = os.getenv('PSI_API_KEY')
-    if not api_key or api_key == 'your_actual_api_key_here':
-        raise ValueError("PSI_API_KEY not found in environment variables or still set to placeholder value")
-    
-    # Debug log to verify API key is loaded (showing first 6 chars only)
-    print(f"[DOMAIN_PERFORMANCE] Using PSI API key: {api_key[:6]}***")
-    
-    # Validate and format URL
+
+    from db import db, seo_domain_performance, jobs
+
+    api_key = os.getenv("PSI_API_KEY")
+    if not api_key or api_key == "your_actual_api_key_here":
+        raise ValueError("PSI_API_KEY not configured")
+
+    print(f"[DOMAIN_PERFORMANCE] PSI key: {api_key[:6]}***")
+
+    # Normalise URL
     main_url = job.main_url.strip()
-    if not main_url.startswith(('http://', 'https://')):
-        main_url = 'https://' + main_url
-    
-    # Remove trailing slashes for consistency (but keep one if present)
-    if main_url.endswith('/') and main_url.count('/') > 3:
-        main_url = main_url.rstrip('/')
-    
-    print(f"[DOMAIN_PERFORMANCE] Validated URL: {main_url}")
-    
-    # Extract domain from URL
-    parsed_url = urlparse(main_url)
-    domain = parsed_url.netloc
+    if not main_url.startswith(("http://", "https://")):
+        main_url = "https://" + main_url
+    if main_url.endswith("/") and main_url.count("/") > 3:
+        main_url = main_url.rstrip("/")
+
+    parsed = urlparse(main_url)
+    domain = parsed.netloc
     if not domain:
-        raise Exception(f"Invalid URL format: {main_url}")
-    
-    # PageSpeed API endpoint
-    api_url = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-    
-    mobile_metrics = {}
-    desktop_metrics = {}
-    
-    # Test mobile performance
-    print(f"[DOMAIN_PERFORMANCE] Testing mobile performance for {domain}")
+        raise ValueError(f"Invalid URL: {main_url}")
+
+    print(f"[DOMAIN_PERFORMANCE] Validated URL: {main_url} | domain: {domain}")
+
+    # Emit started WS event
+    _emit_ws_event(job.projectId, "pagespeed:started", {
+        "jobId": job.jobId,
+        "domain": domain,
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+
+    # ------------------------------------------------------------------
+    # Fetch mobile metrics
+    # ------------------------------------------------------------------
+    mobile_metrics = None
+    mobile_status = "completed"
+    mobile_error = None
+    mobile_attempts = 0
+
     try:
-        mobile_params = {
-            'url': main_url,
-            'strategy': 'mobile',
-            'key': api_key,
-            'category': ['performance', 'accessibility', 'best-practices', 'seo']  # Request all categories
-        }
-        
-        print(f"[DOMAIN_PERFORMANCE] Mobile request params: {mobile_params}")
-        mobile_response = requests.get(api_url, params=mobile_params, timeout=120)
-        
-        print(f"[DOMAIN_PERFORMANCE] Mobile response status: {mobile_response.status_code}")
-        
-        if mobile_response.status_code != 200:
-            print(f"[DOMAIN_PERFORMANCE] Mobile error response: {mobile_response.text}")
-            raise Exception(f"Mobile PageSpeed API failed: {mobile_response.status_code} - {mobile_response.text}")
-        
-        mobile_data = mobile_response.json()
-        mobile_metrics = extract_metrics(mobile_data)
-        print(f"[DOMAIN_PERFORMANCE] Mobile metrics extracted: score={mobile_metrics.get('performance_score')}")
-        
+        mobile_metrics = _fetch_psi_with_retry(main_url, "mobile", api_key, job.jobId)
+        mobile_attempts = mobile_metrics.pop("_attempt", 1)
+        print(f"[DOMAIN_PERFORMANCE] Mobile OK | score={mobile_metrics.get('performance_score')} | attempts={mobile_attempts}")
+        validate_scores(mobile_metrics, "mobile")
     except Exception as e:
-        print(f"[ERROR] Mobile performance test failed: {str(e)}")
-        # Continue with desktop test even if mobile fails
-        mobile_metrics = {
-            'error': str(e), 
-            'performance_score': 0,
-            'accessibility_score': 0,
-            'best_practices_score': 0,
-            'seo_score': 0
-        }
-    
-    # Test desktop performance
-    print(f"[DOMAIN_PERFORMANCE] Testing desktop performance for {domain}")
+        mobile_status = "failed"
+        mobile_error = str(e)
+        print(f"[ERROR] Mobile failed | {e}")
+
+    # ------------------------------------------------------------------
+    # Fetch desktop metrics
+    # ------------------------------------------------------------------
+    desktop_metrics = None
+    desktop_status = "completed"
+    desktop_error = None
+    desktop_attempts = 0
+
     try:
-        desktop_params = {
-            'url': main_url,
-            'strategy': 'desktop',
-            'key': api_key,
-            'category': ['performance', 'accessibility', 'best-practices', 'seo']  # Request all categories
-        }
-        
-        print(f"[DOMAIN_PERFORMANCE] Desktop request params: {desktop_params}")
-        desktop_response = requests.get(api_url, params=desktop_params, timeout=120)
-        
-        print(f"[DOMAIN_PERFORMANCE] Desktop response status: {desktop_response.status_code}")
-        
-        if desktop_response.status_code != 200:
-            print(f"[DOMAIN_PERFORMANCE] Desktop error response: {desktop_response.text}")
-            raise Exception(f"Desktop PageSpeed API failed: {desktop_response.status_code} - {desktop_response.text}")
-        
-        desktop_data = desktop_response.json()
-        desktop_metrics = extract_metrics(desktop_data)
-        print(f"[DOMAIN_PERFORMANCE] Desktop metrics extracted: score={desktop_metrics.get('performance_score')}")
-        
+        desktop_metrics = _fetch_psi_with_retry(main_url, "desktop", api_key, job.jobId)
+        desktop_attempts = desktop_metrics.pop("_attempt", 1)
+        print(f"[DOMAIN_PERFORMANCE] Desktop OK | score={desktop_metrics.get('performance_score')} | attempts={desktop_attempts}")
+        validate_scores(desktop_metrics, "desktop")
     except Exception as e:
-        print(f"[ERROR] Desktop performance test failed: {str(e)}")
-        # Continue with storing partial results even if desktop fails
-        desktop_metrics = {
-            'error': str(e), 
-            'performance_score': 0,
-            'accessibility_score': 0,
-            'best_practices_score': 0,
-            'seo_score': 0
-        }
-    
-    # Check if both tests failed
-    if 'error' in mobile_metrics and 'error' in desktop_metrics:
-        raise Exception("Both mobile and desktop PageSpeed tests failed")
-    
-    # Validate scores before storing
-    validate_scores(mobile_metrics, 'mobile')
-    validate_scores(desktop_metrics, 'desktop')
-    
-    # Store results in MongoDB
-    performance_doc = {
-        'project_id': ObjectId(job.projectId),
-        'domain': domain,
-        'mobile': mobile_metrics,
-        'desktop': desktop_metrics,
-        'tested_at': datetime.utcnow(),
-        'job_id': job.jobId
-    }
-    
-    # Upsert to ensure only one document per project
-    from db import seo_domain_performance
-    seo_domain_performance.update_one(
-        {'project_id': ObjectId(job.projectId)},
-        {'$set': performance_doc},
-        upsert=True
-    )
-    
-    print(f"[DOMAIN_PERFORMANCE] Analysis complete for {domain} | mobile_score={mobile_metrics.get('performance_score')} | desktop_score={desktop_metrics.get('performance_score')}")
-    
-    # Update job status in MongoDB
-    from db import jobs
-    jobs.update_one(
-        {'_id': ObjectId(job.jobId)},
-        {
-            '$set': {
-                'status': 'completed',
-                'completed_at': datetime.utcnow(),
-                'result_data': {
-                    'domain': domain,
-                    'mobile_score': mobile_metrics.get('performance_score'),
-                    'desktop_score': desktop_metrics.get('performance_score')
+        desktop_status = "failed"
+        desktop_error = str(e)
+        print(f"[ERROR] Desktop failed | {e}")
+
+    # ------------------------------------------------------------------
+    # Both failed → abort without touching existing data
+    # ------------------------------------------------------------------
+    if mobile_status == "failed" and desktop_status == "failed":
+        combined_error = f"mobile: {mobile_error} | desktop: {desktop_error}"
+        duration_ms = int((time.time() - start_ts) * 1000)
+
+        # Update only the scan metadata; preserve previous mobile/desktop data
+        seo_domain_performance.update_one(
+            {"project_id": ObjectId(job.projectId)},
+            {
+                "$set": {
+                    "scan_status": "failed",
+                    "last_run_at": datetime.utcnow(),
+                    "last_error": combined_error,
+                    "mobile_status": "failed",
+                    "desktop_status": "failed",
+                    "mobile_error": mobile_error,
+                    "desktop_error": desktop_error,
+                    "retry_count": mobile_attempts + desktop_attempts,
+                    "duration_ms": duration_ms,
+                    "updated_at": datetime.utcnow(),
                 }
-            }
-        }
-    )
-    
-    return {
-        'domain': domain,
-        'mobile_metrics': mobile_metrics,
-        'desktop_metrics': desktop_metrics
+            },
+            upsert=True,
+        )
+
+        jobs.update_one(
+            {"_id": ObjectId(job.jobId)},
+            {"$set": {"status": "failed", "completed_at": datetime.utcnow(),
+                      "error_message": combined_error}},
+        )
+
+        _emit_ws_event(job.projectId, "pagespeed:failed", {
+            "jobId": job.jobId,
+            "error": combined_error,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        _mark_job_failed(job.jobId, combined_error)
+
+        raise RuntimeError(combined_error)
+
+    # ------------------------------------------------------------------
+    # At least one succeeded — build partial-safe $set payload
+    # ------------------------------------------------------------------
+    duration_ms = int((time.time() - start_ts) * 1000)
+    overall_status = "completed" if (mobile_status == "completed" and desktop_status == "completed") else "partial_success"
+
+    # Base metadata — always written
+    update_fields = {
+        "project_id": ObjectId(job.projectId),
+        "domain": domain,
+        "scan_status": overall_status,
+        "last_run_at": datetime.utcnow(),
+        "last_error": None,
+        "mobile_status": mobile_status,
+        "desktop_status": desktop_status,
+        "mobile_error": mobile_error,
+        "desktop_error": desktop_error,
+        "retry_count": mobile_attempts + desktop_attempts,
+        "duration_ms": duration_ms,
+        "job_id": job.jobId,
+        "updated_at": datetime.utcnow(),
     }
+
+    # Only write device data when that device succeeded
+    if mobile_status == "completed" and mobile_metrics is not None:
+        update_fields["mobile"] = mobile_metrics
+        update_fields["last_successful_run_at"] = datetime.utcnow()
+        update_fields["tested_at"] = datetime.utcnow()
+    if desktop_status == "completed" and desktop_metrics is not None:
+        update_fields["desktop"] = desktop_metrics
+        update_fields["last_successful_run_at"] = datetime.utcnow()
+        update_fields["tested_at"] = datetime.utcnow()
+
+    seo_domain_performance.update_one(
+        {"project_id": ObjectId(job.projectId)},
+        {"$set": update_fields},
+        upsert=True,
+    )
+
+    print(
+        f"[DOMAIN_PERFORMANCE] Saved | domain={domain} | status={overall_status} "
+        f"| mobile_score={mobile_metrics.get('performance_score') if mobile_metrics else 'N/A'} "
+        f"| desktop_score={desktop_metrics.get('performance_score') if desktop_metrics else 'N/A'} "
+        f"| duration={duration_ms}ms"
+    )
+
+    # Update job document
+    jobs.update_one(
+        {"_id": ObjectId(job.jobId)},
+        {
+            "$set": {
+                "status": "completed",
+                "completed_at": datetime.utcnow(),
+                "result_data": {
+                    "domain": domain,
+                    "scan_status": overall_status,
+                    "mobile_score": mobile_metrics.get("performance_score") if mobile_metrics else None,
+                    "desktop_score": desktop_metrics.get("performance_score") if desktop_metrics else None,
+                    "mobile_status": mobile_status,
+                    "desktop_status": desktop_status,
+                    "duration_ms": duration_ms,
+                },
+            }
+        },
+    )
+
+    # Emit completion WS event
+    _emit_ws_event(job.projectId, "pagespeed:completed", {
+        "jobId": job.jobId,
+        "status": overall_status,
+        "mobileScore": mobile_metrics.get("performance_score") if mobile_metrics else None,
+        "desktopScore": desktop_metrics.get("performance_score") if desktop_metrics else None,
+        "mobileStatus": mobile_status,
+        "desktopStatus": desktop_status,
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+    _mark_job_complete(job.jobId, {
+        "domain": domain,
+        "scan_status": overall_status,
+        "mobile_score": mobile_metrics.get("performance_score") if mobile_metrics else None,
+        "desktop_score": desktop_metrics.get("performance_score") if desktop_metrics else None,
+    })
+
+    return {
+        "domain": domain,
+        "mobile_metrics": mobile_metrics,
+        "desktop_metrics": desktop_metrics,
+        "scan_status": overall_status,
+        "duration_ms": duration_ms,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metric extraction helpers (unchanged API surface)
+# ---------------------------------------------------------------------------
 
 def extract_metrics(pagespeed_data):
-    """Extract key performance metrics from PageSpeed API response"""
     metrics = {}
-    
     try:
-        lighthouse_result = pagespeed_data['lighthouseResult']
-        categories = lighthouse_result['categories']
-        audits = lighthouse_result['audits']
-        
-        # Extract Lighthouse scores (multiply by 100 for 0-100 scale)
-        metrics['performance_score'] = categories.get('performance', {}).get('score', 0) * 100
-        
-        # Other scores may not be available if only performance category requested
-        metrics['accessibility_score'] = categories.get('accessibility', {}).get('score', 0) * 100
-        metrics['best_practices_score'] = categories.get('best-practices', {}).get('score', 0) * 100
-        metrics['seo_score'] = categories.get('seo', {}).get('score', 0) * 100
-        
-        # Log available categories for debugging
-        print(f"[CATEGORIES] Available categories: {list(categories.keys())}")
-        
-        # Store categories debug info for validation
-        metrics['categories_debug'] = list(categories.keys())
-        
-        print(f"[CATEGORIES] Performance score: {metrics['performance_score']}")
-        if 'accessibility' in categories:
-            print(f"[CATEGORIES] Accessibility score: {metrics['accessibility_score']}")
-        else:
-            print(f"[CATEGORIES] Accessibility category NOT FOUND in response")
-        if 'best-practices' in categories:
-            print(f"[CATEGORIES] Best practices score: {metrics['best_practices_score']}")
-        else:
-            print(f"[CATEGORIES] Best practices category NOT FOUND in response")
-        if 'seo' in categories:
-            print(f"[CATEGORIES] SEO score: {metrics['seo_score']}")
-        else:
-            print(f"[CATEGORIES] SEO category NOT FOUND in response")
-        
-        # Log available audit keys (sample)
-        print(f"[AUDITS] Total audits available: {len(audits)}")
-        audit_keys = list(audits.keys())
-        print(f"[AUDITS] Sample audit keys: {audit_keys[:10]}...")  # Show first 10
-        
-        # Check for specific opportunity audits
-        missing_opportunities = []
-        for opp_key in ['render-blocking-resources', 'unused-javascript', 'uses-responsive-images', 'uses-text-compression', 'uses-long-cache-ttl']:
-            if opp_key in audits:
-                print(f"[AUDITS] Found opportunity: {opp_key} - score: {audits[opp_key].get('score')}")
-            else:
-                missing_opportunities.append(opp_key)
-        
-        if missing_opportunities:
-            print(f"[AUDITS] Missing opportunities: {missing_opportunities}")
-        
-        # Check for specific diagnostic audits  
-        missing_diagnostics = []
-        for diag_key in ['mainthread-work-breakdown', 'bootup-time', 'network-requests']:
-            if diag_key in audits:
-                print(f"[AUDITS] Found diagnostic: {diag_key} - score: {audits[diag_key].get('score')}")
-            else:
-                missing_diagnostics.append(diag_key)
-                
-        if missing_diagnostics:
-            print(f"[AUDITS] Missing diagnostics: {missing_diagnostics}")
-        
-        # Get Core Web Vitals and other metrics
-        metrics['metrics'] = {}
-        
-        # First Contentful Paint (FCP)
-        if 'first-contentful-paint' in audits:
-            fcp = audits['first-contentful-paint']
-            metrics['metrics']['fcp'] = {
-                'value': fcp.get('numericValue', 0) / 1000,  # Convert to seconds
-                'unit': 's',
-                'display_value': fcp.get('displayValue', 'N/A')
-            }
-        
-        # Largest Contentful Paint (LCP)
-        if 'largest-contentful-paint' in audits:
-            lcp = audits['largest-contentful-paint']
-            metrics['metrics']['lcp'] = {
-                'value': lcp.get('numericValue', 0) / 1000,  # Convert to seconds
-                'unit': 's',
-                'display_value': lcp.get('displayValue', 'N/A')
-            }
-        
-        # Cumulative Layout Shift (CLS)
-        if 'cumulative-layout-shift' in audits:
-            cls = audits['cumulative-layout-shift']
-            metrics['metrics']['cls'] = {
-                'value': cls.get('numericValue', 0),
-                'unit': 'score',
-                'display_value': cls.get('displayValue', 'N/A')
-            }
-        
-        # Total Blocking Time (TBT)
-        if 'total-blocking-time' in audits:
-            tbt = audits['total-blocking-time']
-            metrics['metrics']['tbt'] = {
-                'value': tbt.get('numericValue', 0),  # Already in milliseconds
-                'unit': 'ms',
-                'display_value': tbt.get('displayValue', 'N/A')
-            }
-        
-        # Speed Index
-        if 'speed-index' in audits:
-            si = audits['speed-index']
-            metrics['metrics']['speed_index'] = {
-                'value': si.get('numericValue', 0) / 1000,  # Convert to seconds
-                'unit': 's',
-                'display_value': si.get('displayValue', 'N/A')
-            }
-        
-        # Time to Interactive (TTI)
-        if 'interactive' in audits:
-            tti = audits['interactive']
-            metrics['metrics']['tti'] = {
-                'value': tti.get('numericValue', 0) / 1000,  # Convert to seconds
-                'unit': 's',
-                'display_value': tti.get('displayValue', 'N/A')
-            }
-        
-        # Extract opportunities
-        metrics['opportunities'] = extract_opportunities(audits)
-        
-        # Extract diagnostics
-        metrics['diagnostics'] = extract_diagnostics(audits)
-        
-        # Keep backward compatibility - maintain old field structure
-        for metric_name, metric_data in metrics['metrics'].items():
-            metrics[metric_name] = metric_data
-        
-        # Log extraction summary
-        print(f"[METRICS] Extraction complete:")
-        print(f"  - Performance score: {metrics.get('performance_score', 'N/A')}")
-        print(f"  - Accessibility score: {metrics.get('accessibility_score', 'N/A')}")
-        print(f"  - Best practices score: {metrics.get('best_practices_score', 'N/A')}")
-        print(f"  - SEO score: {metrics.get('seo_score', 'N/A')}")
-        print(f"  - Opportunities: {len(metrics.get('opportunities', []))}")
-        print(f"  - Diagnostics: {len(metrics.get('diagnostics', []))}")
-        print(f"  - Core metrics: {len(metrics.get('metrics', {}))}")
-        
+        lr = pagespeed_data["lighthouseResult"]
+        categories = lr["categories"]
+        audits = lr["audits"]
+
+        metrics["performance_score"]    = round((categories.get("performance",    {}).get("score", 0) or 0) * 100)
+        metrics["accessibility_score"]  = round((categories.get("accessibility",  {}).get("score", 0) or 0) * 100)
+        metrics["best_practices_score"] = round((categories.get("best-practices", {}).get("score", 0) or 0) * 100)
+        metrics["seo_score"]            = round((categories.get("seo",            {}).get("score", 0) or 0) * 100)
+        metrics["categories_debug"]     = list(categories.keys())
+
+        metrics["metrics"] = {}
+
+        _cwv = {
+            "fcp":          "first-contentful-paint",
+            "lcp":          "largest-contentful-paint",
+            "cls":          "cumulative-layout-shift",
+            "tbt":          "total-blocking-time",
+            "speed_index":  "speed-index",
+            "tti":          "interactive",
+        }
+        for key, audit_id in _cwv.items():
+            if audit_id in audits:
+                a = audits[audit_id]
+                raw = a.get("numericValue", 0) or 0
+                # CLS is unit-less; others convert ms→s except TBT which stays ms
+                if key in ("cls", "tbt"):
+                    value = raw
+                else:
+                    value = raw / 1000
+                metrics["metrics"][key] = {
+                    "value": value,
+                    "unit": "score" if key == "cls" else ("ms" if key == "tbt" else "s"),
+                    "display_value": a.get("displayValue", "N/A"),
+                }
+                # Backward-compat flat fields
+                metrics[key] = metrics["metrics"][key]
+
+        metrics["opportunities"] = extract_opportunities(audits)
+        metrics["diagnostics"]   = extract_diagnostics(audits)
+
     except Exception as e:
-        print(f"[ERROR] Failed to extract metrics: {str(e)}")
-        metrics['error'] = str(e)
-    
+        print(f"[ERROR] extract_metrics failed: {e}")
+        metrics["error"] = str(e)
+
     return metrics
 
+
 def extract_opportunities(audits):
-    """Extract opportunity audits from PageSpeed data"""
-    opportunities = []
-    
-    # Updated opportunity keys based on actual Lighthouse audit IDs
-    opportunity_keys = [
-        'render-blocking-resources',
-        'unused-javascript', 
-        'uses-responsive-images',
-        'uses-text-compression',
-        'uses-long-cache-ttl',
-        # Additional common opportunities
-        'uses-webp-images',
-        'modern-image-formats',
-        'efficient-animated-images',
-        'offscreen-images',
-        'properly-size-images',
-        'unused-css-rules',
-        'legacy-javascript',
-        'modern-javascript'
+    keys = [
+        "render-blocking-resources", "unused-javascript", "uses-responsive-images",
+        "uses-text-compression", "uses-long-cache-ttl", "uses-webp-images",
+        "modern-image-formats", "efficient-animated-images", "offscreen-images",
+        "properly-size-images", "unused-css-rules", "legacy-javascript",
     ]
-    
-    for key in opportunity_keys:
-        if key in audits:
-            audit = audits[key]
-            # Only include opportunities that have room for improvement (score < 1)
-            if audit.get('score') is not None and audit.get('score') < 1:
-                opportunity = {
-                    'id': key,
-                    'title': audit.get('title', key),
-                    'description': audit.get('description', ''),
-                    'score': audit.get('score', 0),
-                    'displayValue': audit.get('displayValue', 'N/A'),
-                    'numericValue': audit.get('numericValue', 0),
-                    'numericUnit': audit.get('numericUnit', ''),
-                    'details': audit.get('details', {})
-                }
-                opportunities.append(opportunity)
-                print(f"[OPPORTUNITY] Found: {key} - score={audit.get('score')} - {audit.get('displayValue', 'N/A')}")
-            else:
-                print(f"[OPPORTUNITY] Skipped (good score): {key} - score={audit.get('score')}")
-        else:
-            print(f"[OPPORTUNITY] Not found in audits: {key}")
-    
-    print(f"[OPPORTUNITY] Total opportunities extracted: {len(opportunities)}")
-    return opportunities
+    result = []
+    for k in keys:
+        if k in audits:
+            a = audits[k]
+            if a.get("score") is not None and a.get("score") < 1:
+                result.append({
+                    "id": k,
+                    "title": a.get("title", k),
+                    "description": a.get("description", ""),
+                    "score": a.get("score", 0),
+                    "displayValue": a.get("displayValue", "N/A"),
+                    "numericValue": a.get("numericValue", 0),
+                    "numericUnit": a.get("numericUnit", ""),
+                    "details": a.get("details", {}),
+                })
+    return result
+
 
 def extract_diagnostics(audits):
-    """Extract diagnostic audits from PageSpeed data"""
-    diagnostics = []
-    
-    # Updated diagnostic keys based on actual Lighthouse audit IDs
-    diagnostic_keys = [
-        'mainthread-work-breakdown',
-        'bootup-time',
-        'network-requests',
-        # Additional useful diagnostics
-        'resource-summary',
-        'script-treemap-data',
-        'layout-shift-elements',
-        'cumulative-layout-shift',
-        'largest-contentful-paint',
-        'first-contentful-paint',
-        'speed-index',
-        'interactive',
-        'total-blocking-time',
-        'server-response-time'
+    keys = [
+        "mainthread-work-breakdown", "bootup-time", "network-requests",
+        "resource-summary", "layout-shift-elements", "cumulative-layout-shift",
+        "largest-contentful-paint", "first-contentful-paint", "speed-index",
+        "interactive", "total-blocking-time", "server-response-time",
     ]
-    
-    for key in diagnostic_keys:
-        if key in audits:
-            audit = audits[key]
-            diagnostic = {
-                'id': key,
-                'title': audit.get('title', key),
-                'description': audit.get('description', ''),
-                'score': audit.get('score', 0),
-                'displayValue': audit.get('displayValue', 'N/A'),
-                'numericValue': audit.get('numericValue', 0),
-                'numericUnit': audit.get('numericUnit', ''),
-                'details': audit.get('details', {})
-            }
-            diagnostics.append(diagnostic)
-            print(f"[DIAGNOSTIC] Found: {key} - score={audit.get('score')} - {audit.get('displayValue', 'N/A')}")
-        else:
-            print(f"[DIAGNOSTIC] Not found in audits: {key}")
-    
-    print(f"[DIAGNOSTIC] Total diagnostics extracted: {len(diagnostics)}")
-    return diagnostics
+    result = []
+    for k in keys:
+        if k in audits:
+            a = audits[k]
+            result.append({
+                "id": k,
+                "title": a.get("title", k),
+                "description": a.get("description", ""),
+                "score": a.get("score", 0),
+                "displayValue": a.get("displayValue", "N/A"),
+                "numericValue": a.get("numericValue", 0),
+                "numericUnit": a.get("numericUnit", ""),
+                "details": a.get("details", {}),
+            })
+    return result

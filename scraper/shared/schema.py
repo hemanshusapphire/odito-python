@@ -1,8 +1,11 @@
 """Structured data (JSON-LD schema) extraction and validation."""
 
 import json
+import logging
 import re
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 # Third-party imports
 from bs4 import BeautifulSoup
@@ -16,28 +19,28 @@ from config.config import (
 
 def flatten_schema(schema_obj):
     """
-    Recursively flatten JSON-LD schema objects that contain @graph arrays.
-    
-    If schema_obj contains "@graph", extracts each item from the @graph array as a separate schema.
-    Otherwise, returns the object as-is.
-    
-    Returns:
-        list: Flattened list of schema objects
+    Recursively flatten JSON-LD schema objects into a list of plain dicts.
+
+    Handles three cases:
+      - Top-level JSON array  → recurse into each element (Bug A fix)
+      - Dict with @graph      → recurse into @graph items
+      - Plain dict            → return as single-element list
+      - Anything else         → return [] (primitives are not valid schemas)
     """
+    if isinstance(schema_obj, list):
+        result = []
+        for item in schema_obj:
+            result.extend(flatten_schema(item))
+        return result
     if not isinstance(schema_obj, dict):
-        return [schema_obj] if schema_obj else []
-    
-    # If this schema contains @graph, flatten it
+        return []
     if "@graph" in schema_obj:
         graph_array = schema_obj.get("@graph", [])
         flattened = []
         if isinstance(graph_array, list):
             for item in graph_array:
-                # Recursively flatten each item in case of nested @graph
                 flattened.extend(flatten_schema(item))
         return flattened
-    
-    # No @graph, return as single-item list
     return [schema_obj]
 
 
@@ -47,18 +50,31 @@ def extract_structured_data(soup: BeautifulSoup, seo_data: dict):
     schema_types = []
     
     for script in soup.find_all("script", type="application/ld+json"):
+        # Bug B fix: .string is None when lxml sees multiple child nodes
+        # (e.g. CDATA wrappers, HTML comment wrappers). Log it so failures
+        # are visible in scraper output instead of silently disappearing.
+        if not script.string:
+            logger.warning(
+                "JSON-LD script skipped: BeautifulSoup .string is None — "
+                "possible CDATA or HTML-comment wrapping by lxml"
+            )
+            continue
+        # Bug C fix: split except so JSONDecodeError is logged with the
+        # offending snippet rather than silently discarded.
         try:
-            if script.string:
-                schema = json.loads(script.string)
-                # Flatten any @graph structures
-                flattened_schemas = flatten_schema(schema)
-                schemas.extend(flattened_schemas)
-                # Track schema types for validation
-                for flat_schema in flattened_schemas:
-                    if isinstance(flat_schema, dict):
-                        schema_types.append(flat_schema.get("@type", "Unknown"))
-        except (json.JSONDecodeError, Exception):
-            continue  # Skip invalid JSON
+            schema = json.loads(script.string)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "JSON-LD script skipped: json.loads failed — %s | snippet: %.120s",
+                exc,
+                script.string.strip(),
+            )
+            continue
+        # flatten_schema() now guarantees every item is a dict (Bug A fix).
+        flattened_schemas = flatten_schema(schema)
+        schemas.extend(flattened_schemas)
+        for flat_schema in flattened_schemas:
+            schema_types.append(flat_schema.get("@type", "Unknown"))
     
     # Validate structured data
     if schemas:
@@ -67,20 +83,11 @@ def extract_structured_data(soup: BeautifulSoup, seo_data: dict):
         localbusiness_schemas = []
         
         for schema in schemas:
-            if isinstance(schema, dict):
-                schema_type = schema.get("@type")
-                if schema_type == "Organization":
-                    organization_schemas.append(schema)
-                elif schema_type == "LocalBusiness":
-                    localbusiness_schemas.append(schema)
-            elif isinstance(schema, list):
-                for item in schema:
-                    if isinstance(item, dict):
-                        schema_type = item.get("@type")
-                        if schema_type == "Organization":
-                            organization_schemas.append(item)
-                        elif schema_type == "LocalBusiness":
-                            localbusiness_schemas.append(item)
+            schema_type = schema.get("@type")
+            if schema_type == "Organization":
+                organization_schemas.append(schema)
+            elif schema_type == "LocalBusiness":
+                localbusiness_schemas.append(schema)
         
         # Validate Organization schemas
         for org_schema in organization_schemas:
@@ -116,12 +123,8 @@ def extract_structured_data(soup: BeautifulSoup, seo_data: dict):
         # Check for FAQ schema
         faq_schemas = []
         for schema in schemas:
-            if isinstance(schema, dict) and schema.get("@type") == "FAQPage":
+            if schema.get("@type") == "FAQPage":
                 faq_schemas.append(schema)
-            elif isinstance(schema, list):
-                for item in schema:
-                    if isinstance(item, dict) and item.get("@type") == "FAQPage":
-                        faq_schemas.append(item)
         
         # Check if page needs FAQ schema (About page, services page, etc.)
         if not faq_schemas:
@@ -134,12 +137,8 @@ def extract_structured_data(soup: BeautifulSoup, seo_data: dict):
         # Check for BreadcrumbList schema
         breadcrumb_schemas = []
         for schema in schemas:
-            if isinstance(schema, dict) and schema.get("@type") == "BreadcrumbList":
+            if schema.get("@type") == "BreadcrumbList":
                 breadcrumb_schemas.append(schema)
-            elif isinstance(schema, list):
-                for item in schema:
-                    if isinstance(item, dict) and item.get("@type") == "BreadcrumbList":
-                        breadcrumb_schemas.append(item)
         
         # Check if page needs breadcrumbs
         if not breadcrumb_schemas:
@@ -150,16 +149,9 @@ def extract_structured_data(soup: BeautifulSoup, seo_data: dict):
         # Check for Review schema
         review_schemas = []
         for schema in schemas:
-            if isinstance(schema, dict):
-                schema_type = schema.get("@type")
-                if schema_type == "Review" or schema_type == "AggregateRating":
-                    review_schemas.append(schema)
-            elif isinstance(schema, list):
-                for item in schema:
-                    if isinstance(item, dict):
-                        schema_type = item.get("@type")
-                        if schema_type == "Review" or schema_type == "AggregateRating":
-                            review_schemas.append(item)
+            schema_type = schema.get("@type")
+            if schema_type in ("Review", "AggregateRating"):
+                review_schemas.append(schema)
         
         # Check if page has testimonials but no review schema
         if not review_schemas:

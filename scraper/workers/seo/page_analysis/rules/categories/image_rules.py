@@ -16,13 +16,13 @@ class BrokenImagesRule(BaseSEORuleV2):
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
         images = normalized.get("images", [])
-        
+
         for image in images:
             status = image.get("status")
             if status and status >= 400:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Broken image found: {image.get('src')} (status: {status})",
+                    "Broken Image",
                     f"Image {image.get('src')} returns {status}",
                     "200 OK status for all images",
                     data_key="images",
@@ -49,8 +49,8 @@ class ImageFileSizeRule(BaseSEORuleV2):
                 size_kb = size / 1024
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Large image file: {image.get('src')} ({size_kb:.1f}KB)",
-                    f"Image size: {size_kb:.1f}KB",
+                    "Large Image File",
+                    f"Image size: {size_kb:.1f}KB for {image.get('src')}",
                     "Image < 100KB (hero images < 200KB)",
                     data_key="images",
                     data_path=f"images.{image.get('src')}.size"
@@ -75,8 +75,8 @@ class ImagesMissingAltTextRule(BaseSEORuleV2):
             if alt is None or alt == "":
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Image missing alt text: {image.get('src')}",
-                    f"No alt attribute for {image.get('src')}",
+                    "Images Missing Alt Text",
+                    image.get("src") or "",
                     "Descriptive alt text for all content images",
                     data_key="images",
                     data_path=f"images.{image.get('src')}.alt"
@@ -107,8 +107,8 @@ class ImagesNotWebPFormatRule(BaseSEORuleV2):
             if is_jpeg_png and not is_webp_avif:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Image not in modern format: {image.get('src')}",
-                    f"Image format: {src.split('.')[-1] if '.' in src else 'unknown'}",
+                    "Images Not in Modern Format",
+                    f"Format: {src.split('.')[-1] if '.' in src else 'unknown'} for {image.get('src')}",
                     "WebP or AVIF format",
                     data_key="images",
                     data_path=f"images.{image.get('src')}.format"
@@ -135,8 +135,8 @@ class ImagesMissingDimensionsRule(BaseSEORuleV2):
             if not width or not height:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Image missing dimensions: {image.get('src')}",
-                    f"Width: {width}, Height: {height}",
+                    "Images Missing Dimensions",
+                    f"Width: {width}, Height: {height} for {image.get('src')}",
                     "Explicit width and height attributes",
                     data_key="images",
                     data_path=f"images.{image.get('src')}.dimensions"
@@ -166,8 +166,8 @@ class ImagesWithoutLazyLoadingRule(BaseSEORuleV2):
             if loading != "lazy":
                 issues.append(self.create_issue(
                     job_id, project_id, url,
-                    f"Below-fold image not lazy loaded: {image.get('src')}",
-                    f"Loading attribute: {loading}",
+                    "Below-fold Images Without Lazy Loading",
+                    f"Loading attribute: {loading} for {image.get('src')}",
                     "loading='lazy' for non-critical images",
                     data_key="images",
                     data_path=f"images.{image.get('src')}.loading"

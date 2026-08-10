@@ -14,6 +14,7 @@ import logging
 # Shared normalizer — MUST match the normalization used by the link-discovery worker,
 # otherwise url_metadata keys won't match lookups (RC-6).
 from .utils import normalize_url as shared_normalize_url
+from .url_filters import should_skip_seo_url
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -110,60 +111,7 @@ class RecursiveSitemapDiscovery:
             'failed_sitemaps': 0,
             'recursion_depth_used': 0
         }
-    
-    def is_strict_business_content_url(self, url: str) -> bool:
-        """
-        Strict URL-level filter for business content only.
-        Prevents custom post types, templates, builder artifacts from database.
-        
-        Architectural note: This is a second line of defense (URL-level).
-        Primary filter is at sitemap-file level in is_valid_business_sitemap().
-        This catches cases where custom post types are embedded in normal sitemaps.
-        """
-        url_lower = url.lower()
-        
-        # Blocked path segments (custom post types, builder artifacts, transactional pages)
-        blocked_segments = [
-            '/pxl-template/',            # Panda template engine
-            '/pxl-templates/',           # Plural variant
-            '/elementor_library/',       # Elementor templates
-            '/elementor-template/',      # Elementor user templates
-            '/fl-builder/',              # Beaver Builder
-            '/divi-template/',           # Divi theme
-            '/extra-template/',          # Extra theme
-            '/wp-admin/',                # Admin pages
-            '/wp-json/',                 # API endpoints
-            '/wp-includes/',             # System files
-            '/wp-content/plugins/',      # Plugin files
-            '/draft/',                   # Draft posts
-            '/revision/',                # Post revisions
-            '/trash/',                   # Trash items
-            '/wp-template/',             # Gutenberg templates
-            '/wp-templates/',            # Gutenberg templates plural
-            '/acf-template/',            # ACF Custom post type
-            '/template-part/',           # Template parts
-            '/wp-custom-css/',           # Custom CSS storage
-            '/sample-post/',             # Sample/placeholder posts
-            '/staging/',                 # Staging URLs
-            '/test/',                    # Test URLs
-            '/preview/',                 # Preview URLs
-            '/login/',                   # Login pages
-            '/register/',                # Registration pages
-            '/signup/',                  # Signup pages
-            '/checkout/',                # Checkout pages
-            '/cart/',                    # Shopping cart
-            '/account/',                 # Account pages
-            '/my-account/',              # WooCommerce account
-            '/user/',                    # User pages
-        ]
-        
-        for segment in blocked_segments:
-            if segment in url_lower:
-                logger.debug(f"[DISCOVERY] Filtered junk URL: {url} (blocked segment: {segment})")
-                return False
-        
-        return True
-    
+
     def is_valid_business_sitemap(self, sitemap_url: str) -> bool:
         """
         Validate that sitemap is business content, not theme/builder artifacts.
@@ -382,8 +330,8 @@ class RecursiveSitemapDiscovery:
             if self.is_valid_internal_url(url):
                 normalized_url = self.normalize_url(url)
 
-                # Apply strict content filtering (second line of defense)
-                if not self.is_strict_business_content_url(normalized_url):
+                # Centralized URL filter — shared with link_discovery and url_selector
+                if should_skip_seo_url(normalized_url):
                     filtered_count += 1
                     continue
 

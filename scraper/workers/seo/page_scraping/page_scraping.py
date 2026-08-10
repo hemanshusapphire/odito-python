@@ -4,6 +4,7 @@
 
 import os
 import re
+import copy
 import difflib
 import random
 from urllib.parse import urlparse, urljoin
@@ -12,9 +13,12 @@ import threading
 
 from datetime import datetime
 
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from bson.objectid import ObjectId
+from pymongo import ReplaceOne
+from pymongo.errors import BulkWriteError
 
 
 
@@ -33,15 +37,78 @@ from bs4 import BeautifulSoup
 
 from scraper.shared.orchestrator import scrape_page_data
 from scraper.shared.url_selector import get_top_urls
-from scraper.shared.fetcher import probe_rendering_need, set_audit_user_agent
+from scraper.shared.fetcher import (
+    probe_rendering_need, set_audit_user_agent,
+    is_js_rendering_domain, get_request_user_agent, get_pooled_session,
+)
 # from scraper.shared.screenshots import clear_screenshot_registry, take_page_screenshot  # DISABLED
 
 from scraper.shared.utils import normalize_url, get_registrable_domain
 from shared.context_enrichment import enrich_from_page_data
 
-from db import seo_internal_links, seo_page_data
+from db import seo_internal_links, seo_page_data, seo_page_failures, jobs
 from config.config import USER_AGENTS
 
+
+# ---------------------------------------------------------------------------
+# Shared, process-wide executor used solely to bound scrape_page_data(url) to
+# a wall-clock deadline (see scrape_single_url below). Python cannot
+# cooperatively interrupt a synchronous call, so a background thread is the
+# only portable way to enforce a timeout on it — this pool reuses threads
+# across every URL/job instead of spawning a brand-new threading.Thread per
+# URL (the previous approach). Sized above the outer 8-worker page pool so
+# every outer worker can always have one fetch in flight without queueing.
+_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="page-fetch")
+
+
+def upsert_page_data_results(results, job_id, collection=None):
+    """Persist scraped page documents via upsert (P0-002).
+
+    Replaces the previous insert_many write: insert_many, paired with
+    duplicate-key-tolerant error handling, silently SKIPPED any document
+    whose (projectId, url) already existed — so a re-scrape of an
+    already-present URL kept the stale old document forever. ReplaceOne
+    keyed on the unique (projectId, url) index (see db.py) inserts when no
+    document exists and fully replaces the existing document otherwise, so
+    the freshest scrape always wins. ordered=False is preserved: every
+    non-conflicting write in the batch is attempted regardless of
+    individual failures.
+
+    A duplicate-key error (code 11000) is still possible on an upsert:
+    two concurrent upserts for the SAME missing (projectId, url) can race
+    — both observe no document, both attempt the insert leg, one loses.
+    Unlike the old insert path the correct response is not to skip (that
+    would keep stale data, the exact bug this change removes) but to retry
+    the losing writes once: on retry the document exists, so ReplaceOne
+    matches and replaces it. Any write error that is NOT a duplicate key
+    is a real problem and is re-raised unchanged, preserving the existing
+    failure/retry behavior for every other error class.
+
+    collection is injectable for tests only; production call sites omit it.
+    """
+    if collection is None:
+        collection = seo_page_data
+
+    def _ops(docs):
+        return [
+            ReplaceOne(
+                {"projectId": doc["projectId"], "url": doc["url"]},
+                doc,
+                upsert=True
+            )
+            for doc in docs
+        ]
+
+    try:
+        collection.bulk_write(_ops(results), ordered=False)
+    except BulkWriteError as bwe:
+        write_errors = bwe.details.get("writeErrors", [])
+        non_duplicate_errors = [we for we in write_errors if we.get("code") != 11000]
+        if non_duplicate_errors:
+            raise
+        retry_docs = [results[we["index"]] for we in write_errors]
+        collection.bulk_write(_ops(retry_docs), ordered=False)
+        print(f"[WORKER] Retried {len(retry_docs)} seo_page_data upsert(s) after a concurrent duplicate-key race | jobId={job_id}")
 
 
 class PageScrapingJob(BaseModel):
@@ -171,14 +238,22 @@ def detect_cloaking(raw_html: str, rendered_html: str) -> dict:
 def _fetch_raw_html_only(url: str, timeout: int = 8) -> str:
     """
     Lightweight raw HTTP GET — no Selenium, no JS detection.
-    Used to capture raw server HTML for cloaking comparison.
+    Used to capture raw server HTML for cloaking comparison, only for
+    domains that required JS rendering (see cloaking-detection call site) —
+    i.e. only when page_data["raw_html"] is NOT already server HTML.
+
+    Routed through the shared, connection-pooled session and the
+    audit-stable User-Agent (same infrastructure fetch_html() itself uses)
+    instead of a bare `requests.get()` with a random UA, so this request
+    reuses an existing connection where possible and doesn't introduce
+    UA-driven content variance unrelated to real cloaking.
     """
     try:
         headers = {
-            "User-Agent": random.choice(USER_AGENTS),
+            "User-Agent": get_request_user_agent(),
             "Accept": "text/html"
         }
-        res = requests.get(url, headers=headers, timeout=timeout)
+        res = get_pooled_session().get(url, headers=headers, timeout=timeout)
         res.raise_for_status()
         return res.text
     except Exception:
@@ -188,13 +263,26 @@ def _fetch_raw_html_only(url: str, timeout: int = 8) -> str:
 # ---------------------------------------------------------------------------
 # Feature 2 — Media Detection (Rules 237, 238)
 # ---------------------------------------------------------------------------
-def detect_media_elements(html: str) -> dict:
+def detect_media_elements(soup: "BeautifulSoup | None") -> dict:
     """
     Parse DOM to detect video/audio elements and accessibility compliance.
     Returns structured media analysis object.
+
+    Args:
+        soup: Pre-parsed BeautifulSoup of the page's raw HTML. This function
+              is read-only (only .find/.find_all/.get calls — never mutates
+              the tree), so callers may safely pass a soup instance that is
+              shared with/reused by other read-only extractors.
     """
     try:
-        soup = BeautifulSoup(html, "lxml")
+        if soup is None:
+            return {
+                "has_video": False,
+                "has_audio": False,
+                "has_captions": False,
+                "has_transcript": False,
+                "error": "no_soup_provided"
+            }
 
         has_video = bool(soup.find("video"))
         has_audio = bool(soup.find("audio"))
@@ -230,17 +318,24 @@ def detect_media_elements(html: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def check_link_status_batch(links: list, base_url: str, timeout: int = 3, max_links: int = 20) -> dict:
-    """Check HTTP status for links in parallel. Returns only broken_links_count."""
+    """Check HTTP status for links in parallel. Returns broken_links_count and broken_links list."""
     if not links:
-        return {"broken_links_count": 0}
+        return {"broken_links_count": 0, "broken_links": []}
+
+    def _extract_url(link):
+        if isinstance(link, dict):
+            return link.get('url') or link.get('href') or link.get('src')
+        return str(link) if link else None
 
     try:
-        broken_count = 0
+        broken_links = []
 
-        def check_single_link(url):
+        def check_single_link(link_url):
+            if not link_url or not str(link_url).startswith('http'):
+                return None
             try:
                 response = requests.head(
-                    url,
+                    link_url,
                     timeout=(1, timeout),
                     allow_redirects=True,
                     headers={'User-Agent': random.choice(USER_AGENTS)}
@@ -251,25 +346,35 @@ def check_link_status_batch(links: list, base_url: str, timeout: int = 3, max_li
 
         limited_links = links[:max_links]
         with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(check_single_link, url): url for url in limited_links}
+            futures = {executor.submit(check_single_link, _extract_url(link)): link for link in limited_links}
             for future in as_completed(futures):
+                original_link = futures[future]
                 status_code = future.result()
                 if status_code is not None and status_code >= 400:
-                    broken_count += 1
+                    link_url = _extract_url(original_link) or str(original_link)
+                    broken_links.append({"url": link_url, "status_code": status_code})
 
-        return {"broken_links_count": broken_count}
+        return {"broken_links_count": len(broken_links), "broken_links": broken_links}
 
     except Exception as e:
-        return {"broken_links_count": 0, "error": str(e)}
+        return {"broken_links_count": 0, "broken_links": [], "error": str(e)}
 
 
-def calculate_html_metrics(html: str) -> dict:
+def calculate_html_metrics(html: str, soup: "BeautifulSoup | None" = None) -> dict:
     """
     Calculate code-to-HTML ratio and size metrics.
-    
+
     Args:
-        html: Raw HTML string
-        
+        html: Raw HTML string. Always used (as-is) for html_size_bytes so the
+              byte count reflects the true original document, never a
+              re-serialized soup.
+        soup: Optional pre-parsed BeautifulSoup of the same `html`. When
+              provided, a deep copy is used for the (mutating, decompose-based)
+              text-extraction pass instead of re-parsing `html` from scratch —
+              same decompose/get_text logic, just skipping a redundant lxml
+              parse. Falls back to parsing `html` internally when omitted, so
+              existing callers that only pass `html` are unaffected.
+
     Returns:
         dict with html_size_bytes, visible_text_bytes, code_to_html_ratio
     """
@@ -281,13 +386,14 @@ def calculate_html_metrics(html: str) -> dict:
                 "code_to_html_ratio": 0,
                 "error": "no_html_provided"
             }
-        
+
         # Total HTML size
         html_size = len(html.encode('utf-8'))
-        
-        # Create copy for visible text extraction
-        text_soup = BeautifulSoup(html, "lxml")
-        
+
+        # Create copy for visible text extraction — deep-copy the shared soup
+        # (if given) rather than re-parsing, since this pass mutates via decompose()
+        text_soup = copy.deepcopy(soup) if soup is not None else BeautifulSoup(html, "lxml")
+
         # Remove non-visible elements
         for element in text_soup(["script", "style", "noscript", "meta", "link"]):
             element.decompose()
@@ -743,7 +849,18 @@ def execute_page_scraping_logic(job: PageScrapingJob):
         print(f"[DEBUG] URLs: {urls_to_scrape[:5]}...")  # Show first 5 for debugging
         print(f"[WORKER] PAGE_SCRAPING started | jobId={job.jobId} | selectedUrls={total_pages}")
 
-        
+        # URL-level retry (chainingEngine._maybeCreatePageScrapingRetryChunks
+        # built canonical_urls for this job from seo_page_failures, not
+        # URL_SELECTION). Progress-only — reuses the existing progress-update
+        # channel, no new architecture; ProcessingScreen keeps showing the
+        # same "Scraping" stage since this is still a PAGE_SCRAPING job.
+        if getattr(job, 'retry_round', 0) > 0:
+            send_progress_update(
+                job.jobId, 0, "Scraping",
+                f"Retrying failed pages ({total_pages} remaining)", None
+            )
+
+
 
         # Clear screenshot registry at the start of each job - DISABLED
         # clear_screenshot_registry()
@@ -767,11 +884,67 @@ def execute_page_scraping_logic(job: PageScrapingJob):
         completed_pages = 0
         _counter_lock = __import__('threading').Lock()
 
-        TARGET_SUCCESSES = 25  # Stop collecting results once this many succeed
+        # Persistent failure tracking (observability only — never read by any
+        # pipeline decision). One dict appended per failed URL, inserted into
+        # seo_page_failures after the executor block below. run_id/group_id/
+        # attempts come from the Node-owned jobs collection (this Python job
+        # model has no such fields of its own) — a single read-only lookup,
+        # not a behavior change.
+        #
+        # Two independent retry dimensions feed into the "attempt" number:
+        #   1. Whole-job crash-retry: jobService.claimJob (GET /api/jobs/claim,
+        #      used by poll_for_jobs) matches status in ['pending','retrying']
+        #      and $inc's `attempts` on every claim, so a chunk that fails
+        #      catastrophically (the outer except Exception at the bottom of
+        #      this function, which posts to /api/jobs/{jobId}/fail) can be
+        #      reclaimed and this entire function re-run for the same
+        #      job_id/URLs.
+        #   2. URL-level retry: chainingEngine._maybeCreatePageScrapingRetryChunks
+        #      creates a brand-new Job (its own attempts counter starts over)
+        #      whose canonical_urls are sourced from seo_page_failures instead
+        #      of URL_SELECTION — job.retry_round (1-indexed) says which round.
+        # attempt = retry_round + (this job's own claim count) combines both:
+        # a normal first-ever execution of an initial chunk is retry_round=0,
+        # attempts=1 (from the Node claim) -> attempt=1, identical to the
+        # pre-retry-system behavior. Never fabricated — both inputs are real
+        # counters read from Mongo/the job model, never hardcoded.
+        failure_records = []
+        try:
+            _job_doc = jobs.find_one({"_id": ObjectId(job.jobId)}, {"run_id": 1, "group_id": 1, "attempts": 1})
+        except Exception:
+            _job_doc = None
+        _run_id = _job_doc.get("run_id") if _job_doc else None
+        _group_id = _job_doc.get("group_id") if _job_doc else None
+        _retry_round = getattr(job, 'retry_round', 0) or 0
+        _attempt_number = _retry_round + (_job_doc.get("attempts") or 1 if _job_doc else 1)
+
+        def _record_failure(url, failure_type, error_message, http_status_code, started_at):
+            now = datetime.utcnow()
+            failure_records.append({
+                "project_id": ObjectId(job.projectId),
+                "run_id": _run_id,
+                "job_id": ObjectId(job.jobId),
+                "group_id": _group_id,
+                "url": url,
+                "canonical_url": normalize_url(url),
+                "failure_type": failure_type,
+                "error_message": (error_message or "")[:500],
+                "http_status_code": http_status_code,
+                "attempt": _attempt_number,
+                "worker": threading.current_thread().name,
+                "duration_ms": int((now - started_at).total_seconds() * 1000) if started_at else None,
+                "started_at": started_at,
+                "failed_at": now,
+                "timestamp": now,
+                "resolved": False,
+                "resolved_at": None,
+                "resolved_by_attempt": None,
+            })
 
         def scrape_single_url(url):
             """Scrape a single URL - optimized for concurrent processing"""
             nonlocal successful_pages, failed_pages, completed_pages
+            _url_started_at = datetime.utcnow()
 
             
 
@@ -785,40 +958,42 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
             try:
                 print(f"[SCRAPE] Starting URL: {url}")
-                
-                # Scrape page data using comprehensive extraction with timeout
-                # Use threading.Timer for cross-platform timeout (Windows-compatible)
-                import threading
-                
-                result_container = {'page_data': None, 'exception': None}
-                
-                def scrape_with_timeout():
-                    try:
-                        result_container['page_data'] = scrape_page_data(url)
-                    except Exception as e:
-                        result_container['exception'] = e
-                
-                # Start scraping in a thread
-                thread = threading.Thread(target=scrape_with_timeout)
-                thread.start()
-                thread.join(timeout=120)  # 120-second timeout
-                
-                if thread.is_alive():
+
+                # Bound scrape_page_data() to a 120-second wall-clock budget.
+                #
+                # scrape_page_data() has no internal hard cap of its own (its
+                # HTTP retries + possible Playwright escalation can, in
+                # pathological cases, run long), and Python cannot
+                # cooperatively interrupt a synchronous call from the outside —
+                # the only portable way to enforce a deadline is to run it on
+                # another thread and stop waiting once the deadline passes.
+                #
+                # This now reuses the shared, pooled _FETCH_EXECUTOR instead of
+                # spawning a brand-new threading.Thread per URL. Duration and
+                # outcome are unchanged: on timeout this still returns None
+                # (no document is stored, counters increment once) exactly as
+                # before, and if the abandoned fetch eventually finishes in the
+                # background, its result is simply never read — identical to
+                # the previous abandoned-thread behavior, and consistent with
+                # how already-cancelled futures are handled further below.
+                _failure_info = {}
+                fetch_future = _FETCH_EXECUTOR.submit(scrape_page_data, url, _failure_info)
+                try:
+                    page_data = fetch_future.result(timeout=120)
+                except concurrent.futures.TimeoutError:
                     print(f"[SCRAPE] TIMEOUT for URL: {url} | timeout=120s")
                     with _counter_lock:
                         failed_pages += 1
                         completed_pages += 1
+                        _record_failure(url, "TIMEOUT", "Timeout after 120s (wall-clock budget)", None, _url_started_at)
                     return None
-
-                # Check for exceptions
-                if result_container['exception']:
-                    print(f"[SCRAPE] EXCEPTION for URL: {url} | error={str(result_container['exception'])}")
+                except Exception as e:
+                    print(f"[SCRAPE] EXCEPTION for URL: {url} | error={str(e)}")
                     with _counter_lock:
                         failed_pages += 1
                         completed_pages += 1
+                        _record_failure(url, "UNEXPECTED_EXCEPTION", str(e), None, _url_started_at)
                     return None
-
-                page_data = result_container['page_data']
 
                 # Check if scraping succeeded
                 if not page_data:
@@ -826,6 +1001,13 @@ def execute_page_scraping_logic(job: PageScrapingJob):
                     with _counter_lock:
                         failed_pages += 1
                         completed_pages += 1
+                        _record_failure(
+                            url,
+                            _failure_info.get("failure_type", "UNEXPECTED_EXCEPTION"),
+                            _failure_info.get("error_message", "scrape_page_data returned None"),
+                            _failure_info.get("http_status_code"),
+                            _url_started_at,
+                        )
                     return None
 
                 # Check status code — non-200 is a content failure for PAGE_SCRAPING
@@ -835,12 +1017,20 @@ def execute_page_scraping_logic(job: PageScrapingJob):
                     with _counter_lock:
                         failed_pages += 1
                         completed_pages += 1
+                        _record_failure(url, "NON_200_STATUS", f"HTTP {status_code}", status_code, _url_started_at)
                     return None
 
                 # Check extraction status
                 if page_data.get("extraction_status") != "SUCCESS":
                     print(f"[SCRAPE] FAILED for URL: {url} | extraction_status={page_data.get('extraction_status')} | reason=extraction failed")
                     with _counter_lock:
+                        _record_failure(
+                            url,
+                            "EXTRACTION_FAILED",
+                            f"extraction_status={page_data.get('extraction_status')}",
+                            status_code,
+                            _url_started_at,
+                        )
                         failed_pages += 1
                         completed_pages += 1
                     return None
@@ -901,12 +1091,22 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
                         )
 
+                    # --- Shared, read-only BeautifulSoup parse for this page ---
+                    # Built ONCE and reused (not re-parsed) by every read-only
+                    # consumer below: extract_internal_links, detect_media_elements,
+                    # detect_mixed_content, detect_navigation_enhanced,
+                    # analyze_404_page. Each of these only calls .find/.find_all/
+                    # .get/.get_text — none mutate the tree — so sharing one
+                    # instance across all of them is safe. calculate_html_metrics
+                    # DOES mutate (decompose) internally, so it always receives a
+                    # deep copy, never this shared instance directly.
+                    raw_html_for_page = page_data.get("raw_html", "")
+                    page_soup = BeautifulSoup(raw_html_for_page, "lxml") if raw_html_for_page else None
+
                     # --- Internal Link Extraction for CRAWL_GRAPH ---
                     try:
-                        raw_html_for_links = page_data.get("raw_html", "")
-                        if raw_html_for_links:
-                            link_soup = BeautifulSoup(raw_html_for_links, "lxml")
-                            page_data["internal_links"] = extract_internal_links(link_soup, url)
+                        if page_soup is not None:
+                            page_data["internal_links"] = extract_internal_links(page_soup, url)
                         else:
                             page_data["internal_links"] = []
                     except Exception as link_err:
@@ -915,23 +1115,41 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
                     # --- Feature 1: Cloaking Detection ---
                     try:
-                        # page_data["raw_html"] is the "best" HTML from fetch_html()
-                        # (possibly Selenium-rendered). Get raw server HTML separately.
-                        raw_server_html = _fetch_raw_html_only(url)
                         rendered_html = page_data.get("raw_html", "")
-                        if raw_server_html and rendered_html:
-                            page_data["cloaking_analysis"] = detect_cloaking(raw_server_html, rendered_html)
+                        if is_js_rendering_domain(url):
+                            # This domain required JS rendering, so
+                            # page_data["raw_html"] is the rendered (not server)
+                            # HTML — a real, independent server-HTML fetch is
+                            # needed for a meaningful comparison. Reuses the
+                            # pooled session + stable UA (see
+                            # _fetch_raw_html_only) instead of a bare request.
+                            raw_server_html = _fetch_raw_html_only(url)
+                            if raw_server_html and rendered_html:
+                                page_data["cloaking_analysis"] = detect_cloaking(raw_server_html, rendered_html)
+                            else:
+                                page_data["cloaking_analysis"] = {"cloaking_checked": False, "note": "html_unavailable"}
                         else:
-                            page_data["cloaking_analysis"] = {"cloaking_checked": False, "note": "html_unavailable"}
+                            # Static-fetch path: page_data["raw_html"] IS the raw
+                            # server HTML already (fetch_html() never rendered
+                            # this page), so there is no distinct rendered
+                            # variant to compare it against — a second live
+                            # fetch here would only compare the page's static
+                            # HTML against itself. Documented, explicit result
+                            # instead of a redundant duplicate network request.
+                            page_data["cloaking_analysis"] = {
+                                "cloaking_checked": True,
+                                "cloaking_similarity_score": 1.0,
+                                "cloaking_flagged": False,
+                                "note": "static_fetch_no_distinct_rendered_variant"
+                            }
                     except Exception as cloak_err:
                         print(f"[WARNING] Cloaking detection failed for {url}: {cloak_err}")
                         page_data["cloaking_analysis"] = {"cloaking_checked": False, "error": str(cloak_err)}
 
                     # --- Feature 2: Media Detection ---
                     try:
-                        html_for_media = page_data.get("raw_html", "")
-                        if html_for_media:
-                            page_data["media_analysis"] = detect_media_elements(html_for_media)
+                        if page_soup is not None:
+                            page_data["media_analysis"] = detect_media_elements(page_soup)
                     except Exception as media_err:
                         print(f"[WARNING] Media detection failed for {url}: {media_err}")
 
@@ -942,19 +1160,22 @@ def execute_page_scraping_logic(job: PageScrapingJob):
                         internal_links = page_data.get("internal_links", [])
                         http_status = page_data.get("http_status_code", 200)
 
-                        # Create BeautifulSoup object ONCE for all DOM analysis
-                        seo_soup = BeautifulSoup(raw_html, "lxml") if raw_html else None
-                        
+                        # Reuse the shared page_soup built above instead of
+                        # re-parsing raw_html again for this block.
+                        seo_soup = page_soup
+
                         # A. Link Status Analysis
                         if internal_links:
                             link_analysis = check_link_status_batch(internal_links, url)
                             page_data.update(link_analysis)
-                        
-                        # B. HTML Metrics
+
+                        # B. HTML Metrics — calculate_html_metrics mutates
+                        # (decompose) internally, so it gets a deep copy of the
+                        # shared soup, never the shared instance itself.
                         if raw_html:
-                            html_metrics = calculate_html_metrics(raw_html)
+                            html_metrics = calculate_html_metrics(raw_html, soup=seo_soup)
                             page_data.update(html_metrics)
-                        
+
                         # C. URL Structure Analysis
                         url_structure = analyze_url_structure(url, internal_links)
                         page_data.update(url_structure)
@@ -1037,6 +1258,7 @@ def execute_page_scraping_logic(job: PageScrapingJob):
                     failed_pages += 1
                     completed_pages += 1
                     _snap = completed_pages
+                    _record_failure(url, "TIMEOUT", f"Timeout after 60 seconds: {str(te)}", None, _url_started_at)
 
                 print(f"[TIMEOUT] URL scraping timed out after 60s: {url}")
 
@@ -1086,6 +1308,7 @@ def execute_page_scraping_logic(job: PageScrapingJob):
                     failed_pages += 1
                     completed_pages += 1
                     _snap = completed_pages
+                    _record_failure(url, "UNEXPECTED_EXCEPTION", str(e), None, _url_started_at)
 
                 percentage = int((_snap / total_pages) * 100) if total_pages > 0 else 100
 
@@ -1103,7 +1326,7 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
                 )
 
-                
+
 
                 return {
 
@@ -1125,7 +1348,7 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
                     "internal_links": []
 
-                }       
+                }
 
         
 
@@ -1152,11 +1375,22 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
         with ThreadPoolExecutor(max_workers=8) as executor:
 
-            # Submit ALL canonical URLs — success-targeting means we keep collecting
-            # until TARGET_SUCCESSES succeed or the full pool is exhausted.
+            # Submit every URL assigned to this chunk. Each PAGE_SCRAPING job
+            # already represents a bounded, user-approved chunk (JobGroup
+            # architecture) — there is no longer a "large candidate pool" to
+            # sample from, so every submitted URL must be attempted and its
+            # outcome (success or failure) recorded. No early exit: removing
+            # the previous success-count cutoff here is what makes chunk
+            # statistics (totalUrls/successful/failed) and the number of
+            # documents actually inserted into seo_page_data agree.
             futures = [executor.submit(scrape_single_url, url) for url in urls_to_scrape]
 
-            # Collect results as they complete
+            # Collect every result as it completes — no early break, no
+            # future.cancel(). A partial cancel here previously let already-
+            # running threads keep incrementing the success/failure counters
+            # after the loop had already moved on without collecting their
+            # results, which is exactly what caused stats to overstate what
+            # was actually stored.
             for future in as_completed(futures):
 
                 if is_job_cancelled(job.jobId):
@@ -1172,14 +1406,8 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
                 if result:
                     all_results.append(result)
-                    # Stop collecting once we have enough successful pages.
-                    # In-flight threads still run to completion but their results are discarded.
-                    if len(all_results) >= TARGET_SUCCESSES:
-                        for f in futures:
-                            f.cancel()
-                        break
 
-        
+
 
         # Final cancellation check before storing results
 
@@ -1195,9 +1423,106 @@ def execute_page_scraping_logic(job: PageScrapingJob):
 
         if all_results:
 
-            seo_page_data.insert_many(all_results, ordered=False)
+            # Upsert keyed on the unique (projectId, url) index — see
+            # upsert_page_data_results for the full rationale (P0-002:
+            # replaces the previous insert_many, whose duplicate-key
+            # skipping kept stale page data on re-scrape).
+            upsert_page_data_results(all_results, job.jobId)
 
-        
+
+
+        # Persist every failed URL for forensic observability. Best-effort:
+        # a failure here must never affect the job's own success/failure or
+        # any of the counters/stats already computed above — this collection
+        # is read by nobody in the pipeline, only by diagnostics/reporting.
+        #
+        # retry_round > 0 means every URL in this job's canonical_urls came
+        # FROM seo_page_failures (built by
+        # chainingEngine._maybeCreatePageScrapingRetryChunks) — each one
+        # already has exactly one unresolved document. Re-failing here must
+        # UPDATE that same document (bump attempt/error/duration/failed_at)
+        # rather than insert a second one, per "maintain one failure history
+        # per URL, never duplicate". $set only ever touches the mutable
+        # per-attempt fields; resolved/resolved_at/resolved_by_attempt and
+        # the original discovery metadata are never touched here, so history
+        # is preserved exactly as it happened. upsert=True is a defensive
+        # fallback only — the candidate list was built from this exact
+        # collection moments earlier, so a matching document should always
+        # exist; retry_round=0 (every initial, non-retry chunk) is
+        # completely unchanged from before this feature existed.
+        if failure_records:
+            if _retry_round > 0:
+                try:
+                    from pymongo import UpdateOne
+                    update_ops = [
+                        UpdateOne(
+                            {"project_id": rec["project_id"], "run_id": rec["run_id"], "url": rec["url"]},
+                            {
+                                "$set": {
+                                    "failure_type": rec["failure_type"],
+                                    "error_message": rec["error_message"],
+                                    "http_status_code": rec["http_status_code"],
+                                    "attempt": rec["attempt"],
+                                    "worker": rec["worker"],
+                                    "duration_ms": rec["duration_ms"],
+                                    "started_at": rec["started_at"],
+                                    "failed_at": rec["failed_at"],
+                                    "timestamp": rec["timestamp"],
+                                    "job_id": rec["job_id"],
+                                    "group_id": rec["group_id"],
+                                },
+                                "$setOnInsert": {
+                                    "canonical_url": rec["canonical_url"],
+                                    "resolved": False,
+                                    "resolved_at": None,
+                                    "resolved_by_attempt": None,
+                                },
+                            },
+                            upsert=True,
+                        )
+                        for rec in failure_records
+                    ]
+                    update_result = seo_page_failures.bulk_write(update_ops, ordered=False)
+                    print(f"[WORKER] Updated {update_result.modified_count} + upserted {len(update_result.upserted_ids or {})} seo_page_failures (retry round {_retry_round}, still failing) | jobId={job.jobId}")
+                except Exception as failure_write_error:
+                    print(f"[ERROR] Failed to update seo_page_failures (retry round {_retry_round}) | jobId={job.jobId} | reason=\"{failure_write_error}\"")
+            else:
+                try:
+                    seo_page_failures.insert_many(failure_records, ordered=False)
+                    print(f"[WORKER] Persisted {len(failure_records)} failure records | jobId={job.jobId}")
+                except Exception as failure_write_error:
+                    print(f"[ERROR] Failed to persist seo_page_failures | jobId={job.jobId} | reason=\"{failure_write_error}\"")
+
+        # Resolve any earlier-attempt failure history for URLs that succeeded
+        # THIS attempt — covers BOTH retry dimensions (whole-job crash-retry
+        # AND URL-level retry_round) since _attempt_number already combines
+        # both; _attempt_number > 1 is true whenever either kind of retry
+        # produced this execution. A URL cannot appear in both all_results
+        # and failure_records within the same attempt, since scrape_single_url
+        # runs exactly once per URL per execution. Never overwrites
+        # failure_type/error_message/attempt — only adds resolved metadata
+        # alongside the original record, so failure history is preserved
+        # exactly as it happened, not silently erased.
+        if all_results and _attempt_number > 1:
+            try:
+                succeeded_urls_this_attempt = [r["url"] for r in all_results if isinstance(r, dict) and r.get("url")]
+                if succeeded_urls_this_attempt:
+                    now = datetime.utcnow()
+                    resolve_result = seo_page_failures.update_many(
+                        {
+                            "project_id": ObjectId(job.projectId),
+                            "run_id": _run_id,
+                            "url": {"$in": succeeded_urls_this_attempt},
+                            "resolved": False,
+                        },
+                        {"$set": {"resolved": True, "resolved_at": now, "resolved_by_attempt": _attempt_number}},
+                    )
+                    if resolve_result.modified_count:
+                        print(f"[WORKER] Resolved {resolve_result.modified_count} prior failure records | jobId={job.jobId} | attempt={_attempt_number}")
+            except Exception as resolve_error:
+                print(f"[ERROR] Failed to resolve prior seo_page_failures | jobId={job.jobId} | reason=\"{resolve_error}\"")
+
+
 
         # Update seo_internal_links with crawl status and HTTP metrics after PAGE_SCRAPING completion
 
@@ -1253,15 +1578,18 @@ def execute_page_scraping_logic(job: PageScrapingJob):
         attempted_urls = _final_completed
         _success_rate = round((_final_successful / attempted_urls) * 100, 2) if attempted_urls > 0 else 0
 
-        # Prepare completion stats (backward-compatible keys + new metrics)
+        # Prepare completion stats (backward-compatible keys + new metrics).
+        # No targetReached/poolExhausted anymore — those described the old
+        # single-job "sample until you have enough good pages" model. In the
+        # JobGroup chunk architecture every URL in the chunk is always
+        # attempted, so attemptedUrls == totalUrls always, and
+        # successfulPages/failedPages are the only outcome that matters.
         stats = {
             "totalUrls": total_pages,
             "attemptedUrls": attempted_urls,
             "successfulPages": _final_successful,
             "failedPages": _final_failed,
             "successRate": _success_rate,
-            "targetReached": _final_successful >= TARGET_SUCCESSES,
-            "poolExhausted": attempted_urls >= total_pages and _final_successful < TARGET_SUCCESSES,
         }
 
         result_data = {
@@ -1271,14 +1599,12 @@ def execute_page_scraping_logic(job: PageScrapingJob):
             "successfulPages": _final_successful,
             "failedUrls": _final_failed,
             "successRate": _success_rate,
-            "targetReached": _final_successful >= TARGET_SUCCESSES,
-            "poolExhausted": attempted_urls >= total_pages and _final_successful < TARGET_SUCCESSES,
             "duration_ms": duration_ms,
         }
 
         
 
-        print(f"[WORKER] PAGE_SCRAPING completed | jobId={job.jobId} | success={_final_successful} | failed={_final_failed} | targetReached={stats['targetReached']}")
+        print(f"[WORKER] PAGE_SCRAPING completed | jobId={job.jobId} | attempted={attempted_urls}/{total_pages} | success={_final_successful} | failed={_final_failed}")
 
         
 

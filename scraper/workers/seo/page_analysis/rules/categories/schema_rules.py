@@ -3,6 +3,7 @@ Schema / Structured Data SEO Rules
 Rules for JSON-LD schema markup validation and optimization.
 """
 
+import re
 from ..base_seo_rule import BaseSEORuleV2
 import sys
 import os
@@ -10,7 +11,150 @@ from urllib.parse import urlparse
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from .eeat_rules import ContextValidator
 from shared.page_type_detector import page_type_detector
+from shared.schema_applicability import (
+    SCHEMA_APPLICABILITY,
+    SCHEMA_FAMILIES,
+    CONFLICTING_FAMILIES,
+    UNIVERSAL_SCHEMAS,
+)
 
+# Display names for page types (mirrors page_type_detector._DISPLAY_NAMES)
+_PAGE_TYPE_DISPLAY = {
+    "homepage": "Homepage", "article": "Article", "service": "Service",
+    "product": "Product", "collection": "Collection", "faq": "FAQ",
+    "about": "About", "contact": "Contact", "pricing": "Pricing",
+    "legal": "Legal", "listing": "Listing", "blog": "Blog",
+    "location": "Location", "generic": "Generic",
+}
+
+
+# ── Schema applicability matrix ───────────────────────────────────────────────
+#
+# Mirrors the pattern in ai_v2/rules/page_type_matrix.py.
+# Canonical page types come from page_type_detector.py (always lowercase):
+#   homepage  article  service  product  collection  faq
+#   about     contact  pricing  legal    listing     blog  generic
+
+# Pages that must carry an Organization or LocalBusiness entity schema.
+# All other page types either don't need it or satisfy the requirement by
+# referencing the homepage entity via @id.
+_ORG_APPLICABLE: frozenset[str] = frozenset({
+    "homepage", "about", "contact", "location", "generic",
+})
+
+# Contact and location pages must specifically have LocalBusiness (not just Organization).
+_LOCALBUSINESS_REQUIRED: frozenset[str] = frozenset({
+    "contact", "location",
+})
+
+# Pages where Article/BlogPosting absence is an error.
+_ARTICLE_APPLICABLE: frozenset[str] = frozenset({
+    "article", "blog",
+})
+
+# Pages where BreadcrumbList validation is skipped entirely.
+# Breadcrumbs are not a meaningful signal on root-level or transactional pages.
+_BREADCRUMB_SKIP: frozenset[str] = frozenset({
+    "homepage", "contact", "pricing", "legal",
+})
+
+# Pages where AggregateRating validation is applicable.
+_AGGREGATE_RATING_APPLICABLE: frozenset[str] = frozenset({
+    "homepage", "about", "service", "product", "location", "generic",
+})
+
+# Numeric rating pattern: must be something like "4.5/5", "98/100", "5 stars",
+# "★★★★★", etc. — not just the word "reviews" or "rating" in prose.
+_NUMERIC_RATING_RE = re.compile(
+    r'\b[1-5](?:\.\d)?\s*/\s*5\b'           # 4.5/5, 5/5
+    r'|\b[1-9]\d?\s*/\s*100\b'               # 98/100
+    r'|\b[1-5]\s*(?:stars?|out\s+of\s+5)\b'  # "5 stars", "4 out of 5"
+    r'|★{2,}|⭐{2,}'                         # ★★★★ or ⭐⭐⭐⭐
+    r'|\b(?:4|5|4\.[0-9]|5\.0)\s*(?:stars?|rating)\b',  # "4.5 stars", "5 rating"
+    re.IGNORECASE,
+)
+
+
+# ── Module-level helpers ──────────────────────────────────────────────────────
+
+def _get_page_type(normalized: dict) -> str:
+    """
+    Return the canonical lowercase page type for this page.
+
+    URL pattern detection takes priority over the stored `page_type` field because
+    stored values may be stale — the old classifier used schema @type as the
+    highest-confidence signal (90), causing pages with Article schema (e.g. a
+    WordPress plugin on every page) to be misclassified as "article" even when the
+    URL clearly indicated a different type (about, contact, blog index, etc.).
+
+    Reading order:
+    1. URL-pattern detection — immune to stale schema-first classification data.
+       If the URL matches a pattern with confidence ≥ 65, use it.
+    2. Stored `page_type` flat field — used when URL gives no pattern match
+       (e.g. custom slugs like /about-naxonify that need content signals too).
+    3. Full multi-signal detection via page_type_detector.detect_structured().
+    """
+    url = normalized.get("url", "")
+
+    # 1. URL-based detection (most reliable; immune to stale data)
+    if url:
+        url_result = page_type_detector._from_url(url)
+        if url_result:
+            ptype, conf = url_result
+            if ptype != "generic" and conf >= 65:
+                return ptype
+
+    # 2. Stored page_type (may be stale from old schema-first classifier)
+    raw = normalized.get("page_type", "")
+    if raw and raw.strip().lower() not in ("", "generic", "general"):
+        return raw.strip().lower()
+
+    # 3. Full multi-signal detection as last resort
+    if url:
+        detected = page_type_detector.detect_structured(url=url)
+        name = detected.get("name", "generic").lower()
+        if name != "generic" and detected.get("confidence", 0) >= 55:
+            return name
+
+    return "generic"
+
+
+def _get_structured_data(normalized: dict) -> list:
+    """Return structured data from the best available source in normalized."""
+    sd = normalized.get("structured_data", [])
+    if sd:
+        return sd
+    return (
+        normalized.get("schema_data", {}).get("structured_data", [])
+        or normalized.get("enhanced_extraction_v2", {}).get("schema_data", {}).get("structured_data", [])
+        or normalized.get("body_signals", {}).get("structured_data", [])
+    )
+
+
+def _has_entity_reference(structured_data: list) -> bool:
+    """
+    Return True if any schema on this page references an external Organization
+    entity via a typed @id link.
+
+    This satisfies the entity-relationship requirement for non-entity pages
+    (blog, service, article, etc.) that link to the homepage Organization entity:
+        {"publisher": {"@id": "https://example.com/#organization"}}
+
+    That is equivalent to Organisation entity presence — a duplicate full schema
+    should NOT be required on every page.
+    """
+    reference_keys = ("publisher", "isPartOf", "author", "provider", "sourceOrganization")
+    for schema in structured_data:
+        for key in reference_keys:
+            ref = schema.get(key)
+            if isinstance(ref, dict) and ref.get("@id"):
+                return True
+            if isinstance(ref, str) and ref.startswith("http"):
+                return True
+    return False
+
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
 
 class OrganizationSchemaRule(BaseSEORuleV2):
     rule_id = "organization_schema"
@@ -21,32 +165,60 @@ class OrganizationSchemaRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        
-        # Check multiple sources for structured data
-        structured_data = normalized.get("structured_data", [])
-        if not structured_data:
-            structured_data = (
-                normalized.get("schema_data", {}).get("structured_data", []) or
-                normalized.get("enhanced_extraction_v2", {}).get("schema_data", {}).get("structured_data", []) or
-                normalized.get("body_signals", {}).get("structured_data", [])
-            )
-        
-        has_organization_schema = False
+
+        # ── Page-type applicability gate ─────────────────────────────────────
+        # Organization/entity schema is only required on identity pages:
+        #   homepage, about, contact, location, generic.
+        #
+        # Non-entity pages (service, article, blog, faq, product, pricing, legal,
+        # collection, listing) satisfy the entity requirement by referencing the
+        # homepage Organization via @id — they do NOT need a duplicate full schema.
+        #
+        # This mirrors AISO-A1 in ai_v2/rules/page_type_matrix.py which skips the
+        # same rule on service, article, blog, faq, product, pricing, legal,
+        # collection, and listing pages.
+        page_type = _get_page_type(normalized)
+        if page_type not in _ORG_APPLICABLE:
+            return issues  # N/A for this page type
+
+        structured_data = _get_structured_data(normalized)
+
+        # For non-entity pages that somehow reached here as "generic", accept an
+        # @id reference as a valid entity link rather than requiring a full schema.
+        # (This path only fires for genuinely generic pages, not blog/service/etc.)
+
+        # ── Locate entity schema ─────────────────────────────────────────────
+        has_organization = False
+        has_localbusiness = False
         org_schema = None
-        
+
         for schema in structured_data:
             schema_type = schema.get("@type")
-            if isinstance(schema_type, list):
-                if "Organization" in schema_type or "LocalBusiness" in schema_type:
-                    has_organization_schema = True
-                    org_schema = schema
-                    break
-            elif schema_type in ["Organization", "LocalBusiness"]:
-                has_organization_schema = True
+            types = schema_type if isinstance(schema_type, list) else [schema_type]
+            if "LocalBusiness" in types:
+                has_localbusiness = True
+                has_organization = True
                 org_schema = schema
                 break
-        
-        if not has_organization_schema:
+            if "Organization" in types and not has_organization:
+                has_organization = True
+                org_schema = schema
+
+        # ── Report missing schema ────────────────────────────────────────────
+        requires_localbusiness = page_type in _LOCALBUSINESS_REQUIRED
+
+        if requires_localbusiness and not has_localbusiness:
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                "Missing LocalBusiness schema",
+                "No LocalBusiness schema found",
+                "LocalBusiness JSON-LD with name, url, address, telephone, geo, openingHours",
+                data_key="structured_data",
+                data_path="structured_data.localbusiness",
+                impact="Missing LocalBusiness schema prevents Knowledge Graph and Maps from identifying your physical location.",
+                recommendation="Add LocalBusiness schema with address, telephone, openingHours, and geo coordinates."
+            ))
+        elif not requires_localbusiness and not has_organization:
             issues.append(self.create_issue(
                 job_id, project_id, url,
                 "Missing Organization or LocalBusiness schema",
@@ -57,20 +229,13 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                 impact="Missing entity schema prevents AI and Knowledge Graph from properly identifying your brand, limiting entity recognition and authority building.",
                 recommendation="Add Organization schema with required fields: name, url, logo, sameAs (social profiles), and address for local businesses."
             ))
-        else:
-            # Enhanced validation for Organization schema
+
+        # ── Validate completeness of existing schema ─────────────────────────
+        if org_schema:
             required_fields = ["name", "url"]
             recommended_fields = ["logo", "sameAs", "address"]
-            missing_fields = []
-            missing_recommended = []
-
-            for field in required_fields:
-                if not org_schema.get(field):
-                    missing_fields.append(field)
-
-            for field in recommended_fields:
-                if not org_schema.get(field):
-                    missing_recommended.append(field)
+            missing_fields = [f for f in required_fields if not org_schema.get(f)]
+            missing_recommended = [f for f in recommended_fields if not org_schema.get(f)]
 
             if missing_fields:
                 issues.append(self.create_issue(
@@ -84,12 +249,9 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                     recommendation="Add missing required fields to Organization schema for proper entity identification."
                 ))
 
-            # sameAs is intentionally excluded from the "incomplete recommended fields" issue.
-            # SameAsArrayRule (rule_id: sameas_array) owns that specific check and produces a
-            # more explicit, actionable finding.  Emitting sameAs here as well would create a
-            # duplicate issue for the same root cause when sameAs is the only missing field.
-            # When other recommended fields (logo, address) are also absent we still report
-            # those — but never sameAs, regardless of what else is missing.
+            # sameAs is intentionally excluded here — SameAsArrayRule owns that check.
+            # Reporting sameAs here as well creates a duplicate issue when it is the
+            # only missing recommended field.
             non_sameas_missing = [f for f in missing_recommended if f != "sameAs"]
             if non_sameas_missing:
                 issues.append(self.create_issue(
@@ -102,7 +264,7 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                     impact="Missing recommended fields weakens AI entity recognition and Knowledge Graph completeness.",
                     recommendation="Add logo and address information for comprehensive entity representation."
                 ))
-        
+
         return issues
 
 
@@ -115,112 +277,67 @@ class ArticleSchemaRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        
-        # Multi-layer validation
-        content = normalized.get("content", "")
-        structured_data = normalized.get("structured_data", [])
-        headings = normalized.get("headings", [])
-        
-        # Context validation - detect page type
-        page_type = ContextValidator.detect_page_type(url, content, headings)
-        
-        # Validation layers
-        # NOTE: is_user_visible (date visibility in page content) is intentionally absent.
-        # ContentFreshnessRule (rule_id: content_freshness) owns that check for all page
-        # types and produces a more actionable finding.  Including it here caused a duplicate
-        # issue on blog pages that have schema dates but no visible date in the content.
-        validation_results = {
-            'exists': False,
-            'is_contextually_valid': False,
-            'is_complete': False,
-            'is_semantically_correct': False
-        }
 
-        failure_reasons = []
-
-        # 1. SEMANTIC VALIDATION: Article schema should NOT be on service/product pages
-        schema_correct, schema_reason = ContextValidator.validate_schema_correctness(page_type, structured_data)
-        if schema_correct:
-            validation_results['is_semantically_correct'] = True
+        # ── Page-type gate: only fire on content pages ────────────────────────
+        stored_pt = _get_page_type(normalized)
+        if stored_pt in ("article", "blog"):
+            is_content_page = True
+        elif stored_pt == "generic":
+            # Fall back to lightweight ContextValidator for truly unknown pages
+            content  = normalized.get("content", "")
+            headings = normalized.get("headings", [])
+            cv_type  = ContextValidator.detect_page_type(url, content, headings)
+            is_content_page = cv_type in ("blog", "general")
         else:
-            failure_reasons.append(schema_reason)
+            # Known non-content type (service, product, contact, etc.) — skip.
+            # If Article schema IS present on those pages, InvalidSchemaTypeRule
+            # will report it as an "Invalid schema for page type" issue.
+            return issues
 
-        # 2. EXISTENCE: Check for Article schema on appropriate pages
+        if not is_content_page:
+            return issues
+
+        structured_data = _get_structured_data(normalized)
+
+        # ── Check Article schema existence ────────────────────────────────────
         has_article_schema = False
         article_schema = None
-
         for schema in structured_data:
             schema_type = schema.get("@type")
-            if isinstance(schema_type, list):
-                if any(t in ["Article", "BlogPosting", "NewsArticle"] for t in schema_type):
-                    has_article_schema = True
-                    article_schema = schema
-                    break
-            elif schema_type in ["Article", "BlogPosting", "NewsArticle"]:
+            types = schema_type if isinstance(schema_type, list) else [schema_type]
+            if any(t in ["Article", "BlogPosting", "NewsArticle"] for t in types):
                 has_article_schema = True
                 article_schema = schema
                 break
 
-        if has_article_schema:
-            validation_results['exists'] = True
-        else:
-            failure_reasons.append("No Article schema found")
-
-        # 3. CONTEXT VALIDATION: Article schema should be on content pages
-        if page_type in ['blog', 'general']:
-            validation_results['is_contextually_valid'] = True
-        else:
-            failure_reasons.append(f"Article schema on {page_type} page is inappropriate")
-
-        # 4. COMPLETENESS: Check required fields
-        if article_schema:
-            required_fields = ["datePublished", "dateModified", "headline"]
-            missing_fields = []
-
-            for field in required_fields:
-                if not article_schema.get(field):
-                    missing_fields.append(field)
-
-            if not missing_fields:
-                validation_results['is_complete'] = True
-            else:
-                failure_reasons.append(f"Missing required fields: {', '.join(missing_fields)}")
-        else:
-            failure_reasons.append("No article schema to validate completeness")
-
-        # Calculate confidence score
-        passed_checks = sum(validation_results.values())
-        total_checks = len(validation_results)
-        confidence_score = ContextValidator.calculate_confidence(passed_checks, total_checks)
-
-        # FAIL if:
-        # (a) This is a content page (blog/general) but Article schema is missing or incomplete, OR
-        # (b) An Article schema IS present but on the wrong page type or missing required fields.
-        #
-        # Non-content pages (service, product, etc.) without Article schema are NOT flagged —
-        # the absence of Article schema there is correct and expected behaviour.
-        #
-        # Date visibility in page content is NOT checked here — ContentFreshnessRule owns it.
-        is_content_page = page_type in ['blog', 'general']
-        missing_on_content_page = is_content_page and not all([
-            validation_results['exists'],
-            validation_results['is_complete'],
-        ])
-        schema_has_structural_issues = has_article_schema and not all([
-            validation_results['is_semantically_correct'],
-            validation_results['is_complete'],
-        ])
-
-        if missing_on_content_page or schema_has_structural_issues:
+        if not has_article_schema:
             issues.append(self.create_issue(
                 job_id, project_id, url,
-                f"Article schema validation failed: {', '.join(failure_reasons)}",
-                f"Failures: {len(failure_reasons)} | Confidence: {confidence_score:.2f}",
-                "Article schema with complete fields on appropriate page type",
+                "Article schema missing on content page",
+                "No Article schema found",
+                "Article JSON-LD with headline, datePublished, dateModified, author",
                 data_key="structured_data",
-                data_path="structured_data.article"
+                data_path="structured_data.article",
+                impact="Missing Article schema prevents Google News inclusion and reduces AI recency signals for content pages.",
+                recommendation="Add Article (or BlogPosting/NewsArticle) schema with headline, datePublished, dateModified, and author fields."
             ))
-        
+            return issues
+
+        # ── Completeness check ────────────────────────────────────────────────
+        required_fields = ["datePublished", "dateModified", "headline"]
+        missing_fields  = [f for f in required_fields if not article_schema.get(f)]
+        if missing_fields:
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                f"Article schema missing required fields: {', '.join(missing_fields)}",
+                f"Missing: {missing_fields}",
+                "Complete Article schema with headline, datePublished, dateModified",
+                data_key="structured_data",
+                data_path="structured_data.article.incomplete",
+                impact="Incomplete Article schema reduces rich result eligibility and AI date/recency scoring.",
+                recommendation=f"Add missing fields to Article schema: {', '.join(missing_fields)}."
+            ))
+
         return issues
 
 
@@ -233,33 +350,30 @@ class BreadcrumbListSchemaRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        
-        # Check multiple sources for structured data and breadcrumb signals
-        structured_data = normalized.get("structured_data", [])
+
+        # ── Page-type applicability gate ─────────────────────────────────────
+        # BreadcrumbList is not meaningful on root/transactional pages where
+        # breadcrumbs are unusual or absent by design.
+        page_type = _get_page_type(normalized)
+        if page_type in _BREADCRUMB_SKIP:
+            return issues
+
+        structured_data = _get_structured_data(normalized)
         breadcrumb_schema_present = normalized.get("breadcrumb_schema_present", False)
         breadcrumb_detected = normalized.get("breadcrumb_detected", False)
-        
-        # Enhanced validation - check nested sources
-        if not structured_data:
-            structured_data = (
-                normalized.get("schema_data", {}).get("structured_data", []) or
-                normalized.get("enhanced_extraction_v2", {}).get("schema_data", {}).get("structured_data", []) or
-                normalized.get("body_signals", {}).get("structured_data", [])
-            )
-        
+
         if not breadcrumb_schema_present:
             breadcrumb_schema_present = (
                 normalized.get("schema_analysis", {}).get("breadcrumb_schema_present", False) or
                 normalized.get("breadcrumb_schema_signals", {}).get("breadcrumb_schema_present", False)
             )
-        
+
         if not breadcrumb_detected:
             breadcrumb_detected = (
                 normalized.get("breadcrumb_dom_signals", {}).get("breadcrumb_detected", False) or
                 normalized.get("navigation_detection", {}).get("breadcrumb_detected", False)
             )
-        
-        # Validation layers
+
         validation_results = {
             'exists': False,
             'is_contextually_valid': False,
@@ -267,69 +381,58 @@ class BreadcrumbListSchemaRule(BaseSEORuleV2):
             'is_user_visible': False,
             'is_semantically_correct': False
         }
-        
         failure_reasons = []
-        
-        # 1. SCHEMA EXISTENCE: Check if breadcrumb schema exists
+
+        # 1. SCHEMA EXISTENCE
         has_breadcrumb_schema = False
         breadcrumb_schema = None
-        
         for schema in structured_data:
             schema_type = schema.get("@type")
-            if isinstance(schema_type, list):
-                if "BreadcrumbList" in schema_type:
-                    has_breadcrumb_schema = True
-                    breadcrumb_schema = schema
-                    break
-            elif schema_type == "BreadcrumbList":
+            types = schema_type if isinstance(schema_type, list) else [schema_type]
+            if "BreadcrumbList" in types:
                 has_breadcrumb_schema = True
                 breadcrumb_schema = schema
                 break
-        
+
         if has_breadcrumb_schema:
             validation_results['exists'] = True
         else:
             failure_reasons.append("No BreadcrumbList schema found")
-        
-        # 2. UI VISIBILITY: Check if breadcrumb navigation exists in content
+
+        # 2. UI VISIBILITY
         content = normalized.get("content", "")
         breadcrumb_indicators = ["breadcrumb", "nav", "breadcrumb-nav", "breadcrumb-list", "breadcrumbs"]
         has_breadcrumb_nav = ContextValidator.is_ui_visible(content, breadcrumb_indicators)
-        
+
         if has_breadcrumb_nav or breadcrumb_detected:
             validation_results['is_user_visible'] = True
         else:
             failure_reasons.append("No visible breadcrumb navigation in page content")
-        
-        # 3. COMPLETENESS: Check if breadcrumb has proper structure
+
+        # 3. COMPLETENESS
         if has_breadcrumb_schema and breadcrumb_schema:
             breadcrumb_list = breadcrumb_schema.get("itemListElement", [])
             if breadcrumb_list and len(breadcrumb_list) > 0:
                 validation_results['is_complete'] = True
             else:
                 failure_reasons.append("BreadcrumbList schema has no items")
-        
-        # 4. SEMANTIC CORRECTNESS: Check breadcrumb items structure
+
+        # 4. SEMANTIC CORRECTNESS
         if has_breadcrumb_schema and breadcrumb_schema and validation_results['is_complete']:
             breadcrumb_list = breadcrumb_schema.get("itemListElement", [])
-            valid_items = 0
-            for item in breadcrumb_list:
-                if (item.get("@type") == "ListItem" and 
-                    item.get("name") and 
-                    item.get("item")):
-                    valid_items += 1
-            
+            valid_items = sum(
+                1 for item in breadcrumb_list
+                if item.get("@type") == "ListItem" and item.get("name") and item.get("item")
+            )
             if valid_items > 0:
                 validation_results['is_semantically_correct'] = True
             else:
                 failure_reasons.append("Breadcrumb items missing required fields (name, item)")
-        
-        # 5. CONTEXTUAL VALIDATION: Overall assessment
-        passed_validations = sum(validation_results.values())
-        if passed_validations >= 3:  # At least 3 of 5 validations pass
+
+        # 5. CONTEXTUAL VALIDATION
+        if sum(validation_results.values()) >= 3:
             validation_results['is_contextually_valid'] = True
-        
-        # Issue reporting
+
         if not validation_results['exists']:
             issues.append(self.create_issue(
                 job_id, project_id, url,
@@ -352,7 +455,7 @@ class BreadcrumbListSchemaRule(BaseSEORuleV2):
                 impact="Incomplete breadcrumb schema reduces rich snippet effectiveness and AI site structure understanding.",
                 recommendation="Ensure breadcrumb schema is complete, visible, and semantically correct. Match schema items with visible breadcrumb navigation."
             ))
-        
+
         return issues
 
 
@@ -365,7 +468,7 @@ class ProductSchemaRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        structured_data = normalized.get("structured_data", [])
+        structured_data = _get_structured_data(normalized)
 
         is_product_page = self._is_product_page(normalized, url, structured_data)
 
@@ -389,7 +492,6 @@ class ProductSchemaRule(BaseSEORuleV2):
                     data_path="structured_data.product"
                 ))
             else:
-                # Check for Offer schema
                 offers = product_schema.get("offers", [])
                 if not offers:
                     issues.append(self.create_issue(
@@ -411,22 +513,18 @@ class ProductSchemaRule(BaseSEORuleV2):
         service, about, blog, and home pages that merely mention "price" or "product".
 
         Priority (highest → lowest):
-          1. page_context stored by the scraper (PageTypeDetector ran at crawl time)
+          1. page_type flat field (from page_type_detector, set by context enrichment)
           2. Schema.org @type = Product / ProductGroup on the page
           3. URL path segments that unambiguously indicate a product detail page
         """
-        # 1. Scraper-set page_context (most authoritative)
-        page_context = normalized.get("page_context", {})
-        if page_context:
-            ctx_name = page_context.get("name", "").lower()
-            ctx_confidence = page_context.get("confidence", 0)
-            if ctx_name == "product" and ctx_confidence >= 60:
-                return True
-            # Explicit non-product type with sufficient confidence → reject early
-            if ctx_confidence >= 70 and ctx_name and ctx_name != "generic":
-                return False
+        # 1. Stored page_type (most authoritative)
+        stored_pt = _get_page_type(normalized)
+        if stored_pt == "product":
+            return True
+        if stored_pt and stored_pt not in ("generic",):
+            return False  # Explicit non-product type
 
-        # 2. Schema.org @type on this page signals it is a product
+        # 2. Schema.org @type
         for schema in structured_data:
             schema_type = schema.get("@type")
             types = schema_type if isinstance(schema_type, list) else [schema_type]
@@ -450,82 +548,74 @@ class AggregateRatingSchemaRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        
-        # Check multiple sources for structured data
-        structured_data = normalized.get("structured_data", [])
-        if not structured_data:
-            structured_data = (
-                normalized.get("schema_data", {}).get("structured_data", []) or
-                normalized.get("enhanced_extraction_v2", {}).get("schema_data", {}).get("structured_data", []) or
-                normalized.get("body_signals", {}).get("structured_data", [])
-            )
-        
-        # Enhanced detection for testimonials and ratings
+
+        # ── Page-type applicability gate ─────────────────────────────────────
+        # AggregateRating is applicable on pages that can legitimately display
+        # ratings: homepage, about, service pages, product pages, location pages.
+        # It is NOT applicable on pure content pages (article, blog), contact,
+        # pricing, legal, or FAQ pages.
+        page_type = _get_page_type(normalized)
+        if page_type not in _AGGREGATE_RATING_APPLICABLE:
+            return issues
+
+        structured_data = _get_structured_data(normalized)
         content = normalized.get("content", "").lower()
-        
-        # Check for testimonials section
-        testimonial_indicators = [
-            "what agencies say",
-            "testimonials",
-            "customer reviews",
-            "client testimonials",
+
+        # ── Rating evidence: require numeric rating signals, not just keywords ─
+        # Keywords like "reviews", "testimonials", "rating" appear in prose and
+        # navigation menus on nearly every page — they are not evidence of actual
+        # ratings being displayed.  Only fire when there are measurable rating
+        # artefacts: star symbols, numeric scores, or an explicit rating scale.
+        has_numeric_rating = bool(_NUMERIC_RATING_RE.search(content))
+
+        # Testimonials section is an acceptable signal on its own because dedicated
+        # testimonial blocks with names/quotes indicate social proof content.
+        # BUT require at least one specific testimonial keyword (not just "reviews").
+        specific_testimonial_keywords = [
             "what our clients say",
-            "reviews",
-            "ratings",
-            "star",
-            "★",
-            "testimonial",
-            "satisfied clients"
+            "client testimonials",
+            "customer testimonials",
+            "what agencies say",
+            "satisfied clients",
+            "testimonials",
         ]
-        
-        has_testimonials = any(indicator in content for indicator in testimonial_indicators)
-        
-        # Check for rating patterns in content
-        rating_patterns = ["rating", "review", "score", "stars", "★", "⭐", "5/5", "4.5/5"]
-        has_ratings = any(pattern in content for pattern in rating_patterns)
-        
-        # Check for person names (testimonials often have names)
-        has_person_names = bool(
-            normalized.get("content", {}).get("headings", {}).get("h4", []) or
-            any("—" in content or name in content for name in ["jennifer", "mike", "sarah", "david", "emily"])
-        )
-        
-        if has_testimonials or has_ratings or has_person_names:
-            has_aggregate_rating = False
-            
-            # Check for AggregateRating schema
-            for schema in structured_data:
-                if schema.get("@type") == "AggregateRating":
-                    has_aggregate_rating = True
-                    break
-                
-                # Also check nested in other schemas
-                if "aggregateRating" in schema:
-                    has_aggregate_rating = True
-                    break
-            
-            if not has_aggregate_rating:
-                evidence_parts = []
-                if has_testimonials:
-                    evidence_parts.append("testimonials section")
-                if has_ratings:
-                    evidence_parts.append("rating indicators")
-                if has_person_names:
-                    evidence_parts.append("person names")
-                
-                evidence_text = ", ".join(evidence_parts)
-                
-                issues.append(self.create_issue(
-                    job_id, project_id, url,
-                    f"Page displays {evidence_text} but no AggregateRating schema",
-                    f"Found: {evidence_text} | Missing: AggregateRating structured data",
-                    "AggregateRating JSON-LD for star ratings in SERPs",
-                    data_key="structured_data",
-                    data_path="structured_data.aggregate_rating",
-                    impact="Missing AggregateRating schema prevents star ratings from appearing in search results, reducing CTR and trust signals.",
-                    recommendation="Add AggregateRating schema with ratingValue, reviewCount, and bestRating fields to enable star rich snippets in search results."
-                ))
-        
+        has_testimonials = any(kw in content for kw in specific_testimonial_keywords)
+
+        # Fire only when there is BOTH a testimonial section AND numeric rating
+        # evidence, OR when numeric ratings alone are clearly displayed.
+        should_check = has_numeric_rating or (has_testimonials and has_numeric_rating)
+        if not should_check:
+            return issues
+
+        # ── Check for AggregateRating schema ─────────────────────────────────
+        has_aggregate_rating = False
+        for schema in structured_data:
+            if schema.get("@type") == "AggregateRating":
+                has_aggregate_rating = True
+                break
+            if "aggregateRating" in schema:
+                has_aggregate_rating = True
+                break
+
+        if not has_aggregate_rating:
+            evidence_parts = []
+            if has_testimonials:
+                evidence_parts.append("testimonials section")
+            if has_numeric_rating:
+                evidence_parts.append("numeric rating indicators")
+            evidence_text = ", ".join(evidence_parts)
+
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                f"Page displays {evidence_text} but no AggregateRating schema",
+                f"Found: {evidence_text} | Missing: AggregateRating structured data",
+                "AggregateRating JSON-LD for star ratings in SERPs",
+                data_key="structured_data",
+                data_path="structured_data.aggregate_rating",
+                impact="Missing AggregateRating schema prevents star ratings from appearing in search results, reducing CTR and trust signals.",
+                recommendation="Add AggregateRating schema with ratingValue, reviewCount, and bestRating fields to enable star rich snippets in search results."
+            ))
+
         return issues
 
 
@@ -538,17 +628,9 @@ class SameAsArrayRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        
-        # Check multiple sources for structured data
-        structured_data = normalized.get("structured_data", [])
-        if not structured_data:
-            structured_data = (
-                normalized.get("schema_data", {}).get("structured_data", []) or
-                normalized.get("enhanced_extraction_v2", {}).get("schema_data", {}).get("structured_data", []) or
-                normalized.get("body_signals", {}).get("structured_data", [])
-            )
-        
-        # Check Organization/LocalBusiness schemas for sameAs
+
+        structured_data = _get_structured_data(normalized)
+
         for schema in structured_data:
             schema_type = schema.get("@type")
             if isinstance(schema_type, list):
@@ -561,15 +643,13 @@ class SameAsArrayRule(BaseSEORuleV2):
             # If name or url are missing, OrganizationSchemaRule already reports the broader
             # incompleteness.  Firing a sameAs-specific issue on top of that is misleading —
             # the root problem is not sameAs, it is the schema being fundamentally incomplete.
-            # Fix required fields first; sameAs can be addressed afterwards.
             if not schema.get("name") or not schema.get("url"):
                 continue
 
             same_as = schema.get("sameAs", [])
             if isinstance(same_as, str):
                 same_as = [same_as]
-            
-            # Enhanced validation for sameAs
+
             validation_results = {
                 'exists': len(same_as) > 0,
                 'is_contextually_valid': False,
@@ -577,38 +657,32 @@ class SameAsArrayRule(BaseSEORuleV2):
                 'has_social_profiles': False,
                 'excludes_self_reference': True
             }
-            
             failure_reasons = []
-            
-            # Check for multiple social profiles
+
             social_domains = ['facebook.com', 'twitter.com', 'linkedin.com', 'instagram.com', 'youtube.com', 'pinterest.com']
             social_count = 0
-            
-            for url in same_as:
-                if any(domain in url.lower() for domain in social_domains):
+            current_domain = normalized.get("url", "").replace("https://", "").replace("http://", "").split("/")[0]
+
+            for sa_url in same_as:
+                if any(domain in sa_url.lower() for domain in social_domains):
                     social_count += 1
-                
-                # Check if it's just self-referencing (useless)
-                current_domain = normalized.get("url", "").replace("https://", "").replace("http://", "").split("/")[0]
-                if current_domain and current_domain in url.lower():
+                if current_domain and current_domain in sa_url.lower():
                     validation_results['excludes_self_reference'] = False
                     failure_reasons.append("Contains self-referencing URL")
-            
+
             validation_results['has_social_profiles'] = social_count >= 2
-            
+
             if not validation_results['exists']:
                 failure_reasons.append("No sameAs array found")
             elif not validation_results['has_multiple']:
                 failure_reasons.append("Less than 2 sameAs URLs")
             elif not validation_results['has_social_profiles']:
                 failure_reasons.append("No social media profiles found")
-            
-            # Contextual validation
+
             passed_validations = sum(validation_results.values())
             if passed_validations >= 3:
                 validation_results['is_contextually_valid'] = True
-            
-            # Issue reporting
+
             if not validation_results['exists']:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
@@ -631,7 +705,7 @@ class SameAsArrayRule(BaseSEORuleV2):
                     impact="Incomplete or invalid sameAs array reduces AI entity recognition and Knowledge Graph building effectiveness.",
                     recommendation="Enhance sameAs array with at least 2-3 social media profile URLs. Remove self-referencing URLs and ensure all links are valid social profiles."
                 ))
-        
+
         return issues
 
 
@@ -644,15 +718,13 @@ class DeprecatedSchemaTypesRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        structured_data = normalized.get("structured_data", [])
-        
-        # List of deprecated schema types (simplified - would need to maintain current list)
+        structured_data = _get_structured_data(normalized)
+
         deprecated_types = [
-            "Blog",  # Deprecated in favor of BlogPosting
-            "Recipe",  # Some deprecated properties
-            # Add more as needed based on current schema.org changes
+            "Blog",       # Deprecated in favour of BlogPosting
+            "Recipe",     # Some deprecated properties
         ]
-        
+
         for schema in structured_data:
             schema_type = schema.get("@type")
             if schema_type in deprecated_types:
@@ -664,7 +736,7 @@ class DeprecatedSchemaTypesRule(BaseSEORuleV2):
                     data_key="structured_data",
                     data_path=f"structured_data.{schema_type.lower()}"
                 ))
-        
+
         return issues
 
 
@@ -677,18 +749,15 @@ class DuplicateSchemaFormatsRule(BaseSEORuleV2):
 
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
-        
-        # Check for different schema formats
+
         json_ld_schemas = normalized.get("structured_data", [])
         microdata_schemas = normalized.get("microdata", [])
-        
-        # Get entity types from each format
+
         json_ld_types = set(schema.get("@type") for schema in json_ld_schemas if schema.get("@type"))
         microdata_types = set(item.get("itemtype") for item in microdata_schemas if item.get("itemtype"))
-        
-        # Check for overlapping entity types
+
         overlapping_types = json_ld_types.intersection(microdata_types)
-        
+
         if overlapping_types:
             issues.append(self.create_issue(
                 job_id, project_id, url,
@@ -698,7 +767,131 @@ class DuplicateSchemaFormatsRule(BaseSEORuleV2):
                 data_key="structured_data",
                 data_path="structured_data.duplicate_formats"
             ))
-        
+
+        return issues
+
+
+class InvalidSchemaTypeRule(BaseSEORuleV2):
+    rule_id = "invalid_schema_type"
+    rule_no = 104
+    category = "Schema"
+    severity = "high"
+    description = "Detects schema types that don't match the page's detected content type"
+
+    def evaluate(self, normalized, job_id, project_id, url):
+        issues = []
+
+        page_type = _get_page_type(normalized)
+        if page_type == "generic":
+            return issues  # Can't determine invalid vs valid without a known page type
+
+        applicability = SCHEMA_APPLICABILITY.get(page_type, SCHEMA_APPLICABILITY["generic"])
+        not_applicable = applicability.get("not_applicable", frozenset())
+        if not not_applicable:
+            return issues
+
+        structured_data = _get_structured_data(normalized)
+        if not structured_data:
+            return issues
+
+        # Collect all @types present on the page
+        detected_types = []
+        for schema in structured_data:
+            schema_type_val = schema.get("@type")
+            if isinstance(schema_type_val, list):
+                detected_types.extend(t for t in schema_type_val if t)
+            elif isinstance(schema_type_val, str) and schema_type_val:
+                detected_types.append(schema_type_val)
+
+        page_display = _PAGE_TYPE_DISPLAY.get(page_type, page_type.capitalize())
+        recommended  = applicability.get("recommended", frozenset())
+        suggested    = ", ".join(sorted(recommended)[:3]) if recommended else "WebPage"
+
+        for invalid_type in detected_types:
+            if invalid_type in not_applicable and invalid_type not in UNIVERSAL_SCHEMAS:
+                issues.append(self.create_issue(
+                    job_id, project_id, url,
+                    f"Invalid {invalid_type} schema on {page_display} page",
+                    f"Found: {invalid_type} | Page type: {page_display}",
+                    f"Use schema appropriate for {page_display} pages (e.g., {suggested})",
+                    data_key="structured_data",
+                    data_path=f"structured_data.{invalid_type.lower()}",
+                    impact=(
+                        f"Using {invalid_type} schema on a {page_display} page confuses "
+                        f"search engines about page intent and may cause incorrect rich result eligibility."
+                    ),
+                    recommendation=(
+                        f"Remove {invalid_type} schema from this {page_display} page "
+                        f"and add the appropriate schema type instead."
+                    ),
+                    context={
+                        "invalid_type":    invalid_type,
+                        "page_type":       page_type,
+                        "detected_types":  detected_types,
+                        "suggested":       suggested,
+                    }
+                ))
+
+        return issues
+
+
+class SchemaTypeConflictRule(BaseSEORuleV2):
+    rule_id = "schema_type_conflict"
+    rule_no = 105
+    category = "Schema"
+    severity = "medium"
+    description = "Detects mutually exclusive schema types present on the same page"
+
+    def evaluate(self, normalized, job_id, project_id, url):
+        issues = []
+
+        structured_data = _get_structured_data(normalized)
+        if not structured_data:
+            return issues
+
+        # Collect all @types present on the page
+        detected_types = []
+        for schema in structured_data:
+            schema_type_val = schema.get("@type")
+            if isinstance(schema_type_val, list):
+                detected_types.extend(t for t in schema_type_val if t)
+            elif isinstance(schema_type_val, str) and schema_type_val:
+                detected_types.append(schema_type_val)
+
+        if not detected_types:
+            return issues
+
+        page_type   = _get_page_type(normalized)
+        page_display = _PAGE_TYPE_DISPLAY.get(page_type, page_type.capitalize())
+
+        # Check each conflicting schema family
+        for family_name in CONFLICTING_FAMILIES:
+            family_types = SCHEMA_FAMILIES.get(family_name, frozenset())
+            found_in_family = [t for t in detected_types if t in family_types]
+            if len(found_in_family) >= 2:
+                issues.append(self.create_issue(
+                    job_id, project_id, url,
+                    f"Conflicting {family_name} schema types: {', '.join(found_in_family)}",
+                    f"Multiple {family_name} schemas: {', '.join(found_in_family)}",
+                    f"Use only the most specific {family_name} schema type for this page",
+                    data_key="structured_data",
+                    data_path="structured_data.conflict",
+                    impact=(
+                        f"Having {len(found_in_family)} conflicting {family_name} schemas "
+                        f"({', '.join(found_in_family)}) causes search engine confusion about "
+                        f"page content type and may invalidate rich result eligibility."
+                    ),
+                    recommendation=(
+                        f"Keep only the most specific {family_name} schema "
+                        f"and remove the others: {', '.join(found_in_family[1:])}."
+                    ),
+                    context={
+                        "conflicting_types": found_in_family,
+                        "family":            family_name,
+                        "page_type":         page_type,
+                    }
+                ))
+
         return issues
 
 
@@ -712,3 +905,5 @@ def register_schema_rules(registry):
     registry.register(SameAsArrayRule())
     registry.register(DeprecatedSchemaTypesRule())
     registry.register(DuplicateSchemaFormatsRule())
+    registry.register(InvalidSchemaTypeRule())
+    registry.register(SchemaTypeConflictRule())
