@@ -9,7 +9,7 @@ import requests
 from bs4 import BeautifulSoup
 
 # Local imports
-from .fetcher import fetch_html
+from .fetcher import fetch_html, validate_html_integrity, InvalidHtmlContentError
 from .seo import (
     extract_head_and_meta_data, extract_social_media_data,
     extract_internationalization_data, extract_visual_branding_data,
@@ -29,6 +29,24 @@ def extract_comprehensive_seo_data(html: str, base_url: str, response_headers: d
     """
     try:
         soup = BeautifulSoup(html, "lxml")
+
+        # Defense in depth: fetch_html() already validates response integrity
+        # before ever returning html (see validate_html_integrity in
+        # fetcher.py), but extraction_status must reflect real structural
+        # validity for ANY caller of this function, not merely "no Python
+        # exception was raised while parsing" — BeautifulSoup/lxml do not
+        # raise on corrupted/binary-as-text input, they simply return empty
+        # results for every tag lookup, which previously left
+        # extraction_status="SUCCESS" on fully garbled documents (forensic
+        # finding, 2026-08-11).
+        is_valid, integrity_diagnostics = validate_html_integrity(html)
+        if not is_valid:
+            return {
+                "url": base_url,
+                "scraped_at": datetime.utcnow().isoformat(),
+                "extraction_status": "FAILED",
+                "extraction_failure_reason": integrity_diagnostics.get("reason"),
+            }
 
         # Initialize result structure
         seo_data = {
@@ -124,6 +142,22 @@ def _classify_fetch_exception(e: Exception) -> dict:
     reason. Mirrors the same substring/exception-type approach already used
     by url_qualification/worker.py's _probe_url() for consistency.
     """
+    # InvalidHtmlContentError is fetch_html()'s own response-integrity
+    # failure (see fetcher.py) — not a requests exception, so it must be
+    # checked before the requests.exceptions branches below. Diagnostics are
+    # folded into error_message (rather than added as new failure_info
+    # keys/seo_page_failures fields) so the existing failure schema is
+    # unchanged; the reason/content_encoding/replacement ratio are still
+    # fully visible in the stored failure record.
+    if isinstance(e, InvalidHtmlContentError):
+        diag = e.diagnostics or {}
+        msg = (
+            f"reason={diag.get('reason')} content_encoding={diag.get('content_encoding')} "
+            f"content_type={diag.get('content_type')} replacement_char_ratio={diag.get('replacement_char_ratio')} "
+            f"http_status={diag.get('http_status')}"
+        )
+        return {"failure_type": "INVALID_HTML_RESPONSE", "error_message": msg[:500]}
+
     # SSLError is a ConnectionError subclass in requests — must check first.
     if isinstance(e, requests.exceptions.SSLError):
         return {"failure_type": "SSL_ERROR", "error_message": str(e)[:500]}

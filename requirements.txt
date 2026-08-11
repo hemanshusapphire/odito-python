@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 requests
+brotli
 httpx
 beautifulsoup4
 lxml

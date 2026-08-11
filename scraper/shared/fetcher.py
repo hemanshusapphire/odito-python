@@ -96,6 +96,81 @@ _session = _build_session()
 MIN_STATIC_ANCHORS = 5
 
 # ---------------------------------------------------------------------------
+# Response integrity validation.
+#
+# Forensic finding (2026-08-11): a 200 status with a body that decoded
+# without raising an exception is NOT proof the body is real HTML. If the
+# origin/CDN responds with a Content-Encoding this process can't decompress
+# (e.g. Content-Encoding: br when the `brotli` package isn't installed),
+# urllib3 has no registered decoder for it and silently hands back the
+# still-compressed bytes with no error — _download_html_streaming()'s own
+# raw.decode(encoding, errors="replace") then force-decodes that binary as
+# text, producing a string dense with U+FFFD replacement characters that
+# BeautifulSoup/lxml parse without complaint (yielding empty title/meta/
+# links/images, not an exception). Confirmed live against krishnaeyecentre.com
+# and vasaneye.com (both Content-Encoding: br) vs. asgeyehospital.com
+# (Content-Encoding: gzip, natively supported, unaffected).
+#
+# Deliberately does NOT require specific tags (title, meta description,
+# canonical, images, links) — a legitimate minimal HTML page can lack any of
+# those. It only checks two encoding-agnostic corruption signals that a real
+# HTML document essentially never exhibits.
+# ---------------------------------------------------------------------------
+_HTML_STRUCTURE_RE = re.compile(r"<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]", re.IGNORECASE)
+_REPLACEMENT_CHAR = "�"
+_STRUCTURE_CHECK_PREFIX_CHARS = 4096  # doctype/html/head/body always appear near the start
+MAX_REPLACEMENT_CHAR_RATIO = float(os.environ.get("MAX_REPLACEMENT_CHAR_RATIO", "0.01"))
+
+
+def validate_html_integrity(text: "str | None") -> "tuple[bool, dict]":
+    """
+    Determine whether `text` is genuinely-decoded HTML, or corrupted/binary
+    data (most commonly a still-compressed body force-decoded as text) that
+    happened to decode without raising.
+
+    Returns (is_valid, diagnostics). diagnostics is always populated —
+    callers can log/persist a useful reason even when is_valid is True.
+    """
+    length = len(text) if text else 0
+    replacement_count = text.count(_REPLACEMENT_CHAR) if text else 0
+    replacement_ratio = (replacement_count / length) if length else 0.0
+    has_structure = bool(_HTML_STRUCTURE_RE.search(text[:_STRUCTURE_CHECK_PREFIX_CHARS])) if text else False
+
+    diagnostics = {
+        "length": length,
+        "replacement_char_count": replacement_count,
+        "replacement_char_ratio": round(replacement_ratio, 4),
+        "has_html_structure_marker": has_structure,
+        "reason": None,
+    }
+
+    if length == 0:
+        diagnostics["reason"] = "EMPTY_CONTENT"
+        return False, diagnostics
+
+    if replacement_ratio > MAX_REPLACEMENT_CHAR_RATIO:
+        diagnostics["reason"] = "HIGH_REPLACEMENT_CHAR_DENSITY"
+        return False, diagnostics
+
+    if not has_structure:
+        diagnostics["reason"] = "NO_HTML_STRUCTURE_MARKER"
+        return False, diagnostics
+
+    return True, diagnostics
+
+
+class InvalidHtmlContentError(Exception):
+    """
+    Raised by fetch_html() when a response cannot be validated as real HTML
+    after exhausting every fallback (static HTTP + browser render). Carries
+    structured diagnostics (see validate_html_integrity) so callers can
+    record a useful failure reason instead of a generic exception message.
+    """
+    def __init__(self, message: str, diagnostics: "dict | None" = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
+
+# ---------------------------------------------------------------------------
 # Per-URL rendering-decision cache.
 #
 # Deliberately keyed by the exact URL, never by domain: one page's rendering
@@ -632,6 +707,53 @@ def fetch_html(url: str, timeout: int = 8, prefer_static_for_links: bool = False
             # Single-pass parse: parse the HTML once and reuse the soup for both
             # JS detection and (in static-first mode) anchor counting.
             soup = BeautifulSoup(html, "lxml")
+
+            # === Response integrity validation ===
+            # Must run before the static-first short-circuit below — a
+            # corrupted/still-compressed body could coincidentally contain
+            # enough '<a' -like byte noise to pass the anchor-count check,
+            # so integrity is checked first, unconditionally, for every
+            # caller (PAGE_SCRAPING and LINK_DISCOVERY's prefer_static_for_links
+            # mode alike). On failure, escalate to a real browser exactly
+            # like the JS-rendering-needed path below — a browser's own
+            # network stack decompresses every Content-Encoding correctly
+            # regardless of what's importable in this Python process, so
+            # this self-heals without any manual decompression code (no
+            # double-decompression risk: no decompression code was added at
+            # all, this only adds validation + reuses the existing browser
+            # fallback).
+            is_valid, integrity_diagnostics = validate_html_integrity(html)
+            if not is_valid:
+                print(f"[FETCH] Response failed integrity validation for {url} | reason={integrity_diagnostics['reason']} | replacement_ratio={integrity_diagnostics['replacement_char_ratio']}")
+                content_encoding = resp_headers.get('Content-Encoding') or resp_headers.get('content-encoding')
+
+                browser_html = None
+                if PLAYWRIGHT_AVAILABLE:
+                    try:
+                        browser_html, b_status, b_rt, _, b_final_url = fetch_html_playwright(url, timeout * 3, user_agent=_get_request_ua())
+                    except Exception as e:
+                        print(f"[FETCH] Playwright fallback failed after integrity check for {url}: {str(e)[:100]}")
+                elif SELENIUM_AVAILABLE:
+                    try:
+                        browser_html, b_status, b_rt, _, b_final_url = fetch_html_selenium(url, timeout * 3)
+                    except Exception as e:
+                        print(f"[FETCH] Selenium fallback failed after integrity check for {url}: {str(e)[:100]}")
+
+                if browser_html:
+                    browser_valid, browser_diagnostics = validate_html_integrity(browser_html)
+                    if browser_valid:
+                        return browser_html, b_status, b_rt, {}, b_final_url
+                    print(f"[FETCH] Browser fallback also failed integrity validation for {url} | reason={browser_diagnostics['reason']}")
+
+                raise InvalidHtmlContentError(
+                    f"Response body failed HTML integrity validation for {url}",
+                    diagnostics={
+                        **integrity_diagnostics,
+                        "content_encoding": content_encoding,
+                        "content_type": resp_headers.get('Content-Type') or resp_headers.get('content-type'),
+                        "http_status": res.status_code,
+                    }
+                )
 
             # === Static-first short-circuit (link discovery) ===
             # If the server-rendered HTML already contains enough anchors, trust
