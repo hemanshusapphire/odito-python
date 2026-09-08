@@ -412,27 +412,12 @@ class PersonSchemaLinkedRule(BaseSEORuleV2):
                     break
         
         if has_person_schema:
-            # Enhanced validation - check if it's a real person vs generic entity
-            is_human, human_reason = ContextValidator.is_human_author(author_name)
-            
             # Check for social links in Person schema
             has_same_as = bool(person_schema.get("sameAs"))
             has_url = bool(person_schema.get("url"))
             has_job_title = bool(person_schema.get("jobTitle") or person_schema.get("description"))
-            
+
             # Validation issues
-            if not is_human:
-                issues.append(self.create_issue(
-                    job_id, project_id, url,
-                    f"Person schema uses generic entity name: '{author_name}'",
-                    f"Non-human author detected: {human_reason}",
-                    "Person schema with real human name (First + Last)",
-                    data_key="structured_data",
-                    data_path="structured_data.person.name",
-                    impact="Generic entity names in Person schema weaken entity graph and reduce EEAT credibility with AI systems.",
-                    recommendation="Use real human name in Person schema. Replace 'S-Agency' with actual person's name like 'John Smith'."
-                ))
-            
             if not has_works_for:
                 issues.append(self.create_issue(
                     job_id, project_id, url,
@@ -806,84 +791,6 @@ class FirstHandExperienceRule(BaseSEORuleV2):
         return issues
 
 
-class ContentFreshnessRule(BaseSEORuleV2):
-    rule_id = "content_freshness"
-    rule_no = 110
-    category = "EEAT"
-    severity = "medium"
-    description = "AI systems and Google's freshness algorithm downrank outdated content"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        issues = []
-        
-        content = normalized.get("content", "")
-        
-        # Enhanced validation - check for VISIBLE date information in content
-        date_indicators = [
-            "last updated", "updated on", "published on", "posted on",
-            "last modified", "date:", "published:", "updated:",
-            "january", "february", "march", "april", "may", "june",
-            "july", "august", "september", "october", "november", "december",
-            "updated:", "published:", "modified:", "last reviewed"
-        ]
-        
-        content_lower = content.lower()
-        has_visible_date = any(indicator in content_lower for indicator in date_indicators)
-        
-        # Look for actual date patterns in visible content
-        import re
-        date_patterns = [
-            r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',  # MM/DD/YYYY or MM-DD-YYYY
-            r'\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b',    # YYYY/MM/DD or YYYY-MM-DD
-            r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]* \d{1,2},? \d{4}\b',  # Month DD, YYYY
-            r'\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*,? \d{4}\b',  # DD Month YYYY
-        ]
-        
-        has_actual_date = any(re.search(pattern, content_lower) for pattern in date_patterns)
-        
-        # Check for schema dates (but these are NOT sufficient for user visibility)
-        schema_dates = normalized.get("last_updated_signals", {}).get("schema_dates", [])
-        date_meta_tags = normalized.get("last_updated_signals", {}).get("date_meta_tags", [])
-        
-        has_schema_dates = len(schema_dates) > 0 or len(date_meta_tags) > 0
-        
-        # Enhanced validation - check if dates are in meaningful context
-        meaningful_date_patterns = [
-            r'updated\s+(?:on|:)?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
-            r'published\s+(?:on|:)?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
-            r'last\s+updated\s+(?:on|:)?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}',
-            r'modified\s+(?:on|:)?\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}'
-        ]
-        
-        has_meaningful_date = any(re.search(pattern, content_lower) for pattern in meaningful_date_patterns)
-        
-        # FAIL if no visible date found (meta-only dates are NOT sufficient)
-        if not has_visible_date or not has_actual_date or not has_meaningful_date:
-            missing_elements = []
-            
-            if not has_visible_date:
-                missing_elements.append("visible date indicators")
-            if not has_actual_date:
-                missing_elements.append("actual date patterns")
-            if not has_meaningful_date:
-                missing_elements.append("meaningful date context")
-            
-            schema_info = "" if has_schema_dates else " (schema dates present but not visible)"
-            
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"Page missing visible date information{schema_info}",
-                f"Missing: {', '.join(missing_elements)} | Schema dates: {'Yes' if has_schema_dates else 'No'}",
-                "Visible last-updated or published date in page content (not just schema/meta)",
-                data_key="last_updated_signals",
-                data_path="last_updated_signals",
-                impact="Dates visible only in schema/meta are insufficient for users. Missing visible dates reduce trust and EEAT signals.",
-                recommendation="Add visible publication or last-updated date in page content. Use formats like 'Last updated: Month DD, YYYY' or 'Published: Month DD, YYYY' near the title or at the bottom of the content."
-            ))
-        
-        return issues
-
-
 def register_eeat_rules(registry):
     """Register all E-E-A-T rules with the registry."""
     registry.register(AuthorNameBioRule())
@@ -894,4 +801,3 @@ def register_eeat_rules(registry):
     registry.register(PrivacyTermsPagesRule())
     # DISABLED: Content lacks first-hand experience signals
     # registry.register(FirstHandExperienceRule())
-    registry.register(ContentFreshnessRule())

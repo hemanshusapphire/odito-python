@@ -66,7 +66,7 @@ class TitleMissingRule(BaseSEORuleV2):
     def evaluate(self, normalized, job_id, project_id, url):
         issues = []
         title = normalized.get("title", "")
-        
+
         if not title or not title.strip():
             issues.append(self.create_issue(
                 job_id, project_id, url,
@@ -74,9 +74,10 @@ class TitleMissingRule(BaseSEORuleV2):
                 "No title content",
                 "Non-empty title tag",
                 data_key="title",
-                data_path="title"
+                data_path="title",
+                before_snapshot={"type": "title", "title": None}
             ))
-        
+
         return issues
 
 
@@ -99,9 +100,10 @@ class MetaDescriptionMissingRule(BaseSEORuleV2):
                 "No meta description content",
                 "Unique meta description",
                 data_key="meta_tags",
-                data_path="meta_tags.description"
+                data_path="meta_tags.description",
+                before_snapshot={"type": "meta_description", "metaDescription": None}
             ))
-        
+
         return issues
 
 
@@ -129,7 +131,8 @@ class TitleTooShortRule(BaseSEORuleV2):
                     "detected_length": title_len,
                     "target_min": 30,
                     "target_max": 60,
-                }
+                },
+                before_snapshot={"type": "title", "title": title.strip(), "length": title_len}
             ))
 
         return issues
@@ -159,7 +162,8 @@ class TitleTooLongRule(BaseSEORuleV2):
                     "detected_length": title_len,
                     "target_min": 30,
                     "target_max": 60,
-                }
+                },
+                before_snapshot={"type": "title", "title": title.strip(), "length": title_len}
             ))
 
         return issues
@@ -213,7 +217,8 @@ class MetaDescriptionTooShortRule(BaseSEORuleV2):
                         "detected_length": desc_length,
                         "target_min": 120,
                         "target_max": 160,
-                    }
+                    },
+                    before_snapshot={"type": "meta_description", "metaDescription": descriptions[0].strip(), "length": desc_length}
                 ))
             # DISABLED: Meta description quality issues check (CTR, power words, CTA)
             # elif desc_length >= 120 and desc_length <= 158 and quality_issues:
@@ -259,7 +264,8 @@ class MetaDescriptionTooLongRule(BaseSEORuleV2):
                         "detected_length": desc_length,
                         "target_min": 120,
                         "target_max": 160,
-                    }
+                    },
+                    before_snapshot={"type": "meta_description", "metaDescription": descriptions[0].strip(), "length": desc_length}
                 ))
 
         return issues
@@ -284,9 +290,10 @@ class H1MissingRule(BaseSEORuleV2):
                 "No H1 content",
                 "Descriptive non-empty H1",
                 data_key="headings",
-                data_path="headings.h1"
+                data_path="headings.h1",
+                before_snapshot={"type": "h1", "h1Count": 0, "h1Text": None}
             ))
-        
+
         return issues
 
 
@@ -314,7 +321,12 @@ class MultipleH1TagsRule(BaseSEORuleV2):
                 "Exactly one H1 tag",
                 data_key="headings",
                 data_path="headings.h1",
-                context={"h1_count": len(non_empty_h1)}
+                context={"h1_count": len(non_empty_h1)},
+                before_snapshot={
+                    "type": "h1",
+                    "h1Count": len(non_empty_h1),
+                    "h1Text": [h1.get("text", "").strip() for h1 in non_empty_h1],
+                }
             ))
         
         return issues

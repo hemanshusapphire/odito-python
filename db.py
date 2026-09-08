@@ -170,6 +170,21 @@ except Exception as e:
     else:
         print(f"⚠️ Failed to create index on seo_page_issues: {e}")
 
+# Phase 3 hardening: odito_backend's TaskVerificationService queries
+# {projectId, status:'open'} on every single verification pass (project
+# recrawl or single-URL re-verification) to determine which Optimization
+# Center tasks are still unresolved — the projectId-only index above leaves
+# the status filter unindexed. This compound index covers that exact query
+# shape (and remains a valid prefix-match for the projectId-only case too).
+try:
+    seo_page_issues.create_index([("projectId", 1), ("status", 1)], name="project_status")
+    print("✅ Created index on seo_page_issues (projectId, status)")
+except Exception as e:
+    if "already exists" in str(e):
+        print("✅ Index on seo_page_issues (projectId, status) already exists")
+    else:
+        print(f"⚠️ Failed to create index on seo_page_issues (projectId, status): {e}")
+
 # Unique index on dedup_key (P0-005) — converts seo_page_issues from
 # insert-only to upsert-capable. dedup_key (P0-003: sha256 of
 # project|url|issue_code|data_path, stamped by both issue factories and

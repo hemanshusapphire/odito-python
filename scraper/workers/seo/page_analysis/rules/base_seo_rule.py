@@ -51,7 +51,7 @@ class BaseSEORuleV2(ABC):
     def create_issue(self, job_id, project_id, url,
                      issue_message, detected_value, expected_value,
                      data_key=None, data_path=None, impact=None, recommendation=None,
-                     context=None):
+                     context=None, before_snapshot=None):
         """Create a standardized issue document with SEO insights.
 
         detected_value must be the RAW detected content (actual text, actual URL,
@@ -67,6 +67,16 @@ class BaseSEORuleV2(ABC):
                    "page_title": "...",
                    "h1_text": "..."
                  }
+
+        before_snapshot: optional dict capturing the actual pre-fix page state
+                 for issue types that support it (title, meta description, h1,
+                 image alt text, canonical) — a structured, typed payload like
+                 {"type": "meta_description", "metaDescription": "Old text..."},
+                 refreshed every re-analysis just like detected_value/context.
+                 Used by the Task fix-history feature to show a real "Before"
+                 value instead of re-deriving one from live data later. Rules
+                 that don't pass this fall back to detected_value/context for
+                 display — leave it unset rather than fabricating a value.
         """
         created_at = datetime.utcnow()
 
@@ -97,6 +107,8 @@ class BaseSEORuleV2(ABC):
             issue["recommendation"] = recommendation
         if context:
             issue["context"] = context
+        if before_snapshot is not None:
+            issue["before_snapshot"] = before_snapshot
 
         return issue
 

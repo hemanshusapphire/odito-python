@@ -73,15 +73,17 @@ class ImagesMissingAltTextRule(BaseSEORuleV2):
         for image in images:
             alt = image.get("alt")
             if alt is None or alt == "":
+                src = image.get("src") or ""
                 issues.append(self.create_issue(
                     job_id, project_id, url,
                     "Images Missing Alt Text",
-                    image.get("src") or "",
+                    src,
                     "Descriptive alt text for all content images",
                     data_key="images",
-                    data_path=f"images.{image.get('src')}.alt"
+                    data_path=f"images.{src}.alt",
+                    before_snapshot={"type": "image_alt", "src": src, "imageUrl": src, "alt": None}
                 ))
-        
+
         return issues
 
 

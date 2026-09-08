@@ -101,7 +101,8 @@ class CanonicalTagErrorsRule(BaseSEORuleV2):
                 "No canonical URL specified",
                 "Self-referencing canonical tag",
                 data_key="canonical",
-                data_path="canonical"
+                data_path="canonical",
+                before_snapshot={"type": "canonical", "canonical": None}
             ))
         # DISABLED: Canonical points to different URL check
         # elif canonical != url:

@@ -14,75 +14,6 @@ def _should_skip_accessibility_rules():
     return os.getenv('DISABLE_ACCESSIBILITY_RULES', '').lower() == 'true'
 
 
-class AltTextAccessibilityRule(BaseSEORuleV2):
-    rule_id = "alt_text_accessibility"
-    rule_no = 111
-    category = "Accessibility"
-    severity = "high"
-    description = "Images missing alt text fail WCAG 1.1.1 — screen readers cannot describe the image"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        if _should_skip_accessibility_rules():
-            return []
-
-        issues = []
-        images = normalized.get("images", [])
-
-        for image in images:
-            alt = image.get("alt")
-            src = image.get("src", "")
-            if alt is None or alt == "":
-                issues.append(self.create_issue(
-                    job_id, project_id, url,
-                    "Images Missing Alt Text",
-                    src,
-                    "Descriptive alt text on every content image",
-                    data_key="images",
-                    data_path=f"images.{src}.alt"
-                ))
-
-        return issues
-
-
-class TextContrastRule(BaseSEORuleV2):
-    rule_id = "text_contrast"
-    rule_no = 112
-    category = "Accessibility"
-    severity = "high"
-    description = "Low contrast fails WCAG 2.2 Level AA — Google and users with visual impairments penalise this"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        if _should_skip_accessibility_rules():
-            return []
-
-        issues = []
-        headless = normalized.get("headless", {})
-        axe_violations = headless.get("axeViolations", [])
-
-        contrast_violations = [
-            v for v in axe_violations
-            if "contrast" in v.get("id", "").lower()
-            or "contrast" in v.get("description", "").lower()
-        ]
-
-        for violation in contrast_violations:
-            nodes = violation.get("nodes", 0)
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"Insufficient colour contrast: {violation.get('description', 'Contrast ratio below WCAG AA threshold')}",
-                f"{nodes} element(s) with contrast ratio below WCAG AA threshold",
-                "Contrast ratio ≥ 4.5:1 for normal text, ≥ 3:1 for large text (WCAG 1.4.3)",
-                data_key="headless",
-                # Per-violation suffix: multiple axe violations in one loop
-                # sharing a bare "axeViolations" path would collide to one
-                # dedup_key (P0-003) and all but one finding would be lost
-                # under dedup_key-keyed upserts. axe ids are unique per page.
-                data_path=f"axeViolations.{violation.get('id', 'unknown')}"
-            ))
-
-        return issues
-
-
 class FormLabelsRule(BaseSEORuleV2):
     rule_id = "form_labels"
     rule_no = 113
@@ -363,8 +294,8 @@ class TapTargetSizeRule(BaseSEORuleV2):
 
 def register_accessibility_rules(registry):
     """Register all accessibility rules with the registry."""
-    registry.register(AltTextAccessibilityRule())    # 111
-    registry.register(TextContrastRule())             # 112
+    # REMOVED: Images Missing Alt Text (alt_text_accessibility, rule_no 111)
+    # REMOVED: Insufficient colour contrast (text_contrast, rule_no 112)
     registry.register(FormLabelsRule())               # 113
     registry.register(KeyboardAccessibilityRule())    # 114
     registry.register(FocusIndicatorsRule())          # 115
