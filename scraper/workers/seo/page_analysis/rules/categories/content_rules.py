@@ -415,41 +415,6 @@ class ThinContentRule(BaseSEORuleV2):
         return issues
 
 
-class KeywordNotInTitleRule(BaseSEORuleV2):
-    rule_id = "keyword_not_in_title"
-    rule_no = 39
-    category = "Content"
-    severity = "high"
-    description = "Missing primary keyword in title is a fundamental ranking signal failure"
-    excluded_page_types = ['contact', 'privacy', 'terms', 'login']  # Exclude utility pages
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        issues = []
-        
-        # This requires target keyword knowledge
-        # For implementation, we'd need the target keyword for this page
-        # Simplified implementation would check if H1 content appears in title
-        
-        title = normalized.get("title", "").lower()
-        headings = normalized.get("headings", [])
-        h1_tags = [h for h in headings if h.get("tag") == "h1"]
-        
-        if h1_tags:
-            h1_text = h1_tags[0].get("text", "").lower()
-            # Simple check: if H1 has substantial content, should appear in title
-            if len(h1_text.split()) > 2 and h1_text not in title:
-                issues.append(self.create_issue(
-                    job_id, project_id, url,
-                    "Primary topic from H1 not found in title",
-                    f"H1: '{h1_text}' not in title: '{title}'",
-                    "Primary keyword present in title",
-                    data_key="title",
-                    data_path="title"
-                ))
-        
-        return issues
-
-
 class KeywordNotInH1Rule(BaseSEORuleV2):
     rule_id = "keyword_not_in_h1"
     rule_no = 40
@@ -565,6 +530,5 @@ def register_content_rules(registry):
     registry.register(MultipleH1TagsRule())
     registry.register(HeadingHierarchySkippedRule())
     registry.register(ThinContentRule())
-    registry.register(KeywordNotInTitleRule())
     registry.register(KeywordNotInH1Rule())
     registry.register(DuplicateContentRule())

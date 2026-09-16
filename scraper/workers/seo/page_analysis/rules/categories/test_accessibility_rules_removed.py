@@ -125,7 +125,7 @@ class SurvivingRulesStillWork(unittest.TestCase):
 
 
 class EnginePipelineUnaffected(unittest.TestCase):
-    def test_full_engine_builds_and_summary_count_is_69(self):
+    def test_full_engine_builds_and_summary_count_is_68(self):
         from scraper.workers.seo.page_analysis.rules.seo_rule_engine import SEORuleEngine
         engine = SEORuleEngine(_build_registry())
         normalized = {
@@ -136,7 +136,7 @@ class EnginePipelineUnaffected(unittest.TestCase):
             "links": [], "internal_links": [], "external_links": [],
         }
         result = engine.analyze_page(normalized, JOB_ID, PROJECT_ID, URL)
-        self.assertEqual(result["summary"]["total_rules"], 69)
+        self.assertEqual(result["summary"]["total_rules"], 68)
         all_items = result["issues"] + result["recommendations"]
         rule_ids = {i.get("rule_id") for i in all_items}
         self.assertNotIn("alt_text_accessibility", rule_ids)

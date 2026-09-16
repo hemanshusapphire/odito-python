@@ -65,18 +65,11 @@ class titlePixelLengthRule(BaseSEORuleV2):
                 impact="Mobile titles over 500px get severely truncated, significantly reducing mobile search CTR.",
                 recommendation="Shorten title to under 500px (~62 characters) for optimal mobile search display."
             ))
-        elif mobile_status == "WARNING":
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"Title approaching mobile limit ({title_pixel_width}px > 400px) - may get truncated on mobile",
-                f"Mobile title width: {title_pixel_width}px",
-                "Title width ≤ 400px",
-                data_key="title_pixel_width",
-                data_path="title_pixel_width.mobile",
-                impact="Mobile titles over 400px risk truncation on smaller mobile screens, affecting user experience.",
-                recommendation="Aim for under 400px (~50 characters) for best mobile search performance."
-            ))
-        
+        # Mobile WARNING tier ("Title approaching mobile limit... may get
+        # truncated on mobile") removed — too noisy/false-positive-prone in
+        # practice. FAIL tiers (actual truncation, desktop or mobile) and the
+        # desktop WARNING tier are unaffected.
+
         return issues
 
 
