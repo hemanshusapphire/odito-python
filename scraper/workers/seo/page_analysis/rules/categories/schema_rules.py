@@ -205,30 +205,44 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                 org_schema = schema
 
         # ── Report missing schema ────────────────────────────────────────────
+        # A full Organization schema satisfies this check on every applicable
+        # page type, including contact/location. LocalBusiness is a stronger
+        # entity type (it adds address/telephone/geo/openingHours on top of
+        # Organization) and is still the better choice for a business that has
+        # a physical, customer-facing location — but requiring LocalBusiness
+        # specifically, with no Organization-only path, incorrectly forces
+        # physical-location data onto every contact/location page even for
+        # businesses that don't have one (e.g. a SaaS company's /contact page).
+        # `address` is already checked as a "recommended field" below for
+        # whichever entity type is present, so a contact/location page with
+        # Organization but no street address still gets that softer,
+        # lower-priority nudge instead of a hard failure duplicating the same
+        # gap under two different issue messages.
         requires_localbusiness = page_type in _LOCALBUSINESS_REQUIRED
 
-        if requires_localbusiness and not has_localbusiness:
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                "Missing LocalBusiness schema",
-                "No LocalBusiness schema found",
-                "LocalBusiness JSON-LD with name, url, address, telephone, geo, openingHours",
-                data_key="structured_data",
-                data_path="structured_data.localbusiness",
-                impact="Missing LocalBusiness schema prevents Knowledge Graph and Maps from identifying your physical location.",
-                recommendation="Add LocalBusiness schema with address, telephone, openingHours, and geo coordinates."
-            ))
-        elif not requires_localbusiness and not has_organization:
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                "Missing Organization or LocalBusiness schema",
-                "No entity schema found",
-                "Organization or LocalBusiness JSON-LD with name, url, logo, sameAs, address",
-                data_key="structured_data",
-                data_path="structured_data.organization",
-                impact="Missing entity schema prevents AI and Knowledge Graph from properly identifying your brand, limiting entity recognition and authority building.",
-                recommendation="Add Organization schema with required fields: name, url, logo, sameAs (social profiles), and address for local businesses."
-            ))
+        if not has_organization:
+            if requires_localbusiness:
+                issues.append(self.create_issue(
+                    job_id, project_id, url,
+                    "Missing Organization or LocalBusiness schema",
+                    "No entity schema found",
+                    "Organization or LocalBusiness JSON-LD with name, url, logo, sameAs (address, telephone, geo, openingHours recommended if this is a physical-location business)",
+                    data_key="structured_data",
+                    data_path="structured_data.localbusiness",
+                    impact="Missing entity schema prevents Knowledge Graph and Maps from identifying your brand or physical location.",
+                    recommendation="Add Organization schema (or LocalBusiness with address, telephone, openingHours, and geo coordinates if you have a physical location)."
+                ))
+            else:
+                issues.append(self.create_issue(
+                    job_id, project_id, url,
+                    "Missing Organization or LocalBusiness schema",
+                    "No entity schema found",
+                    "Organization or LocalBusiness JSON-LD with name, url, logo, sameAs, address",
+                    data_key="structured_data",
+                    data_path="structured_data.organization",
+                    impact="Missing entity schema prevents AI and Knowledge Graph from properly identifying your brand, limiting entity recognition and authority building.",
+                    recommendation="Add Organization schema with required fields: name, url, logo, sameAs (social profiles), and address for local businesses."
+                ))
 
         # ── Validate completeness of existing schema ─────────────────────────
         if org_schema:
