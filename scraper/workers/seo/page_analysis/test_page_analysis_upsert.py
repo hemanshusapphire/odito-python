@@ -41,6 +41,7 @@ _stub_module(
 from scraper.workers.seo.page_analysis.page_analysis import (  # noqa: E402
     upsert_issues,
     LIFECYCLE_INSERT_ONLY_FIELDS,
+    issues_to_persist,
 )
 from scraper.workers.seo.page_analysis.rules.issue_identity import compute_dedup_key  # noqa: E402
 
@@ -126,6 +127,51 @@ class InMemoryCollection:
 
 def _bulk_error(write_errors):
     return BulkWriteError({"writeErrors": write_errors})
+
+
+class TestIssuesToPersistIncludesRecommendations(unittest.TestCase):
+    """Regression: SEORuleEngine.analyze_page() splits findings into
+    "issues" (severity high/medium) and "recommendations" (severity
+    low/info) purely for coverage bookkeeping — both are real findings a
+    rule created via create_issue() and both must reach seo_page_issues.
+
+    Concretely triggered by OrganizationSchemaRule's recommended-fields
+    branch: correcting its severity from "high" to "low" made the engine
+    route it into "recommendations", and the caller previously only ever
+    read page_result["issues"] — so the finding silently stopped being
+    persisted even though the rule was still creating it every run.
+    """
+
+    def test_merges_issues_and_recommendations(self):
+        page_result = {
+            "issues": [_issue(code="TITLE_MISSING")],
+            "recommendations": [_issue(code="organization_schema", extra_field="low-severity-finding")],
+        }
+        merged = issues_to_persist(page_result)
+        self.assertEqual(len(merged), 2)
+        codes = [i["issue_code"] for i in merged]
+        self.assertIn("TITLE_MISSING", codes)
+        self.assertIn("organization_schema", codes)
+
+    def test_low_severity_only_finding_is_not_dropped(self):
+        # The exact regression shape: a rule fires ONLY a low-severity
+        # recommendation (no high/medium issue alongside it) — e.g. a valid
+        # Organization schema missing just the recommended `address` field.
+        page_result = {"issues": [], "recommendations": [_issue(code="organization_schema")]}
+        merged = issues_to_persist(page_result)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["issue_code"], "organization_schema")
+
+    def test_missing_recommendations_key_does_not_error(self):
+        # Early-exit paths in analyze_page_seo() (normalization failure,
+        # incomplete document) return {"issues": [], "summary": {...}} with
+        # no "recommendations" key at all.
+        page_result = {"issues": [_issue()], "summary": {"skipped": True}}
+        merged = issues_to_persist(page_result)
+        self.assertEqual(len(merged), 1)
+
+    def test_empty_result_returns_empty_list(self):
+        self.assertEqual(issues_to_persist({}), [])
 
 
 class TestOpConstruction(unittest.TestCase):

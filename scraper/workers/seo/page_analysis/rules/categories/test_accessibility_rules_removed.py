@@ -125,7 +125,7 @@ class SurvivingRulesStillWork(unittest.TestCase):
 
 
 class EnginePipelineUnaffected(unittest.TestCase):
-    def test_full_engine_builds_and_summary_count_is_68(self):
+    def test_full_engine_builds_and_summary_count_is_64(self):
         from scraper.workers.seo.page_analysis.rules.seo_rule_engine import SEORuleEngine
         engine = SEORuleEngine(_build_registry())
         normalized = {
@@ -136,7 +136,13 @@ class EnginePipelineUnaffected(unittest.TestCase):
             "links": [], "internal_links": [], "external_links": [],
         }
         result = engine.analyze_page(normalized, JOB_ID, PROJECT_ID, URL)
-        self.assertEqual(result["summary"]["total_rules"], 68)
+        # Total: 68 -> 67 when title_pixel_length was removed entirely, then
+        # 67 -> 64 when the three Social Tags rules (og_tags_missing,
+        # og_tags_incomplete, twitter_card_tags_missing) were disabled — see
+        # test_content_and_enhancement_rules_removed.py and
+        # test_social_rules_removed.py. Unrelated to this file's
+        # accessibility-rule removal.
+        self.assertEqual(result["summary"]["total_rules"], 64)
         all_items = result["issues"] + result["recommendations"]
         rule_ids = {i.get("rule_id") for i in all_items}
         self.assertNotIn("alt_text_accessibility", rule_ids)

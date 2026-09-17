@@ -106,6 +106,9 @@ class TwitterCardTagsMissingRule(BaseSEORuleV2):
 
 def register_social_rules(registry):
     """Register all social tag rules with the registry."""
-    registry.register(OgTagsMissingRule())
-    registry.register(OgTagsIncompleteRule())
-    registry.register(TwitterCardTagsMissingRule())
+    # DISABLED: Open Graph tags missing entirely
+    # registry.register(OgTagsMissingRule())
+    # DISABLED: Open Graph tags present but empty
+    # registry.register(OgTagsIncompleteRule())
+    # DISABLED: Twitter Card tags missing
+    # registry.register(TwitterCardTagsMissingRule())

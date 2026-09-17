@@ -30,11 +30,13 @@ URL = "https://example.com/blog/post"
 
 # The rule set registered by register_all_seo_categories() after removing
 # ContentFreshnessRule (this task), the two accessibility rules
-# alt_text_accessibility + text_contrast, and, subsequently,
-# keyword_not_in_title (see test_content_and_enhancement_rules_removed.py).
+# alt_text_accessibility + text_contrast, keyword_not_in_title AND
+# title_pixel_length (see test_content_and_enhancement_rules_removed.py),
+# and og_tags_missing/og_tags_incomplete/twitter_card_tags_missing (see
+# test_social_rules_removed.py).
 # Kept explicit so an accidental re-registration (or an unrelated rule being
 # dropped) trips this test.
-EXPECTED_TOTAL_RULES = 68
+EXPECTED_TOTAL_RULES = 64
 EXPECTED_EEAT_RULES = ["author_name_bio", "author_photo", "person_schema_linked", "privacy_terms_pages"]
 
 

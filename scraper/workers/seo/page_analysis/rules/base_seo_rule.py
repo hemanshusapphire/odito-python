@@ -51,8 +51,19 @@ class BaseSEORuleV2(ABC):
     def create_issue(self, job_id, project_id, url,
                      issue_message, detected_value, expected_value,
                      data_key=None, data_path=None, impact=None, recommendation=None,
-                     context=None, before_snapshot=None):
+                     context=None, before_snapshot=None, severity=None):
         """Create a standardized issue document with SEO insights.
+
+        severity: optional per-call override of self.severity. Most rules emit
+                 one finding type and should leave this unset (falls back to
+                 the class-level self.severity, unchanged). Rules whose
+                 evaluate() can emit multiple distinct finding types at
+                 different severities (e.g. "entity schema entirely missing"
+                 vs "entity schema present but missing a recommended field")
+                 should pass the correct severity explicitly here rather than
+                 mutating self.severity — that keeps each create_issue() call
+                 self-contained and avoids one branch's severity leaking into
+                 another if a future edit reorders or adds branches.
 
         detected_value must be the RAW detected content (actual text, actual URL,
         actual number) — NEVER a diagnostic message string like
@@ -86,7 +97,7 @@ class BaseSEORuleV2(ABC):
             "page_url": url,
             "rule_no": self.rule_no,
             "category": self.category,
-            "severity": self.severity,
+            "severity": severity if severity is not None else self.severity,
             "issue_code": self.rule_id,
             "rule_id": self.rule_id,
             "issue_message": issue_message,

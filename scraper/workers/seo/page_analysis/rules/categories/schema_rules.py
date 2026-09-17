@@ -217,7 +217,11 @@ class OrganizationSchemaRule(BaseSEORuleV2):
         # whichever entity type is present, so a contact/location page with
         # Organization but no street address still gets that softer,
         # lower-priority nudge instead of a hard failure duplicating the same
-        # gap under two different issue messages.
+        # gap under two different issue messages. That severity split is
+        # enforced explicitly below (severity="high" for real absence and for
+        # missing required fields, severity="low" for the recommended-fields
+        # nudge) rather than relying on the class-level self.severity, since
+        # this rule emits three genuinely different-severity finding types.
         requires_localbusiness = page_type in _LOCALBUSINESS_REQUIRED
 
         if not has_organization:
@@ -230,7 +234,8 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                     data_key="structured_data",
                     data_path="structured_data.localbusiness",
                     impact="Missing entity schema prevents Knowledge Graph and Maps from identifying your brand or physical location.",
-                    recommendation="Add Organization schema (or LocalBusiness with address, telephone, openingHours, and geo coordinates if you have a physical location)."
+                    recommendation="Add Organization schema (or LocalBusiness with address, telephone, openingHours, and geo coordinates if you have a physical location).",
+                    severity="high",
                 ))
             else:
                 issues.append(self.create_issue(
@@ -241,7 +246,8 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                     data_key="structured_data",
                     data_path="structured_data.organization",
                     impact="Missing entity schema prevents AI and Knowledge Graph from properly identifying your brand, limiting entity recognition and authority building.",
-                    recommendation="Add Organization schema with required fields: name, url, logo, sameAs (social profiles), and address for local businesses."
+                    recommendation="Add Organization schema with required fields: name, url, logo, sameAs (social profiles), and address for local businesses.",
+                    severity="high",
                 ))
 
         # ── Validate completeness of existing schema ─────────────────────────
@@ -260,7 +266,8 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                     data_key="structured_data",
                     data_path="structured_data.organization.missing_fields",
                     impact="Incomplete Organization schema reduces entity recognition and Knowledge Graph building effectiveness.",
-                    recommendation="Add missing required fields to Organization schema for proper entity identification."
+                    recommendation="Add missing required fields to Organization schema for proper entity identification.",
+                    severity="high",
                 ))
 
             # sameAs is intentionally excluded here — SameAsArrayRule owns that check.
@@ -276,7 +283,12 @@ class OrganizationSchemaRule(BaseSEORuleV2):
                     data_key="structured_data",
                     data_path="structured_data.organization.incomplete",
                     impact="Missing recommended fields weakens AI entity recognition and Knowledge Graph completeness.",
-                    recommendation="Add logo and address information for comprehensive entity representation."
+                    recommendation="Add logo and address information for comprehensive entity representation.",
+                    # Soft/informational — Organization schema itself is valid and
+                    # present; this is a nudge, not a failure. Must NOT inherit the
+                    # rule's class-level severity="high" (that's for real absence /
+                    # missing required fields only).
+                    severity="low",
                 ))
 
         return issues

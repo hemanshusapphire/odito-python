@@ -320,7 +320,7 @@ def execute_page_analysis_logic(job):
                 )
 
                 # Extract issues and summary from new engine return format
-                page_issues = page_result.get("issues", [])
+                page_issues = issues_to_persist(page_result)
                 page_summary = page_result.get("summary", {})
 
                 # Create summary document for storage
@@ -884,6 +884,33 @@ def _is_document_complete(normalized):
     if len(missing) >= 3:  # if 3+ core fields missing, skip this page
         return False
     return True
+
+
+def issues_to_persist(page_result):
+    """Every finding from a page_result that must be written to
+    seo_page_issues, regardless of severity tier.
+
+    SEORuleEngine.analyze_page() splits a rule's findings into "issues"
+    (severity high/medium) and "recommendations" (severity low/info) purely
+    for the coverage summary's bookkeeping — see analyze_page() in
+    seo_rule_engine.py. That split is NOT a signal that recommendations
+    aren't real findings; every document in both lists was built by the same
+    create_issue() factory and has the full P0-003 lifecycle identity
+    (dedup_key, status, etc.) already stamped on it.
+
+    Before this function existed, the caller below only read
+    page_result["issues"], so any rule whose finding used severity="low"/
+    "info" — whether via the rule's class-level severity or a per-call
+    create_issue(severity=...) override — silently never reached
+    seo_page_issues at all. Confirmed pre-existing for og_tags_missing,
+    og_tags_incomplete, twitter_card_tags_missing, and
+    low_code_to_html_ratio's low-severity branch: zero documents for any of
+    them across the whole database. Surfaced concretely when
+    OrganizationSchemaRule's recommended-fields-missing finding was
+    corrected from severity="high" to "low" and promptly vanished from the
+    On-Page Issues list even though the rule was still creating it.
+    """
+    return page_result.get("issues", []) + page_result.get("recommendations", [])
 
 
 def analyze_page_seo(page, job_id, project_id,

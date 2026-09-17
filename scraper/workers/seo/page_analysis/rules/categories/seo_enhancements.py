@@ -1,76 +1,13 @@
 """
-SEO Enhancement Rules (S1-S6)
+SEO Enhancement Rules (S3-S6)
 Advanced SEO optimization rules for enhanced analysis.
+
+S1/S2 (title pixel-length, desktop/mobile) removed — see
+categories/test_content_and_enhancement_rules_removed.py for the
+regression coverage locking that removal in.
 """
 
 from ..base_seo_rule import BaseSEORuleV2
-
-
-class titlePixelLengthRule(BaseSEORuleV2):
-    """S1/S2 - Title pixel length analysis for desktop and mobile optimization."""
-    rule_id = "title_pixel_length"
-    rule_no = 30
-    category = "SEO Enhancements"
-    severity = "medium"
-    description = "Title pixel length affects display and CTR in search results"
-
-    def evaluate(self, normalized, job_id, project_id, url):
-        issues = []
-        title_pixel_width = normalized.get("title_pixel_width", 0)
-        desktop_status = normalized.get("desktop_status", "PASS")
-        mobile_status = normalized.get("mobile_status", "PASS")
-        
-        # Check desktop status (≤600px optimal)
-        #
-        # data_path is suffixed .desktop/.mobile because BOTH device checks can
-        # fire on the same page as two distinct findings — with a shared
-        # data_path they would collide to one dedup_key (P0-003 identity:
-        # project+url+issue_code+data_path) and the second finding would be
-        # silently lost under dedup_key-keyed upserts. The Node
-        # DataPathResolver's PAGE_DATA_ALIASES maps both suffixed paths back
-        # to the real title_pixel_width field, so downstream resolution is
-        # unchanged.
-        if desktop_status == "FAIL":
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"Title too long for desktop ({title_pixel_width}px > 600px) - gets truncated in search results",
-                f"Desktop title width: {title_pixel_width}px",
-                "Title width ≤ 600px",
-                data_key="title_pixel_width",
-                data_path="title_pixel_width.desktop",
-                impact="Titles longer than 600px get truncated in desktop search results, reducing CTR and brand visibility.",
-                recommendation="Shorten title to under 600px (~75 characters). Focus on primary keywords and brand name."
-            ))
-        elif desktop_status == "WARNING":
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"Title approaching desktop limit ({title_pixel_width}px > 500px) - may get truncated",
-                f"Desktop title width: {title_pixel_width}px",
-                "Title width ≤ 500px",
-                data_key="title_pixel_width",
-                data_path="title_pixel_width.desktop",
-                impact="Titles over 500px risk truncation on some desktop displays, potentially reducing click-through rates.",
-                recommendation="Consider shortening title to under 500px (~62 characters) for optimal desktop display."
-            ))
-
-        # Check mobile status (≤500px optimal)
-        if mobile_status == "FAIL":
-            issues.append(self.create_issue(
-                job_id, project_id, url,
-                f"Title too long for mobile ({title_pixel_width}px > 500px) - gets truncated in mobile search",
-                f"Mobile title width: {title_pixel_width}px",
-                "Title width ≤ 500px",
-                data_key="title_pixel_width",
-                data_path="title_pixel_width.mobile",
-                impact="Mobile titles over 500px get severely truncated, significantly reducing mobile search CTR.",
-                recommendation="Shorten title to under 500px (~62 characters) for optimal mobile search display."
-            ))
-        # Mobile WARNING tier ("Title approaching mobile limit... may get
-        # truncated on mobile") removed — too noisy/false-positive-prone in
-        # practice. FAIL tiers (actual truncation, desktop or mobile) and the
-        # desktop WARNING tier are unaffected.
-
-        return issues
 
 
 class metaDescriptionCtrRule(BaseSEORuleV2):
@@ -270,7 +207,6 @@ class anchorTextDiversityRule(BaseSEORuleV2):
 
 def register_seo_enhancement_rules(registry):
     """Register all SEO enhancement rules with the registry."""
-    registry.register(titlePixelLengthRule())
     # DISABLED: Meta description CTR optimization issues
     # registry.register(metaDescriptionCtrRule())
     # DISABLED: Low image alt text quality
