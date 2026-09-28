@@ -598,7 +598,14 @@ class FaqSchemaRule(BaseSEORuleV2):
                 data_key="faq_schema_present",
                 data_path="faq_schema_present",
                 impact="Missing FAQ schema markup loses rich result opportunities in SERPs and AI-powered answer boxes, reducing visibility and click-through rates.",
-                recommendation="Add FAQPage schema markup to your FAQ content. Include question-answer pairs in proper JSON-LD format to enable rich snippets and improve AI search visibility."
+                recommendation="Add FAQPage schema markup to your FAQ content. Include question-answer pairs in proper JSON-LD format to enable rich snippets and improve AI search visibility.",
+                # The full pairs live on seo_page_data.faq_howto_signals.faq_pairs
+                # (read by the backend's issue-context layer); only the counts are
+                # duplicated here so the issue row itself stays small.
+                context={
+                    "faq_pair_count": faq_howto.get("faq_pair_count", 0),
+                    "faq_pairs_extracted": bool(faq_howto.get("faq_pairs_extracted", False)),
+                },
             ))
 
         return issues

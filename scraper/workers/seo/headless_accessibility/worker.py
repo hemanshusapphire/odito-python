@@ -29,8 +29,11 @@ from scraper.shared.perf_tracker import PerformanceTracker, WorkerTimingContext
 from scraper.shared.dom_stability import (
     wait_for_dom_stable,
     wait_for_critical_hydration,
-    detect_tabbable_elements,
     setup_resource_blocking,
+)
+from scraper.workers.seo.headless_accessibility.keyboard_audit import (
+    AUDIT_BUDGET_S,
+    run_keyboard_audit,
 )
 
 
@@ -125,9 +128,9 @@ AXE_RUN_SCRIPT = """
                     helpUrl: v.helpUrl,
                     nodes: v.nodes.length,
                     tags: v.tags,
-                    nodeDetails: v.nodes.slice(0, 5).map(n => ({
-                        target: n.target || [],
-                        html: n.html || ''
+                    nodeDetails: v.nodes.slice(0, 10).map(n => ({
+                        target: (n.target || []).map(t => (typeof t === 'string' ? t : JSON.stringify(t)).slice(0, 200)),
+                        html: (n.html || '').slice(0, 300)
                     }))
                 })),
                 violationCount: results.violations.length,
@@ -169,43 +172,6 @@ DOM_METRICS_SCRIPT = """
 """
 
 
-# ---------------------------------------------------------------------------
-# Feature 4 — Keyboard Accessibility (Rules 227-242)
-# JS script to collect focus state AFTER a real Playwright Tab press
-# ---------------------------------------------------------------------------
-KEYBOARD_FOCUS_COLLECTOR = """
-() => {
-    const el = document.activeElement;
-    if (!el || el === document.body) {
-        return { tag: 'body', focused: false };
-    }
-    const rect = el.getBoundingClientRect();
-    const styles = window.getComputedStyle(el);
-    
-    // Generate CSS selector for element reference
-    let selector = el.tagName.toLowerCase();
-    if (el.id) {
-        selector += '#' + el.id;
-    } else if (el.className && typeof el.className === 'string' && el.className) {
-        selector += '.' + el.className.split(' ').filter(c => c).join('.');
-    }
-    
-    return {
-        tag: el.tagName.toLowerCase(),
-        id: el.id || '',
-        className: (el.className && typeof el.className === 'string') ? el.className.substring(0, 100) : '',
-        selector: selector,
-        focused: true,
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
-        outlineStyle: styles.outlineStyle || 'none',
-        outlineWidth: styles.outlineWidth || '0px',
-        outlineColor: styles.outlineColor || ''
-    };
-}
-"""
-
-
 META_VIEWPORT_SCRIPT = """
 () => {
     const viewportMeta = document.querySelector('meta[name="viewport"]');
@@ -214,99 +180,6 @@ META_VIEWPORT_SCRIPT = """
     };
 }
 """
-
-
-async def _simulate_keyboard_navigation(page) -> dict:
-    """
-    HYBRID keyboard accessibility simulation.
-
-    Phase 1: Detect all focusable elements via JS (instant, no key presses).
-    Phase 2: Simulate min(detected_count, 10) Tab presses with Playwright's
-             native keyboard API for real focus behavior verification.
-
-    Detects:
-      - Focus traps (same element focused >= 3 consecutive times)
-      - Small click targets (width or height < 24px)
-      - Missing focus outline (outline-style is 'none' or outline-width is '0px')
-      - Unreachable elements (focus never moves from body)
-    """
-    # Phase 1: JS-based tabbable element detection
-    try:
-        tabbable_info = await detect_tabbable_elements(page)
-        detected_count = tabbable_info.get("visible_focusable", 0)
-    except Exception:
-        tabbable_info = {"visible_focusable": 0, "elements": []}
-        detected_count = 0
-
-    # Phase 2: Strategic Tab simulation — min(detected, 10) presses
-    TAB_COUNT = min(max(detected_count, 5), 10)  # At least 5, at most 10
-    focus_order = []
-    small_click_targets = 0
-    small_click_targets_list = []
-    missing_focus_outline = 0
-    focus_trap_detected = False
-    unreachable_count = 0
-
-    for i in range(TAB_COUNT):
-        await page.keyboard.press("Tab")
-        await page.wait_for_timeout(50)  # 50ms focus settle (down from 100ms)
-
-        try:
-            focus_info = await page.evaluate(KEYBOARD_FOCUS_COLLECTOR)
-        except Exception:
-            focus_info = {"tag": "unknown", "focused": False}
-
-        focus_order.append(focus_info)
-
-        if not focus_info.get("focused", False):
-            unreachable_count += 1
-            continue
-
-        # Check small click target
-        w = focus_info.get("width", 0)
-        h = focus_info.get("height", 0)
-        if (w > 0 and w < 24) or (h > 0 and h < 24):
-            small_click_targets += 1
-            small_click_targets_list.append({
-                "selector": focus_info.get("selector", ""),
-                "width": w,
-                "height": h
-            })
-
-        # Check missing focus outline
-        outline_style = focus_info.get("outlineStyle", "none")
-        outline_width = focus_info.get("outlineWidth", "0px")
-        if outline_style == "none" or outline_width == "0px":
-            missing_focus_outline += 1
-
-    # Detect focus trap: same element focused >= 3 consecutive times
-    if len(focus_order) >= 3:
-        consecutive = 1
-        for i in range(1, len(focus_order)):
-            prev_id = (focus_order[i - 1].get("tag", "") + focus_order[i - 1].get("id", ""))
-            curr_id = (focus_order[i].get("tag", "") + focus_order[i].get("id", ""))
-            if prev_id == curr_id and focus_order[i].get("focused", False):
-                consecutive += 1
-                if consecutive >= 3:
-                    focus_trap_detected = True
-                    break
-            else:
-                consecutive = 1
-
-    return {
-        "keyboard_navigation_checked": True,
-        "focus_trap_detected": focus_trap_detected,
-        "unreachable_elements": unreachable_count,
-        "small_click_targets": small_click_targets,
-        "small_click_targets_list": small_click_targets_list,
-        "missing_focus_outline": missing_focus_outline,
-        "total_tab_presses": TAB_COUNT,
-        "detected_focusable_elements": detected_count,
-        "focus_order": [
-            {"tag": f.get("tag"), "id": f.get("id", ""), "selector": f.get("selector", "")}
-            for f in focus_order if f.get("focused", False)
-        ]
-    }
 
 
 async def _scan_single_url(browser, url, semaphore, perf_ctx=None, timeout_ms=30000):
@@ -442,14 +315,16 @@ async def _scan_single_url(browser, url, semaphore, perf_ctx=None, timeout_ms=30
                 with tracker.stage("keyboard_navigation"):
                     try:
                         keyboard_result = await asyncio.wait_for(
-                            _simulate_keyboard_navigation(page),
-                            timeout=15  # Down from 30s — fewer tabs now
+                            # v2 audit (keyboard_audit.py): full Tab traversal that records the
+                            # exact elements, computed-style focus diffs and trap analysis.
+                            run_keyboard_audit(page),
+                            timeout=AUDIT_BUDGET_S + 15
                         )
                         result["keyboard_analysis"] = keyboard_result
                     except asyncio.TimeoutError:
                         result["keyboard_analysis"] = {
                             "keyboard_navigation_checked": False,
-                            "error": "Keyboard navigation timeout (15s)"
+                            "error": f"Keyboard navigation timeout ({int(AUDIT_BUDGET_S + 15)}s)"
                         }
                     except Exception as kb_err:
                         result["keyboard_analysis"] = {

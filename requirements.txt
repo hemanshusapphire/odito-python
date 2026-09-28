@@ -10,3 +10,5 @@ pymongo
 pydantic
 webdriver-manager
 playwright
+cryptography
+certifi

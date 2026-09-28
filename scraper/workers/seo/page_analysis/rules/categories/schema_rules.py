@@ -639,7 +639,14 @@ class AggregateRatingSchemaRule(BaseSEORuleV2):
                 data_key="structured_data",
                 data_path="structured_data.aggregate_rating",
                 impact="Missing AggregateRating schema prevents star ratings from appearing in search results, reducing CTR and trust signals.",
-                recommendation="Add AggregateRating schema with ratingValue, reviewCount, and bestRating fields to enable star rich snippets in search results."
+                recommendation="Add AggregateRating schema with ratingValue, reviewCount, and bestRating fields to enable star rich snippets in search results.",
+                # The verified rating figures live on seo_page_data.rating_signals
+                # (read by the backend's issue-context layer); only counts are
+                # duplicated here so the issue row stays small.
+                context={
+                    "rating_candidate_count": (normalized.get("rating_signals") or {}).get("rating_candidate_count", 0),
+                    "rating_extracted": bool((normalized.get("rating_signals") or {}).get("rating_extracted", False)),
+                },
             ))
 
         return issues

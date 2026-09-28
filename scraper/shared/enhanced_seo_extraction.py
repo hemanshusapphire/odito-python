@@ -20,6 +20,9 @@ from typing import Dict, List, Any, Optional, Tuple
 from bs4 import BeautifulSoup, Tag
 from urllib.parse import urlparse
 
+from .faq_pair_extraction import extract_faq_pairs
+from .rating_extraction import extract_rating_signals
+
 
 # ---------------------------------------------------------------------------
 # 6) Author Info Signals
@@ -544,6 +547,18 @@ def extract_faq_howto_signals(soup: BeautifulSoup, json_ld_entries=None) -> Dict
                         'item_count': len(faq_items)
                     })
 
+        # Full visible Q/A pairs (complete question + answer text) — the ONLY
+        # source the backend uses to build FAQPage JSON-LD. Kept separate from
+        # the truncated-preview heuristics above; a failure here must never
+        # break the existing counters, so it is isolated in its own try.
+        try:
+            faq_pair_result = extract_faq_pairs(soup)
+            faq_pairs = faq_pair_result['pairs']
+            faq_pairs_extracted = True
+        except Exception:
+            faq_pairs = []
+            faq_pairs_extracted = False
+
         return {
             'faq_schema_present': len(faq_schema) > 0,
             'faq_schema_count': len(faq_schema),
@@ -556,7 +571,14 @@ def extract_faq_howto_signals(soup: BeautifulSoup, json_ld_entries=None) -> Dict
             'step_patterns': step_patterns,
             'step_pattern_count': len(step_patterns),
             'faq_sections': faq_sections,
-            'faq_section_count': len(faq_sections)
+            'faq_section_count': len(faq_sections),
+            # faq_pairs_extracted=False (or the key missing entirely on
+            # documents crawled before this field existed) means "extraction
+            # never ran / errored", which the backend must not confuse with
+            # "ran and found nothing".
+            'faq_pairs': faq_pairs,
+            'faq_pair_count': len(faq_pairs),
+            'faq_pairs_extracted': faq_pairs_extracted
         }
 
     except Exception as e:
@@ -842,6 +864,22 @@ def extract_breadcrumb_schema_signals(soup: BeautifulSoup, json_ld_entries=None)
 # Main Integration Function
 # ---------------------------------------------------------------------------
 
+def _extract_rating_signals_safe(soup: BeautifulSoup) -> Dict[str, Any]:
+    """
+    Visible rating figures (see rating_extraction.py). Isolated so a failure can
+    never break the other signals. rating_extracted=False (or the key missing on
+    documents crawled before this existed) means "never ran", which the backend
+    must not confuse with "ran and found nothing".
+    """
+    try:
+        signals = extract_rating_signals(soup)
+        signals['rating_extracted'] = True
+        return signals
+    except Exception as e:
+        return {'rating_extracted': False, 'rating_candidates': [], 'rating_candidate_count': 0,
+                'microdata_aggregate_rating': None, 'error': str(e)}
+
+
 def extract_enhanced_seo_signals(
     soup: BeautifulSoup,
     html: str,
@@ -868,6 +906,7 @@ def extract_enhanced_seo_signals(
             'last_updated_signals':     extract_last_updated_signals(soup, html, json_ld_entries),
             'schema_format_signals':    extract_schema_format_signals(soup, json_ld_entries),
             'faq_howto_signals':        extract_faq_howto_signals(soup, json_ld_entries),
+            'rating_signals':           _extract_rating_signals_safe(soup),
             'breadcrumb_dom_signals':   extract_breadcrumb_dom_signals(soup),
             'breadcrumb_schema_signals': extract_breadcrumb_schema_signals(soup, json_ld_entries),
         }

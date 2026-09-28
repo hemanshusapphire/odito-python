@@ -165,7 +165,7 @@ def execute_technical_domain(job):
         if ssl_result["ssl_valid"]:
             print(f"[STEP 6] ✅ SSL check successful | hostname={final_hostname} | expiry={ssl_result['ssl_expiry_date']} | days_remaining={ssl_result['ssl_days_remaining']}")
         else:
-            print(f"[STEP 6] ❌ SSL check failed | hostname={final_hostname} | ssl_valid=False")
+            print(f"[STEP 6] ❌ SSL check not valid | hostname={final_hostname} | status={ssl_result['ssl_status']} | message={ssl_result['ssl_message']}")
         print(f"[STEP 6] ═══════════════════════════════════════════════════════════")
         
         # Step 6.5: Detect framework from homepage HTML
@@ -219,6 +219,9 @@ def execute_technical_domain(job):
             "sslValid": ssl_result["ssl_valid"],
             "sslExpiryDate": ssl_result["ssl_expiry_date"],
             "sslDaysRemaining": ssl_result["ssl_days_remaining"],
+            "sslStatus": ssl_result["ssl_status"],
+            "sslMessage": ssl_result["ssl_message"],
+            "sslDetails": ssl_result["ssl_details"],
             "httpsRedirect": https_redirect_result["https_redirect"],
             "redirectChain": https_redirect_result["redirect_chain"],
             "finalUrl": https_redirect_result["final_url"],
@@ -258,6 +261,7 @@ def execute_technical_domain(job):
             "llmsTxtRawContentLength": llms_result.get("rawContentLength", 0),
             "sslValid": ssl_result["ssl_valid"],
             "sslDaysRemaining": ssl_result["ssl_days_remaining"],
+            "sslStatus": ssl_result["ssl_status"],
             "httpsRedirect": https_redirect_result["https_redirect"]
         }
         
@@ -294,7 +298,7 @@ def execute_technical_domain(job):
         print(f"[END] ═══════════════════════════════════════════════════════════════")
         print(f"[END] Job completed successfully")
         print(f"[END] jobId={job_id}")
-        print(f"[END] robots={robots_result['exists']} | sitemap={sitemap_result['exists']} | sitemapUrls={sitemap_result['url_count']} | llmsTxt={llms_result.get('found', llms_result.get('exists', False))} | ssl={ssl_result['ssl_valid']} | httpsRedirect={https_redirect_result['https_redirect']}")
+        print(f"[END] robots={robots_result['exists']} | sitemap={sitemap_result['exists']} | sitemapUrls={sitemap_result['url_count']} | llmsTxt={llms_result.get('found', llms_result.get('exists', False))} | ssl={ssl_result['ssl_valid']} ({ssl_result['ssl_status']}) | httpsRedirect={https_redirect_result['https_redirect']}")
         print(f"[END] ═══════════════════════════════════════════════════════════════")
         
         print(f"[WORKER] TECHNICAL_DOMAIN COMPLETED | jobId={job_id}")
@@ -312,6 +316,7 @@ def execute_technical_domain(job):
             "llms_mentioned_bots": llms_result["mentionedBots"],
             "ssl_valid": ssl_result["ssl_valid"],
             "ssl_days_remaining": ssl_result["ssl_days_remaining"],
+            "ssl_status": ssl_result["ssl_status"],
             "https_redirect": https_redirect_result["https_redirect"]
         }
         

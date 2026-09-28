@@ -56,6 +56,66 @@ class FormLabelsRule(BaseSEORuleV2):
 
 
 
+# ── Keyboard audit v2 helpers ────────────────────────────────────────────────
+# The headless worker (keyboard_audit.py) now stores the EXACT elements, so the
+# issue can say which ones failed. These helpers only reshape that stored data
+# into the compact, JSON-serializable structures that go onto the issue
+# document (`context` for the recommendation/UI, `before_snapshot` for the
+# task's before-state). Nothing here re-decides pass/fail.
+
+_MAX_ISSUE_ELEMENTS = 25
+
+
+def _slim_element(e):
+    """Compact per-element record for an issue document (no computed-style dumps)."""
+    fi = e.get("focusIndicator") or {}
+    out = {
+        "tag": e.get("tag"),
+        "role": e.get("role"),
+        "accessibleName": e.get("accessibleName"),
+        "text": e.get("text"),
+        "selector": e.get("selector"),
+        "selectorUnique": e.get("selectorUnique"),
+        "domPath": e.get("domPath"),
+        "href": e.get("href"),
+        "classes": e.get("classes"),
+        "tabindex": e.get("tabindex"),
+        "container": e.get("container"),
+        "rect": e.get("rect"),
+        "disabled": e.get("disabled"),
+    }
+    if e.get("xpath"):
+        out["xpath"] = e["xpath"]
+    if fi:
+        out["focusIndicator"] = {
+            "status": fi.get("status"),
+            "reason": fi.get("reason"),
+            "signals": fi.get("signals"),
+            "before": fi.get("before"),
+            "after": fi.get("after"),
+            "focusRuleFound": fi.get("focusRuleFound"),
+            "focusRules": fi.get("focusRules"),
+            "suppressingRule": fi.get("suppressingRule"),
+        }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _audit_frame(keyboard, url, issue_type):
+    """Fields shared by every keyboard finding's context."""
+    return {
+        "issueType": issue_type,
+        "pageUrl": url,
+        "auditVersion": keyboard.get("audit_version"),
+        "auditMethod": keyboard.get("audit_method"),
+        "testedAt": keyboard.get("tested_at"),
+        "testedElementCount": keyboard.get("tab_stops_visited"),
+        "focusableVisible": keyboard.get("focusable_visible"),
+        "traversal": keyboard.get("traversal"),
+        "technology": keyboard.get("technology"),
+        "cssRulesUnavailable": keyboard.get("css_rules_unavailable"),
+    }
+
+
 class KeyboardAccessibilityRule(BaseSEORuleV2):
     rule_id = "keyboard_accessibility"
     rule_no = 114
@@ -67,29 +127,108 @@ class KeyboardAccessibilityRule(BaseSEORuleV2):
         # Defensive guard - skip if feature flag is enabled
         if _should_skip_accessibility_rules():
             return []
-        
-        issues = []
-        
-        # ✅ Use real keyboard navigation data from headless worker
+
         headless = normalized.get("headless", {})
         keyboard = headless.get("keyboard_analysis", {})
-        
+
         if not keyboard.get("keyboard_navigation_checked", False):
             # If keyboard navigation wasn't checked, skip this rule
-            return issues
-        
-        # Check for focus traps
+            return []
+
+        if keyboard.get("audit_version", 1) >= 2:
+            return self._evaluate_v2(keyboard, job_id, project_id, url)
+        return self._evaluate_legacy(keyboard, job_id, project_id, url)
+
+    # ── v2: exact elements, real trap analysis ──────────────────────────────
+    def _evaluate_v2(self, keyboard, job_id, project_id, url):
+        issues = []
+        affected = keyboard.get("affected_elements", {}) or {}
+
+        # Focus trap — only UNINTENDED / improper traps are stored as
+        # focus_trap_detected (an intentional, closable modal is not a failure).
+        trap = keyboard.get("trap_details", {}) or {}
         if keyboard.get("focus_trap_detected", False):
+            container = (trap.get("container") or {}).get("selector")
+            cycle = trap.get("cycle") or []
+            where = f"in {container}" if container else "on this page"
+            n = trap.get("cycleLength") or len(cycle)
+            ctx = _audit_frame(keyboard, url, "focus_trap")
+            ctx.update({
+                "trapDetails": trap,
+                "focusSequence": (keyboard.get("focus_sequence") or [])[:30],
+                "affectedElementCount": len(cycle) or 1,
+                "affectedElements": cycle[:_MAX_ISSUE_ELEMENTS],
+            })
             issues.append(self.create_issue(
                 job_id, project_id, url,
-                "Focus trap detected - keyboard users cannot navigate away from certain elements",
-                "Keyboard navigation test detected focus trap",
-                "All interactive elements must allow keyboard users to navigate away",
+                f"Focus trap detected {where} - keyboard users cannot navigate away from {n} element{'s' if n != 1 else ''}",
+                [c.get("selector") for c in cycle if c.get("selector")],
+                "Keyboard users must be able to move focus out of every component (a modal may trap focus only while it is open and must be closable)",
                 data_key="headless",
-                data_path="keyboard_analysis.focus_trap_detected"
+                data_path="keyboard_analysis.focus_trap_detected",
+                context=ctx,
+                before_snapshot={
+                    "type": "keyboard_accessibility", "finding": "focus_trap",
+                    "verdict": trap.get("verdict"), "container": container,
+                    "elements": [{"selector": c.get("selector"), "tag": c.get("tag"), "accessibleName": c.get("accessibleName")} for c in cycle[:_MAX_ISSUE_ELEMENTS]],
+                },
             ))
-        
-        # Check for unreachable elements
+
+        # Unreachable — visible tabbable elements a completed traversal never focused.
+        unreachable = affected.get("unreachable") or []
+        if unreachable:
+            ctx = _audit_frame(keyboard, url, "unreachable_elements")
+            ctx.update({"affectedElementCount": len(unreachable), "affectedElements": unreachable[:_MAX_ISSUE_ELEMENTS]})
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                f"Unreachable interactive elements detected: {len(unreachable)} elements not reachable by keyboard",
+                [u.get("selector") for u in unreachable if u.get("selector")],
+                "All interactive elements must be reachable via Tab navigation",
+                data_key="headless",
+                data_path="keyboard_analysis.unreachable_elements",
+                context=ctx,
+                before_snapshot={
+                    "type": "keyboard_accessibility", "finding": "unreachable_elements",
+                    "elements": [{"selector": u.get("selector"), "tag": u.get("tag"), "accessibleName": u.get("accessibleName")} for u in unreachable[:_MAX_ISSUE_ELEMENTS]],
+                },
+            ))
+
+        # Missing focus indicator — judged by a computed-style diff (unfocused vs
+        # focused), so outline:none alone is not a failure if another visible
+        # indicator (box-shadow, border, background, underline...) is applied.
+        missing_total = affected.get("missing_focus_indicator_total", len(affected.get("missing_focus_indicator") or []))
+        missing = affected.get("missing_focus_indicator") or []
+        if missing_total > 0:
+            tested = keyboard.get("tab_stops_visited") or 0
+            ctx = _audit_frame(keyboard, url, "missing_focus_indicator")
+            ctx.update({
+                "affectedElementCount": missing_total,
+                "affectedElements": [_slim_element(e) for e in missing[:_MAX_ISSUE_ELEMENTS]],
+                "listTruncated": missing_total > min(len(missing), _MAX_ISSUE_ELEMENTS),
+            })
+            issues.append(self.create_issue(
+                job_id, project_id, url,
+                f"Missing focus indicators: {missing_total} of {tested} keyboard-focusable elements show no visible focus indicator" if tested else f"Missing focus indicators: {missing_total} elements show no visible focus indicator",
+                [e.get("selector") for e in missing[:_MAX_ISSUE_ELEMENTS] if e.get("selector")],
+                "All interactive elements must have a visible focus indicator (outline, ring, border or equivalent) when focused",
+                data_key="headless",
+                data_path="keyboard_analysis.missing_focus_outline",
+                context=ctx,
+                before_snapshot={
+                    "type": "keyboard_accessibility", "finding": "missing_focus_indicator", "count": missing_total,
+                    "elements": [{"selector": e.get("selector"), "tag": e.get("tag"), "accessibleName": e.get("accessibleName")} for e in missing[:_MAX_ISSUE_ELEMENTS]],
+                },
+            ))
+        return issues
+
+    # ── legacy (audit v1 data, not yet re-scanned) ──────────────────────────
+    def _evaluate_legacy(self, keyboard, job_id, project_id, url):
+        """v1 data only has counters. The v1 focus-trap heuristic compared
+        tag+id and reported a trap for any three consecutive links without an id,
+        so it is NOT trusted here; unreachable/missing counters are kept as-is
+        until the page is re-scanned with the v2 audit."""
+        issues = []
+
         unreachable_count = keyboard.get("unreachable_elements", 0)
         if unreachable_count > 0:
             issues.append(self.create_issue(
@@ -100,8 +239,7 @@ class KeyboardAccessibilityRule(BaseSEORuleV2):
                 data_key="headless",
                 data_path="keyboard_analysis.unreachable_elements"
             ))
-        
-        # Check for missing focus outlines
+
         missing_outline_count = keyboard.get("missing_focus_outline", 0)
         if missing_outline_count > 0:
             issues.append(self.create_issue(
@@ -112,7 +250,7 @@ class KeyboardAccessibilityRule(BaseSEORuleV2):
                 data_key="headless",
                 data_path="keyboard_analysis.missing_focus_outline"
             ))
-        
+
         return issues
 
 
