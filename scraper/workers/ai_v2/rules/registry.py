@@ -25,7 +25,7 @@ Hub / card taxonomy:
 
 from typing import Any
 from .base import BaseRule, RuleResult
-from .page_type_matrix import SKIP_MATRIX, GEO_LOCALBUSINESS_RULES
+from .page_type_matrix import should_skip as _matrix_should_skip
 
 
 # Hub → card ordering (determines display order and aggregation structure).
@@ -128,41 +128,21 @@ class RuleRegistry:
         Return a skip-reason string if this rule should not evaluate on this
         page type.  Return None if the rule should proceed.
 
-        Gate order:
-          1. Domain-scope rules always bypass — never skipped by page type.
-          2. Known page type (non-generic) — consult SKIP_MATRIX.
-          3. Generic page type — schema-presence fallback for GEO LocalBusiness
-             rules: skip unless LocalBusiness schema is actually present.
+        Delegates to page_type_matrix.should_skip() — the module's own
+        documented "single source of truth" for this gate. Previously this
+        method duplicated that logic inline (with the same generic-page bug
+        independently; see should_skip()'s docstring/comments for what was
+        wrong and why). Kept as a thin wrapper, not inlined, so there is
+        exactly one implementation to keep correct.
         """
         # Guard 1: domain-scope rules are never gated by page type.
         if rule.SCOPE == "domain":
             return None
 
-        pt = (page_type or "generic").strip().lower()
-
-        # Guard 2: known page type — consult SKIP_MATRIX.
-        if pt != "generic":
-            skip_set = SKIP_MATRIX.get(rule.RULE_ID)
-            if skip_set and pt in skip_set:
-                return (
-                    f"Rule {rule.RULE_ID} not applicable to '{pt}' pages "
-                    f"(page-type gate)"
-                )
-            return None
-
-        # Guard 3: generic page — schema-presence fallback for GEO LocalBusiness
-        # rules. Evaluate if LocalBusiness schema is present on this page;
-        # skip otherwise to avoid false failures on non-local-business pages
-        # whose URL did not match a known pattern.
-        if rule.RULE_ID in GEO_LOCALBUSINESS_RULES:
-            lb = (page.get("schema") or {}).get("local_business") or {}
-            if not lb.get("present", False):
-                return (
-                    "Generic page with no LocalBusiness schema — "
-                    "GEO local entity rules not applicable"
-                )
-
-        return None
+        should_skip, reason = _matrix_should_skip(
+            rule_id=rule.RULE_ID, page_type=page_type, page=page, scope=rule.SCOPE
+        )
+        return reason if should_skip else None
 
     # ── Evaluation ────────────────────────────────────────────────────────────
 

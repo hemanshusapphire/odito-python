@@ -265,16 +265,30 @@ def should_skip(
 
     pt = (page_type or "generic").strip().lower()
 
-    # Known page type — consult SKIP_MATRIX.
+    # Consult SKIP_MATRIX for ANY page type, including "generic".
+    #
+    # Bug fixed here: this used to run only `if pt != "generic"`, so a rule
+    # whose skip set explicitly names "generic" (GEO-S1 through GEO-S5 are
+    # the only such rules today — see their comments above) was never
+    # actually gated on generic pages, contradicting the matrix's own
+    # declared intent. Confirmed against real audit data: GEO-S4 (Product
+    # schema, applicable only to 'product' pages) had generated `ai_issues`
+    # FAIL documents on pages typed 'generic' — on one real project, 118
+    # such issues against 0 pages actually typed 'product'. Page type here
+    # comes from `seo_page_data.page_type` (see extractor.py) and lands as
+    # "generic" whenever that upstream classification is absent or doesn't
+    # map to one of this module's canonical types — common, not an edge case.
+    skip_set = SKIP_MATRIX.get(rule_id)
+    if skip_set and pt in skip_set:
+        return True, (
+            f"Rule {rule_id} not applicable to '{pt}' pages"
+        )
+
     if pt != "generic":
-        skip_set = SKIP_MATRIX.get(rule_id)
-        if skip_set and pt in skip_set:
-            return True, (
-                f"Rule {rule_id} not applicable to '{pt}' pages"
-            )
         return False, ""
 
-    # Generic page — schema-presence fallback for GEO LocalBusiness rules.
+    # Generic page, not caught by an explicit "generic" skip-set entry above:
+    # schema-presence fallback for GEO LocalBusiness rules only.
     if rule_id in GEO_LOCALBUSINESS_RULES:
         lb = (page.get("schema") or {}).get("local_business") or {}
         if not lb.get("present", False):
